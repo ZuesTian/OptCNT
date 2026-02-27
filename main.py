@@ -6,6 +6,8 @@ import logging
 import sys
 import tkinter as tk
 
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
 from gui import CNTAnalyzerGUI

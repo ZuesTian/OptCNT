@@ -21,3 +21,12 @@ env/
 *~
 .DS_Store
 Thumbs.db
+
+# PyInstaller
+*.spec
+*.manifest
+
+# UPX
+upx.exe
+upx.zip
+upx-*/
