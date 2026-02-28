@@ -7,6 +7,7 @@ from typing import Optional, Callable, List
 from datetime import datetime
 
 from widgets import SortableTreeview, ScrollableFrame
+from utils import SCALE_BAR_DEFAULT_UM
 
 # 常量定义
 MIN_ROI_SIZE = 10  # ROI最小尺寸 (像素)
@@ -68,7 +69,7 @@ class ControlPanel(ttk.Frame):
         ttk.Button(scale_frame, text="应用比例尺",
                    command=self.callbacks.get('apply_scale')).pack(fill=tk.X, padx=8, pady=8)
 
-        self.scale_label = ttk.Label(scale_frame, text="当前比例尺: 未设置",
+        self.scale_label = ttk.Label(scale_frame, text=f"当前比例尺: 默认 {SCALE_BAR_DEFAULT_UM:g}μm（待应用）",
                                      foreground=self.colors['accent_primary'],
                                      font=('Segoe UI', 9, 'italic'))
         self.scale_label.pack(anchor=tk.W, padx=8, pady=5)
@@ -161,7 +162,7 @@ class ControlPanel(ttk.Frame):
         self.c_label = ttk.Label(c_frame, text="2", font=('Segoe UI', 9, 'bold'))
         self.c_label.pack(side=tk.RIGHT)
 
-        self.c_scale = ttk.Scale(preprocess_frame, from_=-10, to=10,
+        self.c_scale = ttk.Scale(preprocess_frame, from_=0, to=10,
                                  variable=self.variables.get('adaptive_c'), orient=tk.HORIZONTAL,
                                  command=self.callbacks.get('on_c_change'))
         self.c_scale.pack(fill=tk.X, padx=12, pady=(0, 8))
@@ -186,6 +187,15 @@ class ControlPanel(ttk.Frame):
         ttk.Label(filter_frame, text="最小长宽比:", foreground=self.colors['text_secondary']).pack(anchor=tk.W)
         ttk.Entry(filter_frame, textvariable=self.variables.get('min_slenderness'),
                   width=10).pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(filter_frame, text="粘连分离强度:", foreground=self.colors['text_secondary']).pack(anchor=tk.W)
+        split_mode_box = ttk.Combobox(
+            filter_frame,
+            textvariable=self.variables.get('split_mode'),
+            values=('关闭', '保守', '激进'),
+            state='readonly'
+        )
+        split_mode_box.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Button(analysis_frame, text="🔍 开始检测CNT",
                    style='Danger.TButton',
@@ -229,6 +239,8 @@ class ImagePanel(ttk.Frame):
         self.colors = colors
         self.callbacks = callbacks
         self.canvas: Optional[tk.Canvas] = None
+        self._image_origin = (0.0, 0.0)  # 图像在画布坐标系中的左上角
+        self._image_size = (0.0, 0.0)    # 当前显示图像尺寸（缩放后）
 
         # 选择模式
         self.select_mode = None  # 'roi' 或 'scale'
@@ -318,10 +330,22 @@ class ImagePanel(ttk.Frame):
             if self.select_mode == 'roi':
                 x1, y1 = self.select_start
                 x2, y2 = self.select_end
-                x = min(x1, x2)
-                y = min(y1, y2)
-                w = abs(x2 - x1)
-                h = abs(y2 - y1)
+                # 将画布坐标映射到图像局部坐标，并裁剪到图像范围内
+                ox, oy = self._image_origin
+                iw, ih = self._image_size
+                if iw <= 0 or ih <= 0:
+                    self.cancel_selection()
+                    return
+
+                ix1 = max(0.0, min(float(iw), x1 - ox))
+                iy1 = max(0.0, min(float(ih), y1 - oy))
+                ix2 = max(0.0, min(float(iw), x2 - ox))
+                iy2 = max(0.0, min(float(ih), y2 - oy))
+
+                x = min(ix1, ix2)
+                y = min(iy1, iy2)
+                w = abs(ix2 - ix1)
+                h = abs(iy2 - iy1)
                 if w > MIN_ROI_SIZE and h > MIN_ROI_SIZE:  # 最小尺寸限制
                     self.on_select_complete((int(x), int(y), int(w), int(h)))
             elif self.select_mode == 'scale':
@@ -374,17 +398,27 @@ class ImagePanel(ttk.Frame):
                 fill='#00FF00',
                 width=2
             )
-            # 显示长度
-            length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            # 显示长度（同时显示原图像素，消除缩放误导）
+            canvas_length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            zoom = self._get_zoom_level()
+            real_length = canvas_length / zoom if zoom > 0 else canvas_length
             mid_x = (x1 + x2) / 2
             mid_y = (y1 + y2) / 2
             self.canvas.create_text(
                 mid_x + 10, mid_y - 10,
-                text=f"{length:.1f}px",
+                text=f"原图: {real_length:.1f}px",
                 fill='#00FF00',
                 font=('Segoe UI', 10),
                 tags='scale_text'
             )
+
+    def _get_zoom_level(self) -> float:
+        """获取当前缩放级别（由外部设置）"""
+        return getattr(self, '_zoom_level', 1.0)
+
+    def set_zoom_level(self, zoom: float) -> None:
+        """设置当前缩放级别（供外部同步）"""
+        self._zoom_level = zoom
 
     def _on_mousewheel(self, event) -> str:
         """鼠标滚轮缩放"""
@@ -435,15 +469,32 @@ class ImagePanel(ttk.Frame):
         self.hide_status()
 
     def set_scroll_region(self, width: int, height: int) -> None:
-        """设置滚动区域"""
-        self.canvas.configure(scrollregion=(0, 0, width, height))
+        """设置滚动区域，图像小于画布时居中显示"""
+        canvas_w = self.canvas.winfo_width()
+        canvas_h = self.canvas.winfo_height()
+        # 滚动区域至少与画布一样大，保证图像可以居中
+        region_w = max(width, canvas_w)
+        region_h = max(height, canvas_h)
+        self.canvas.configure(scrollregion=(0, 0, region_w, region_h))
 
     def clear_canvas(self) -> None:
         """清空画布"""
         self.canvas.delete("all")
 
-    def create_image(self, photo) -> int:
-        """创建图像"""
+    def create_image(self, photo, center: bool = True) -> int:
+        """创建图像，默认居中显示"""
+        if center:
+            canvas_w = self.canvas.winfo_width()
+            canvas_h = self.canvas.winfo_height()
+            img_w = photo.width()
+            img_h = photo.height()
+            x = max(0, (canvas_w - img_w) // 2) if img_w < canvas_w else 0
+            y = max(0, (canvas_h - img_h) // 2) if img_h < canvas_h else 0
+            self._image_origin = (float(x), float(y))
+            self._image_size = (float(img_w), float(img_h))
+            return self.canvas.create_image(x, y, anchor=tk.NW, image=photo)
+        self._image_origin = (0.0, 0.0)
+        self._image_size = (float(photo.width()), float(photo.height()))
         return self.canvas.create_image(0, 0, anchor=tk.NW, image=photo)
 
 
@@ -548,6 +599,8 @@ class AdvancedAnalysisPanel(ttk.Frame):
         """创建单个图表的容器"""
         container = ttk.Frame(self.adv_dist_inner, style='Card.TFrame')
         container.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        container.configure(height=420)
+        container.pack_propagate(False)
         
         # 标题带颜色
         title_colors = {

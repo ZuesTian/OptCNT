@@ -28,6 +28,7 @@ class CNTMeasurement:
     skeleton: Optional[np.ndarray] = None
     skeleton_bbox: tuple = (0, 0)
     width_mean_um: Optional[float] = None
+    width_median_um: Optional[float] = None  # 宽度中位数（鲁棒统计）
+    width_iqr_um: Optional[float] = None     # 宽度四分位距（鲁棒统计）
     slenderness: Optional[float] = None
-
-
+    filter_reason: Optional[str] = None      # 被过滤原因（用于调试）

@@ -1,10 +1,16 @@
 """
 CNT图像分析系统 - 程序入口
 """
+import os
 import ctypes
 import logging
 import sys
 import tkinter as tk
+
+# 解决 NumExpr 和 Joblib 核心数检测警告
+# 设置最大线程数，避免自动检测失败或过高
+os.environ['NUMEXPR_MAX_THREADS'] = '16'
+os.environ['LOKY_MAX_CPU_COUNT'] = '16'
 
 import matplotlib
 matplotlib.use('TkAgg')

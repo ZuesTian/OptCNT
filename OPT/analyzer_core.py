@@ -24,6 +24,7 @@ class CNTAnalyzer:
     """CNT图像分析核心类"""
 
     def __init__(self):
+        self.original_image = None
         self.image = None
         self.processed_image = None
         self.binary_image = None
@@ -33,6 +34,7 @@ class CNTAnalyzer:
         self.measurements: List[CNTMeasurement] = []
         self.rois: List[ROIRegion] = []
         self.ocr_templates = None
+        self.auto_enhance_enabled = True
 
     def _ensure_ocr_templates(self):
         """延迟初始化OCR模板"""
@@ -53,12 +55,38 @@ class CNTAnalyzer:
                         cv2.putText(temp, key, (2, 24), f, s, 255, t, cv2.LINE_AA)
                         self.ocr_templates[key].append(temp)
 
+    def _auto_enhance_image(self, image: np.ndarray) -> np.ndarray:
+        """自动增强图像对比度与亮度（CLAHE + 轻微亮度提升）"""
+        if image is None or image.size == 0:
+            return image
+
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_eq = clahe.apply(l)
+
+        # 轻微提升亮度，避免暗图细节丢失
+        l_eq = cv2.convertScaleAbs(l_eq, alpha=1.0, beta=6)
+
+        enhanced_lab = cv2.merge((l_eq, a, b))
+        return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+
+    def set_image(self, image: np.ndarray) -> np.ndarray:
+        """直接设置图像（用于剪贴板粘贴等场景）"""
+        if image is None or image.size == 0:
+            raise ValueError("无效图像数据")
+
+        self.original_image = image.copy()
+        self.image = self._auto_enhance_image(image) if self.auto_enhance_enabled else image.copy()
+        return self.image
+
     def load_image(self, path: str) -> np.ndarray:
         """加载图像"""
-        self.image = cv2.imread(path)
-        if self.image is None:
+        image = cv2.imread(path)
+        if image is None:
             raise ValueError(f"无法加载图像: {path}")
-        return self.image
+        return self.set_image(image)
 
     def set_scale(self, pixels: float, micrometers: float):
         """设置比例尺"""
@@ -449,14 +477,14 @@ class CNTAnalyzer:
 
         # 根据对比度选择参数
         if delta < 30:
-            # 低对比度：需要更强的模糊和更大的块
-            blur_kernel = 11
-            adaptive_block = 21
-            adaptive_c = 3
-        elif delta < 60:
-            blur_kernel = 11
+            # 低对比度场景（如 3.png）：降低平滑强度，保留细线纹理
+            blur_kernel = 9
             adaptive_block = 19
-            adaptive_c = 3
+            adaptive_c = 2
+        elif delta < 60:
+            blur_kernel = 9
+            adaptive_block = 17
+            adaptive_c = 2
         else:
             # 高对比度：较小的模糊和块即可
             blur_kernel = 9
@@ -485,9 +513,9 @@ class CNTAnalyzer:
         fg_ratio = float((binary > 0).mean())
 
         # 目标前景比例约 3%-15%
-        if fg_ratio > 0.20:
-            adaptive_c = min(adaptive_c + 2, 8)
-        elif fg_ratio < 0.01:
+        if fg_ratio > 0.28:
+            adaptive_c = min(adaptive_c + 1, 8)
+        elif fg_ratio < 0.008:
             adaptive_c = max(adaptive_c - 1, 0)
 
         return {
@@ -540,7 +568,7 @@ class CNTAnalyzer:
             return
         self.skeleton_overlay = self.image.copy()
         skeleton_mask = self.skeleton_image > 0
-        self.skeleton_overlay[y1:y2, x1:x2][skeleton_mask] = [0, 0, 255]
+        self.skeleton_overlay[y1:y2, x1:x2][skeleton_mask] = [0, 255, 255]
 
     # ===== 骨架处理方法 =====
     def _build_skeleton_neighbors(self, skeleton: np.ndarray) -> dict:
@@ -711,47 +739,114 @@ class CNTAnalyzer:
         return max(path_lengths) if path_lengths else 0.0
 
     # ===== 宽度测量方法 =====
-    def _measure_width(self, skeleton: np.ndarray, cnt_binary: np.ndarray) -> float:
-        """通过骨架法测量CNT平均宽度
+    def _measure_width(self, skeleton: np.ndarray, cnt_binary: np.ndarray) -> dict:
+        """通过骨架法测量CNT宽度（鲁棒统计）
 
         对骨架上的每个点，计算其到最近轮廓边界的距离（即半宽），
-        取所有点的平均值再乘以2得到平均宽度。
-
-        使用距离变换实现，效率远高于逐点计算。
+        返回均值、中位数和IQR，使用中位数作为主要指标以抵抗异常值。
 
         Args:
             skeleton: 骨架二值图
             cnt_binary: CNT区域二值图
 
         Returns:
-            float: 平均宽度（像素）
+            dict: 包含 mean, median, iqr 的宽度统计（像素），全部为直径
         """
+        result = {'mean': 0.0, 'median': 0.0, 'iqr': 0.0}
         if skeleton is None or cnt_binary is None:
-            return 0.0
+            return result
 
-        # 距离变换：计算每个前景像素到最近背景像素的距离
         dist_transform = cv2.distanceTransform(cnt_binary, cv2.DIST_L2, 5)
 
-        # 获取骨架点位置
         skeleton_mask = skeleton > 0
         if not skeleton_mask.any():
-            return 0.0
+            return result
 
-        # 骨架点处的距离值即为半宽
         half_widths = dist_transform[skeleton_mask]
-
         if len(half_widths) == 0:
-            return 0.0
+            return result
 
-        # 平均宽度 = 2 × 平均半宽
-        mean_width = float(np.mean(half_widths)) * 2.0
-        return mean_width
+        result['mean'] = float(np.mean(half_widths)) * 2.0
+        result['median'] = float(np.median(half_widths)) * 2.0
+        q75, q25 = float(np.percentile(half_widths, 75)), float(np.percentile(half_widths, 25))
+        result['iqr'] = (q75 - q25) * 2.0
+        return result
+
+    def _split_stuck_cnt_region(self, cnt_binary: np.ndarray, split_mode: str = "conservative") -> List[np.ndarray]:
+        """对疑似粘连CNT连通域进行分离（距离变换 + 分水岭）"""
+        if cnt_binary is None or cnt_binary.size == 0:
+            return []
+
+        region = np.where(cnt_binary > 0, 255, 0).astype(np.uint8)
+        area = int(cv2.countNonZero(region))
+        if area <= 0:
+            return []
+
+        mode = (split_mode or "conservative").lower()
+        if mode in ("off", "none", "close", "0"):
+            return [region]
+
+        # 保守策略：仅对“面积较大且骨架端点异常”的连通域尝试分离，降低过分割风险
+        skeleton = self._skeletonize(region)
+        neighbors = self._build_skeleton_neighbors(skeleton)
+        endpoints = self._count_endpoints(skeleton, neighbors) if neighbors else 0
+
+        if mode == "aggressive":
+            area_threshold = 180
+            peak_ratio = 0.35
+            min_piece_ratio = 0.015
+            bypass_endpoint_check = True
+        else:
+            area_threshold = 300
+            peak_ratio = 0.42
+            min_piece_ratio = 0.02
+            bypass_endpoint_check = False
+
+        if area < area_threshold:
+            return [region]
+        if not bypass_endpoint_check and endpoints == 2:
+            return [region]
+
+        dist = cv2.distanceTransform(region, cv2.DIST_L2, 5)
+        max_dist = float(dist.max())
+        if max_dist <= 1.0:
+            return [region]
+
+        sure_fg = cv2.threshold(dist, peak_ratio * max_dist, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
+        sure_fg = cv2.morphologyEx(sure_fg, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        n_fg, markers = cv2.connectedComponents(sure_fg)
+        if n_fg <= 2:
+            return [region]
+
+        sure_bg = cv2.dilate(region, kernel, iterations=1)
+        unknown = cv2.subtract(sure_bg, sure_fg)
+        markers = markers + 1
+        markers[unknown > 0] = 0
+
+        ws_input = cv2.cvtColor(region, cv2.COLOR_GRAY2BGR)
+        ws_markers = cv2.watershed(ws_input, markers.astype(np.int32))
+
+        min_piece_area = max(30, int(area * min_piece_ratio))
+        pieces: List[np.ndarray] = []
+        for label in np.unique(ws_markers):
+            if label <= 1:
+                continue
+            piece = np.zeros_like(region, dtype=np.uint8)
+            piece[ws_markers == label] = 255
+            piece = cv2.bitwise_and(piece, region)
+            if cv2.countNonZero(piece) >= min_piece_area:
+                pieces.append(piece)
+
+        return pieces if len(pieces) >= 2 else [region]
 
     # ===== CNT检测方法 =====
     def detect_cnts_hybrid(self,
                            min_length_um: float = 0.0,
                            max_length_um: float = 0.0,
                            min_slenderness: float = 0.0,
+                           split_mode: str = "conservative",
                            roi: Optional[ROIRegion] = None) -> List[CNTMeasurement]:
         """混合检测方法
 
@@ -782,8 +877,7 @@ class CNTAnalyzer:
 
         cnt_id = 0
         for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 1:
+            if cv2.contourArea(contour) < 1:
                 continue
 
             x_min = int(contour[:, 0, 0].min())
@@ -803,62 +897,75 @@ class CNTAnalyzer:
             cv2.drawContours(mask, [relative_contour], 0, 255, -1)
 
             cnt_binary = cnt_region & mask
-
-            skeleton_region = self._skeletonize(cnt_binary)
-
-            neighbors = self._build_skeleton_neighbors(skeleton_region)
-            if len(neighbors) < 2:
-                continue
-
-            skeleton_region = self._extract_primary_path(skeleton_region, neighbors)
-
-            neighbors = self._build_skeleton_neighbors(skeleton_region)
-            if len(neighbors) < 2:
-                continue
-
-            if self._count_endpoints(skeleton_region, neighbors) != 2:
-                continue
-
-            length_px = self._calculate_skeleton_length(skeleton_region, neighbors)
-            if length_px < 1:
-                continue
-
-            length_um = length_px * self.scale_um_per_pixel
-
-            if min_length_um > 0 and length_um < min_length_um:
-                continue
-            if max_length_um > 0 and length_um > max_length_um:
-                continue
-            if min_slenderness > 0 and area > 0:
-                slenderness = (length_px * length_px) / area
-                if slenderness < min_slenderness:
+            split_regions = self._split_stuck_cnt_region(cnt_binary, split_mode=split_mode)
+            for sub_binary in split_regions:
+                sub_contours, _ = cv2.findContours(sub_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not sub_contours:
+                    continue
+                sub_contour = max(sub_contours, key=cv2.contourArea)
+                area = cv2.contourArea(sub_contour)
+                if area < 1:
                     continue
 
-            # 测量宽度
-            width_px = self._measure_width(skeleton_region, cnt_binary)
-            width_um = width_px * self.scale_um_per_pixel if width_px > 0 else None
+                skeleton_region = self._skeletonize(sub_binary)
 
-            # 计算长宽比（细长度）
-            slenderness_val = (length_px / width_px) if width_px > 0 else None
+                neighbors = self._build_skeleton_neighbors(skeleton_region)
+                if len(neighbors) < 2:
+                    continue
 
-            adjusted_contour = contour + np.array([x1, y1])
+                skeleton_region = self._extract_primary_path(skeleton_region, neighbors)
+                neighbors = self._build_skeleton_neighbors(skeleton_region)
+                if len(neighbors) < 2:
+                    continue
+                endpoint_count = self._count_endpoints(skeleton_region, neighbors)
+                # 放宽约束：允许 1~3 个端点，避免轻微粘连/断裂导致漏检
+                if endpoint_count <= 0 or endpoint_count > 3:
+                    continue
 
-            measurement = CNTMeasurement(
-                id=cnt_id,
-                length_pixels=length_px,
-                length_um=length_um,
-                contour=adjusted_contour,
-                skeleton=skeleton_region,
-                skeleton_bbox=(x_min + x1, y_min + y1),
-                width_mean_um=width_um,
-                slenderness=slenderness_val
-            )
+                length_px = self._calculate_skeleton_length(skeleton_region, neighbors)
+                if length_px < 1:
+                    continue
+                length_um = length_px * self.scale_um_per_pixel
 
-            if roi:
-                roi.measurements.append(measurement)
-            else:
-                self.measurements.append(measurement)
-            cnt_id += 1
+                if min_length_um > 0 and length_um < min_length_um:
+                    continue
+                if max_length_um > 0 and length_um > max_length_um:
+                    continue
+                if min_slenderness > 0 and area > 0:
+                    slenderness = (length_px * length_px) / area
+                    if slenderness < min_slenderness:
+                        continue
+
+                width_stats = self._measure_width(skeleton_region, sub_binary)
+                width_median_px = width_stats['median']
+                width_mean_px = width_stats['mean']
+                width_iqr_px = width_stats['iqr']
+
+                width_mean_um = width_mean_px * self.scale_um_per_pixel if width_mean_px > 0 else None
+                width_median_um = width_median_px * self.scale_um_per_pixel if width_median_px > 0 else None
+                width_iqr_um = width_iqr_px * self.scale_um_per_pixel if width_iqr_px > 0 else None
+
+                slenderness_val = (length_px / width_median_px) if width_median_px > 0 else None
+                adjusted_contour = sub_contour + np.array([x_min + x1, y_min + y1])
+
+                measurement = CNTMeasurement(
+                    id=cnt_id,
+                    length_pixels=length_px,
+                    length_um=length_um,
+                    contour=adjusted_contour,
+                    skeleton=skeleton_region,
+                    skeleton_bbox=(x_min + x1, y_min + y1),
+                    width_mean_um=width_mean_um,
+                    width_median_um=width_median_um,
+                    width_iqr_um=width_iqr_um,
+                    slenderness=slenderness_val
+                )
+
+                if roi:
+                    roi.measurements.append(measurement)
+                else:
+                    self.measurements.append(measurement)
+                cnt_id += 1
 
         return roi.measurements if roi else self.measurements
 
@@ -938,7 +1045,7 @@ class CNTAnalyzer:
                         vis_image[y_start:y_end, x_start:x_end][skeleton_mask] = [255, 0, 0]
 
                 except Exception as e:
-                    print(f"骨架显示错误 (CNT #{m.id}): {e}")
+                    logger.warning(f"骨架显示错误 (CNT #{m.id}): {e}")
 
             M = cv2.moments(m.contour)
             if M["m00"] != 0:

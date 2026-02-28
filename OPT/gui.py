@@ -11,14 +11,14 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageGrab
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 from models import ROIRegion, CNTMeasurement
 from analyzer_core import CNTAnalyzer
-from utils import DEBOUNCE_DELAY_MS
+from utils import DEBOUNCE_DELAY_MS, SCALE_BAR_DEFAULT_UM
 from widgets import SortableTreeview
 from panels import ControlPanel, ImagePanel, ResultPanel, AdvancedAnalysisPanel
 
@@ -79,6 +79,8 @@ class CNTAnalyzerGUI:
         self.roi_counter = 0
         self.zoom_level = 1.0
         self._preprocess_job = None
+        self._layout_job = None
+        self.main_paned: Optional[tk.PanedWindow] = None
         
         # 图表缓存
         self._charts = {
@@ -99,6 +101,10 @@ class CNTAnalyzerGUI:
         # 设置UI
         self._setup_ui()
 
+        # 快捷键：从剪贴板粘贴图像
+        self.root.bind_all("<Control-v>", self._paste_image_from_clipboard)
+        self.root.bind_all("<Control-V>", self._paste_image_from_clipboard)
+
     def _init_variables(self):
         """初始化Tkinter变量"""
         self.blur_kernel_var = tk.IntVar(value=11)
@@ -107,8 +113,9 @@ class CNTAnalyzerGUI:
         self.min_length_um_var = tk.DoubleVar(value=5.0)
         self.max_length_um_var = tk.DoubleVar(value=200.0)
         self.min_slenderness_var = tk.DoubleVar(value=5.0)
+        self.split_mode_var = tk.StringVar(value="保守")
         self.scale_pixels_var = tk.DoubleVar(value=0)
-        self.scale_um_var = tk.DoubleVar(value=10)
+        self.scale_um_var = tk.DoubleVar(value=SCALE_BAR_DEFAULT_UM)
         self.live_preview_var = tk.BooleanVar(value=True)
         self.display_var = tk.StringVar(value="original")
         self._last_preprocess_signature = None
@@ -122,8 +129,8 @@ class CNTAnalyzerGUI:
         
         try:
             style.theme_use('clam')
-        except:
-            pass
+        except tk.TclError:
+            logger.debug("clam主题不可用，使用默认主题")
 
         default_font = ('Segoe UI', 9)
         heading_font = ('Segoe UI', 10, 'bold')
@@ -287,8 +294,8 @@ class CNTAnalyzerGUI:
 
         window_width = int(screen_width * 0.85)
         window_height = int(screen_height * 0.85)
-        min_width = min(1200, max(600, screen_width - 100))
-        min_height = min(700, max(500, screen_height - 100))
+        min_width = min(1360, max(900, screen_width - 120))
+        min_height = min(820, max(560, screen_height - 120))
         window_width = max(window_width, min_width)
         window_height = max(window_height, min_height)
 
@@ -307,24 +314,72 @@ class CNTAnalyzerGUI:
         
         main_paned = tk.PanedWindow(main_frame, orient=tk.HORIZONTAL, sashwidth=6, bg=self.MODERN_COLORS['bg_primary'], bd=0)
         main_paned.pack(fill=tk.BOTH, expand=True)
+        self.main_paned = main_paned
 
         # 左侧面板 - 控制面板
         left_frame = ttk.Frame(main_paned)
-        left_width = int(window_width * 0.2)
+        left_width = int(window_width * 0.22)
         main_paned.add(left_frame, minsize=280, width=left_width)
         self._setup_control_panel(left_frame)
 
         # 中间面板 - 图像显示
         center_frame = ttk.Frame(main_paned)
-        center_width = int(window_width * 0.55)
-        main_paned.add(center_frame, minsize=400, width=center_width)
+        center_width = int(window_width * 0.54)
+        main_paned.add(center_frame, minsize=520, width=center_width)
         self._setup_center_panel(center_frame)
 
         # 右侧面板 - 结果面板
         right_frame = ttk.Frame(main_paned)
-        right_width = int(window_width * 0.20)
-        main_paned.add(right_frame, minsize=200, width=right_width)
+        right_width = int(window_width * 0.24)
+        main_paned.add(right_frame, minsize=260, width=right_width)
         self._setup_result_panel(right_frame)
+
+        # 根据窗口尺寸自动优化三栏分配：左控制/中图像/右结果
+        self.root.after_idle(self._optimize_window_distribution)
+        self.root.bind("<Configure>", self._on_root_resize, add="+")
+
+    def _on_root_resize(self, event):
+        """窗口尺寸变化时防抖重排三栏布局"""
+        if event.widget is not self.root or self.main_paned is None:
+            return
+        if self._layout_job is not None:
+            self.root.after_cancel(self._layout_job)
+        self._layout_job = self.root.after(120, self._optimize_window_distribution)
+
+    def _optimize_window_distribution(self):
+        """自适应优化窗口分布，优先保证中间图像区域"""
+        self._layout_job = None
+        paned = self.main_paned
+        if paned is None or not paned.winfo_exists() or len(paned.panes()) < 3:
+            return
+
+        total_w = max(1, paned.winfo_width())
+        # 目标比例：左 22% / 中 54% / 右 24%
+        left_w = max(280, int(total_w * 0.22))
+        right_w = max(260, int(total_w * 0.24))
+        center_min = 520
+
+        center_w = total_w - left_w - right_w
+        if center_w < center_min:
+            shortage = center_min - center_w
+            left_reducible = max(0, left_w - 260)
+            reduce_left = min(shortage // 2, left_reducible)
+            left_w -= reduce_left
+            shortage -= reduce_left
+
+            right_reducible = max(0, right_w - 220)
+            reduce_right = min(shortage, right_reducible)
+            right_w -= reduce_right
+
+        left_sash = left_w
+        right_sash = max(left_sash + 120, total_w - right_w)
+        right_sash = min(right_sash, total_w - 1)
+
+        try:
+            paned.sash_place(0, left_sash, 0)
+            paned.sash_place(1, right_sash, 0)
+        except tk.TclError:
+            return
 
     def _create_toolbar(self):
         """创建顶部工具栏"""
@@ -342,6 +397,8 @@ class CNTAnalyzerGUI:
 
         ttk.Button(button_frame, text="📂 打开图像", style='Accent.TButton',
                    command=self._open_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(button_frame, text="📋 粘贴图像", style='Accent.TButton',
+                   command=self._paste_image_from_clipboard).pack(side=tk.LEFT, padx=2)
         ttk.Button(button_frame, text="💾 保存结果", style='Success.TButton',
                    command=self._save_results).pack(side=tk.LEFT, padx=2)
         ttk.Button(button_frame, text="📊 导出报告", style='Warning.TButton',
@@ -407,6 +464,7 @@ class CNTAnalyzerGUI:
             'min_length': self.min_length_um_var,
             'max_length': self.max_length_um_var,
             'min_slenderness': self.min_slenderness_var,
+            'split_mode': self.split_mode_var,
             'listbox_bg': self.MODERN_COLORS['input_bg'],
             'listbox_fg': self.MODERN_COLORS['text_primary'],
             'listbox_select_bg': self.MODERN_COLORS['selected_bg'],
@@ -461,46 +519,106 @@ class CNTAnalyzerGUI:
         self.analysis_panel.pack(fill=tk.BOTH, expand=True)
 
     # ===== 文件操作 =====
+    def _load_image_common(self):
+        """加载图像后的通用流程"""
+        self._reset_display()
+        self._update_display()
+
+        # 比例尺默认使用 SCALE_BAR_DEFAULT_UM（OCR 识别值仅作为提示信息）
+        scale_info = self.analyzer.detect_scale_bar()
+        self.scale_um_var.set(SCALE_BAR_DEFAULT_UM)
+        if scale_info:
+            self.scale_pixels_var.set(scale_info['pixels'])
+            ocr_um = scale_info.get('micrometers')
+            if ocr_um is not None:
+                messagebox.showinfo(
+                    "比例尺检测",
+                    f"检测到比例尺长度: {scale_info['pixels']:.1f}像素\n"
+                    f"默认按 {SCALE_BAR_DEFAULT_UM:g}μm 处理（OCR识别值: {ocr_um}μm，仅供参考）\n"
+                    f"请确认后点击'应用比例尺'"
+                )
+            else:
+                messagebox.showinfo(
+                    "比例尺检测",
+                    f"检测到比例尺长度: {scale_info['pixels']:.1f}像素\n"
+                    f"默认按 {SCALE_BAR_DEFAULT_UM:g}μm 处理，请按实际情况修改后点击'应用比例尺'"
+                )
+        else:
+            messagebox.showwarning(
+                "比例尺检测",
+                f"未能自动检测到比例尺，默认已设为 {SCALE_BAR_DEFAULT_UM:g}μm，请手动确认"
+            )
+
+        # 自适应推荐预处理参数
+        self._auto_suggest_params()
+
+        # 加载图像后，若实时预览开启则自动触发骨架预览
+        if self.live_preview_var.get():
+            self.display_var.set("skeleton_preview")
+            self._schedule_preprocessing()
+
     def _open_image(self):
         """打开图像文件"""
         file_path = filedialog.askopenfilename(
             filetypes=[("图像文件", "*.png;*.jpg;*.jpeg;*.tif;*.tiff"), ("所有文件", "*.*")]
         )
-        if file_path:
-            try:
-                self._draw_status_indicator('processing')
-                self.analyzer.load_image(file_path)
-                self._reset_display()
-                self._update_display()
+        if not file_path:
+            return
 
-                # 尝试自动检测比例尺
-                scale_info = self.analyzer.detect_scale_bar()
-                self.scale_um_var.set(10)  # 默认设置为10μm
-                if scale_info:
-                    self.scale_pixels_var.set(scale_info['pixels'])
-                    messagebox.showinfo("比例尺检测",
-                                        f"检测到比例尺长度: {scale_info['pixels']:.1f}像素\n"
-                                        f"默认微米数: 10μm，请根据实际情况确认或修改")
-                else:
-                    messagebox.showwarning("比例尺检测", "未能自动检测到比例尺，请手动设置")
+        try:
+            self._draw_status_indicator('processing')
+            self.analyzer.load_image(file_path)
+            self._load_image_common()
+            self._draw_status_indicator('ready')
+        except (IOError, ValueError, cv2.error) as e:
+            self._draw_status_indicator('error')
+            messagebox.showerror("错误", f"无法加载图像: {e}")
+        except Exception as e:
+            self._draw_status_indicator('error')
+            logger.exception("加载图像时发生未预期的错误")
+            messagebox.showerror("错误", f"发生未预期的错误: {e}")
 
-                # 自适应推荐预处理参数
-                self._auto_suggest_params()
+    def _paste_image_from_clipboard(self, event=None):
+        """从剪贴板粘贴图像（支持图像对象与文件路径）"""
+        try:
+            clip = ImageGrab.grabclipboard()
+            if clip is None:
+                messagebox.showwarning("提示", "剪贴板中没有可用的图像或图像文件路径")
+                return "break"
 
-                # 加载图像后，若实时预览开启则自动触发骨架预览
-                if self.live_preview_var.get():
-                    self.display_var.set("skeleton_preview")
-                    self._schedule_preprocessing()
-                
-                self._draw_status_indicator('ready')
+            self._draw_status_indicator('processing')
 
-            except (IOError, ValueError, cv2.error) as e:
+            if isinstance(clip, Image.Image):
+                pil_img = clip.convert("RGB")
+                image_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                self.analyzer.set_image(image_bgr)
+            elif isinstance(clip, list):
+                image_file = None
+                valid_ext = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
+                for p in clip:
+                    if isinstance(p, str) and p.lower().endswith(valid_ext):
+                        image_file = p
+                        break
+
+                if image_file is None:
+                    self._draw_status_indicator('error')
+                    messagebox.showwarning("提示", "剪贴板文件列表中未找到可识别的图像文件")
+                    return "break"
+
+                self.analyzer.load_image(image_file)
+            else:
                 self._draw_status_indicator('error')
-                messagebox.showerror("错误", f"无法加载图像: {e}")
-            except Exception as e:
-                self._draw_status_indicator('error')
-                logger.exception("加载图像时发生未预期的错误")
-                messagebox.showerror("错误", f"发生未预期的错误: {e}")
+                messagebox.showwarning("提示", "剪贴板内容不是图像或图像文件")
+                return "break"
+
+            self._load_image_common()
+            self._draw_status_indicator('ready')
+        except Exception as e:
+            self._draw_status_indicator('error')
+            logger.exception("粘贴图像失败")
+            messagebox.showerror("错误", f"粘贴图像失败: {e}")
+
+        return "break"
 
     def _reset_display(self):
         """重置显示"""
@@ -545,13 +663,37 @@ class CNTAnalyzerGUI:
                 messagebox.showerror("错误", "像素数和微米数必须大于0！")
                 return
 
+            # 修复2: 比例尺变更后，重算所有已有测量结果的长度和宽度
+            old_scale = self.analyzer.scale_um_per_pixel
             self.analyzer.set_scale(pixels, micrometers)
+            new_scale = self.analyzer.scale_um_per_pixel
+            
+            # 重算全局测量结果
+            for m in self.analyzer.measurements:
+                m.length_um = m.length_pixels * new_scale
+                if m.width_mean_um is not None:
+                    width_px = m.width_mean_um / old_scale if old_scale > 0 else 0
+                    m.width_mean_um = width_px * new_scale
+            
+            # 重算所有ROI的测量结果
+            for roi in self.analyzer.rois:
+                for m in roi.measurements:
+                    m.length_um = m.length_pixels * new_scale
+                    if m.width_mean_um is not None:
+                        width_px = m.width_mean_um / old_scale if old_scale > 0 else 0
+                        m.width_mean_um = width_px * new_scale
+            
             scale_text = f"当前比例尺: {pixels:.1f}px = {micrometers:.1f}μm " \
                         f"({self.analyzer.scale_um_per_pixel:.4f}μm/pixel)"
             self.control_panel.update_scale_label(scale_text)
-            messagebox.showinfo("成功", "比例尺已应用！")
+            
+            # 刷新结果显示
+            self._update_results()
+            
+            messagebox.showinfo("成功", "比例尺已应用，测量结果已更新！")
 
         except Exception as e:
+            logger.exception("应用比例尺失败")
             messagebox.showerror("错误", f"应用比例尺失败: {e}")
 
     # ===== ROI操作 =====
@@ -708,6 +850,8 @@ class CNTAnalyzerGUI:
             return
         if not self.live_preview_var.get():
             return
+        if not self._is_preprocess_mode():
+            return
         if self._preprocess_job is not None:
             self.root.after_cancel(self._preprocess_job)
         self._preprocess_job = self.root.after(DEBOUNCE_DELAY_MS, self._apply_preprocessing)
@@ -743,6 +887,8 @@ class CNTAnalyzerGUI:
         val = int(float(value))
         if val % 2 == 0:
             val += 1
+        if self.blur_kernel_var.get() == val:
+            return
         self.blur_kernel_var.set(val)
         self.control_panel.update_blur_label(str(val))
         self._last_preprocess_signature = None
@@ -756,6 +902,8 @@ class CNTAnalyzerGUI:
             val += 1
         if val < 3:
             val = 3
+        if self.adaptive_block_var.get() == val:
+            return
         self.adaptive_block_var.set(val)
         self.control_panel.update_block_label(str(val))
         self._last_preprocess_signature = None
@@ -783,13 +931,20 @@ class CNTAnalyzerGUI:
             max_length = self.max_length_um_var.get()
             min_slenderness = self.min_slenderness_var.get()
 
-            if self.analyzer.binary_image is None:
-                self._apply_preprocessing()
+            # 修复1: 强制校验并重算预处理，确保二值图与当前ROI一致
+            current_signature = self._get_preprocess_signature()
+            if self.analyzer.binary_image is None or current_signature != self._last_preprocess_signature:
+                self._apply_preprocessing(force=True)
 
             measurements = self.analyzer.detect_cnts_hybrid(
                 min_length_um=min_length,
                 max_length_um=max_length,
                 min_slenderness=min_slenderness,
+                split_mode={
+                    "关闭": "off",
+                    "保守": "conservative",
+                    "激进": "aggressive",
+                }.get(self.split_mode_var.get(), self.split_mode_var.get()),
                 roi=self.current_roi
             )
 
@@ -802,6 +957,7 @@ class CNTAnalyzerGUI:
                                 f"在{roi_text if self.current_roi else '全图'}中检测到 {len(measurements)} 个CNT")
 
         except Exception as e:
+            logger.exception("CNT检测失败")
             messagebox.showerror("错误", f"CNT检测失败: {e}")
 
     # ===== 显示更新 =====
@@ -809,6 +965,9 @@ class CNTAnalyzerGUI:
         """更新显示"""
         if self.analyzer.image is None:
             return
+
+        # 同步缩放级别到 ImagePanel（用于比例尺显示）
+        self.image_panel.set_zoom_level(self.zoom_level)
 
         try:
             mode = self.display_var.get()
@@ -864,22 +1023,89 @@ class CNTAnalyzerGUI:
             self.photo = ImageTk.PhotoImage(self.current_image)
 
             self.image_panel.clear_canvas()
-            self.image_panel.create_image(self.photo)
+            self.image_panel.create_image(self.photo, center=True)
             self.image_panel.set_scroll_region(new_w, new_h)
 
         except Exception as e:
             logger.exception(f"显示更新错误: {e}")
 
     def _on_mousewheel(self, event):
-        """鼠标滚轮缩放"""
+        """鼠标滚轮缩放（严格以鼠标位置为中心）"""
+        if self.analyzer.image is None or self.image_panel.canvas is None:
+            return
+
+        canvas = self.image_panel.canvas
+        old_zoom = self.zoom_level
+
+        # 原图尺寸
+        orig_h, orig_w = self.analyzer.image.shape[:2]
+        old_img_w = int(orig_w * old_zoom)
+        old_img_h = int(orig_h * old_zoom)
+
+        view_w = max(1, canvas.winfo_width())
+        view_h = max(1, canvas.winfo_height())
+
+        # 旧图像在画布中的偏移（居中时的 padding）
+        old_offset_x = max(0, (view_w - old_img_w) // 2) if old_img_w < view_w else 0
+        old_offset_y = max(0, (view_h - old_img_h) // 2) if old_img_h < view_h else 0
+
+        # 鼠标在画布坐标系中的位置
+        mouse_canvas_x = canvas.canvasx(event.x)
+        mouse_canvas_y = canvas.canvasy(event.y)
+
+        # 鼠标指向的原图像素坐标（浮点）
+        img_x = (mouse_canvas_x - old_offset_x) / old_zoom
+        img_y = (mouse_canvas_y - old_offset_y) / old_zoom
+
+        # 计算新缩放级别
         if event.num == 4 or event.delta > 0:
             self.zoom_level *= 1.1
         elif event.num == 5 or event.delta < 0:
             self.zoom_level /= 1.1
 
         self.zoom_level = max(0.1, min(5.0, self.zoom_level))
+        if abs(self.zoom_level - old_zoom) < 1e-9:
+            return
+
         self.image_panel.show_status(f"缩放: {self.zoom_level:.0%}")
         self._update_display()
+
+        if self.current_image is None:
+            return
+
+        new_img_w, new_img_h = self.current_image.size
+
+        # 新图像在画布中的偏移（居中时的 padding）
+        new_offset_x = max(0, (view_w - new_img_w) // 2) if new_img_w < view_w else 0
+        new_offset_y = max(0, (view_h - new_img_h) // 2) if new_img_h < view_h else 0
+
+        # 鼠标指向的原图像素在新缩放下的画布坐标
+        new_target_x = img_x * self.zoom_level + new_offset_x
+        new_target_y = img_y * self.zoom_level + new_offset_y
+
+        # 需要滚动到的位置：让 new_target 出现在鼠标的窗口位置 event.x/y
+        scroll_region_w = max(new_img_w, view_w)
+        scroll_region_h = max(new_img_h, view_h)
+
+        desired_left = new_target_x - event.x
+        desired_top = new_target_y - event.y
+
+        if scroll_region_w > view_w:
+            max_left = float(scroll_region_w - view_w)
+            desired_left = max(0.0, min(max_left, float(desired_left)))
+            # Canvas.xview_moveto 使用“总滚动区域宽度”比例
+            x_frac = desired_left / float(scroll_region_w)
+            canvas.xview_moveto(x_frac)
+        else:
+            canvas.xview_moveto(0.0)
+
+        if scroll_region_h > view_h:
+            max_top = float(scroll_region_h - view_h)
+            desired_top = max(0.0, min(max_top, float(desired_top)))
+            y_frac = desired_top / float(scroll_region_h)
+            canvas.yview_moveto(y_frac)
+        else:
+            canvas.yview_moveto(0.0)
 
     # ===== 结果更新 =====
     def _update_results(self):
@@ -912,6 +1138,17 @@ class CNTAnalyzerGUI:
         for label, count in stats['length_distribution'].items():
             text_widget.insert(tk.END, f"{label}: ", 'header')
             text_widget.insert(tk.END, f"{count}根\n", 'value')
+
+        # 宽度鲁棒统计汇总
+        widths_median = [m.width_median_um for m in measurements if m.width_median_um]
+        if widths_median:
+            text_widget.insert(tk.END, "\n===== 宽度统计 (μm) =====\n", 'header')
+            text_widget.insert(tk.END, "中位数均值: ", 'header')
+            text_widget.insert(tk.END, f"{np.mean(widths_median):.3f}\n", 'value')
+            widths_iqr = [m.width_iqr_um for m in measurements if m.width_iqr_um]
+            if widths_iqr:
+                text_widget.insert(tk.END, "IQR均值: ", 'header')
+                text_widget.insert(tk.END, f"{np.mean(widths_iqr):.3f}\n", 'value')
 
         for m in measurements:
             self.result_panel.add_measurement((m.id, f"{m.length_um:.2f}"))
@@ -991,20 +1228,47 @@ class CNTAnalyzerGUI:
             chart = self._init_chart('histogram')
             ax = chart['ax']
             canvas = chart['canvas']
-            if not canvas: return
+            if not canvas:
+                return
 
-            lengths = [m.length_um for m in measurements]
+            lengths = [m.length_um for m in measurements if m.length_um is not None]
             if not lengths:
+                ax.text(0.5, 0.5, "暂无有效长度数据", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=ax.transAxes, color=self.MODERN_COLORS['text_muted'])
                 canvas.draw()
                 return
 
-            bins = [0, 5, 10, 15, 20, 30, 50, 100, 200]
-            ax.hist(lengths, bins=bins, edgecolor='white', alpha=0.8,
-                    color=self.MODERN_COLORS['accent_primary'])
-            
+            max_len = max(lengths)
+            min_len = min(lengths)
+
+            # 动态分箱：避免固定到 200μm 导致长样本全部落在分箱外，从而“看不到柱形”
+            if max_len <= 200 and min_len >= 0:
+                bins = [0, 5, 10, 15, 20, 30, 50, 100, 200]
+            else:
+                right = max_len * 1.05 if max_len > 0 else 1.0
+                left = min(0.0, min_len)
+                if right <= left:
+                    right = left + 1.0
+                bins = np.linspace(left, right, 12)
+
+            counts, _, _ = ax.hist(
+                lengths,
+                bins=bins,
+                edgecolor='white',
+                alpha=0.8,
+                color=self.MODERN_COLORS['accent_primary']
+            )
+
+            # 若数据全部未落入分箱（极端边界情况下），给出明确提示
+            if np.sum(counts) == 0:
+                ax.text(0.5, 0.5, "当前分箱下无可视柱形，请检查比例尺或过滤参数",
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=ax.transAxes, color=self.MODERN_COLORS['warning'])
+
             ax.set_xlabel('长度 (μm)', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
             ax.set_ylabel('数量', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
-            
+
             ax.grid(True, axis='y', alpha=0.3, linestyle='--', color=self.MODERN_COLORS['border'])
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
@@ -1026,20 +1290,30 @@ class CNTAnalyzerGUI:
             chart = self._init_chart('pie', figsize=(6, 5))
             ax = chart['ax']
             canvas = chart['canvas']
-            if not canvas: return
+            if not canvas:
+                return
 
-            labels = list(distribution.keys())
-            sizes = list(distribution.values())
-            
-            # 过滤掉数量为0的部分
-            filtered_data = [(l, s) for l, s in zip(labels, sizes) if s > 0]
-            if not filtered_data:
+            # 确保 distribution 是 dict
+            if not isinstance(distribution, dict):
+                ax.text(0.5, 0.5, "分布数据无效",
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=ax.transAxes, color=self.MODERN_COLORS['text_muted'])
                 canvas.draw()
                 return
-                
-            labels, sizes = zip(*filtered_data)
 
-            colors = [
+            # 过滤掉数量为0的部分
+            filtered_data = [(k, v) for k, v in distribution.items() if v > 0]
+            if not filtered_data:
+                ax.text(0.5, 0.5, "所有分组数量为0",
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=ax.transAxes, color=self.MODERN_COLORS['text_muted'])
+                canvas.draw()
+                return
+
+            labels = [item[0] for item in filtered_data]
+            sizes = [item[1] for item in filtered_data]
+
+            pie_colors = [
                 self.MODERN_COLORS['accent_primary'],
                 self.MODERN_COLORS['accent_secondary'],
                 self.MODERN_COLORS['accent_tertiary'],
@@ -1049,31 +1323,35 @@ class CNTAnalyzerGUI:
                 self.MODERN_COLORS['success'],
                 self.MODERN_COLORS['info']
             ]
-            
+
             wedges, texts, autotexts = ax.pie(
-                sizes, 
-                labels=labels, 
-                autopct='%1.1f%%',
+                sizes,
+                labels=labels,
+                autopct=lambda pct: f'{pct:.1f}%' if pct > 3 else '',
                 startangle=90,
-                pctdistance=0.85,
-                colors=colors[:len(sizes)],
-                textprops={'color': self.MODERN_COLORS['text_secondary']}
+                pctdistance=0.78,
+                colors=pie_colors[:len(sizes)],
+                textprops={'color': self.MODERN_COLORS['text_secondary'], 'fontsize': 9},
+                wedgeprops={'linewidth': 1.5, 'edgecolor': 'white'}
             )
-            
+
             # 环形图效果
-            centre_circle = plt.Circle((0,0), 0.70, fc=self.MODERN_COLORS['bg_secondary'])
+            from matplotlib.patches import Circle as MplCircle
+            centre_circle = MplCircle((0, 0), 0.65, fc=self.MODERN_COLORS['bg_secondary'])
             ax.add_artist(centre_circle)
-            
-            ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
-            ax.set_aspect('equal') # 双重保险
-            
-            # 样式调整
-            plt.setp(autotexts, size=9, weight="bold", color="white")
+
+            # 中心显示总数
+            total = sum(sizes)
+            ax.text(0, 0, f'{total}\n根',
+                    horizontalalignment='center', verticalalignment='center',
+                    fontsize=14, fontweight='bold',
+                    color=self.MODERN_COLORS['accent_primary'])
+
+            ax.set_aspect('equal')
+
+            plt.setp(autotexts, size=8, weight="bold", color="white")
             plt.setp(texts, size=9)
-            
-            # 标题
-            # ax.set_title('长度占比', fontsize=11, fontweight='bold', color=self.MODERN_COLORS['text_primary'], pad=10)
-            
+
             chart['fig'].tight_layout()
             canvas.draw()
 
@@ -1193,11 +1471,13 @@ class CNTAnalyzerGUI:
                             'length_max': float(stats['length_max']),
                             'scale_um_per_pixel': float(self.analyzer.scale_um_per_pixel)
                         },
-                        'measurements': [
+                    'measurements': [
                             {
                                 'id': int(m.id),
                                 'length_um': float(m.length_um),
                                 'width_mean_um': float(m.width_mean_um) if m.width_mean_um else None,
+                                'width_median_um': float(m.width_median_um) if m.width_median_um else None,
+                                'width_iqr_um': float(m.width_iqr_um) if m.width_iqr_um else None,
                                 'slenderness': float(m.slenderness) if m.slenderness else None
                             }
                             for m in measurements
@@ -1209,12 +1489,14 @@ class CNTAnalyzerGUI:
                 elif file_path.endswith('.csv'):
                     with open(file_path, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
-                        writer.writerow(['ID', '长度(μm)', '平均宽度(μm)', '长宽比'])
+                        writer.writerow(['ID', '长度(μm)', '宽度均值(μm)', '宽度中位数(μm)', '宽度IQR(μm)', '长宽比'])
                         for m in measurements:
                             writer.writerow([
                                 m.id,
                                 f"{m.length_um:.2f}",
                                 f"{m.width_mean_um:.2f}" if m.width_mean_um else "N/A",
+                                f"{m.width_median_um:.2f}" if m.width_median_um else "N/A",
+                                f"{m.width_iqr_um:.2f}" if m.width_iqr_um else "N/A",
                                 f"{m.slenderness:.2f}" if m.slenderness else "N/A"
                             ])
 

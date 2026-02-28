@@ -1,25 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_data_files
 
 datas = []
-binaries = []
-hiddenimports = ['skimage.filters', 'skimage.morphology']
-tmp_ret = collect_all('sklearn')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += collect_data_files('skimage')
+datas += collect_data_files('matplotlib')
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=binaries,
+    binaries=[],
     datas=datas,
-    hiddenimports=hiddenimports,
+    hiddenimports=['cv2', 'numpy', 'PIL', 'PIL._imagingtk', 'PIL._tkinter_finder', 'skimage', 'skimage.filters', 'skimage.morphology', 'matplotlib', 'matplotlib.backends.backend_tkagg', 'matplotlib.pyplot'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['matplotlib.tests', 'numpy.random._examples', 'scipy', 'pandas', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'tkinter.test', 'unittest', 'pytest', 'IPython', 'jupyter', 'notebook', 'sphinx', 'pydoc', 'email', 'http.server', 'xmlrpc', 'multiprocessing', 'concurrent.futures', 'ctypes.test', 'pip', 'wheel', 'Cython', 'cython', 'tkinter.tix', 'tkinter.ttk.test', 'idlelib', 'test', 'lib2to3', 'ensurepip', 'venv', 'turtledemo', 'turtle'],
     noarchive=False,
-    optimize=0,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 
@@ -28,12 +26,12 @@ exe = EXE(
     a.scripts,
     a.binaries,
     a.datas,
-    [],
+    [('O', None, 'OPTION'), ('O', None, 'OPTION')],
     name='OptCNT',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
+    strip=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

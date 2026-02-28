@@ -27,5 +27,5 @@ SKELETON_ANGLE_THRESHOLDS = [120, 135, 150, 165]  # 骨架路径追踪角度阈�
 SKELETON_WALK_ANGLE_DEG = 150         # 骨架长度计算角度阈值
 
 # GUI
-DEBOUNCE_DELAY_MS = 250               # 滑块防抖延迟(毫秒)
+DEBOUNCE_DELAY_MS = 380               # 滑块防抖延迟(毫秒)
 # ZOOM_FACTOR, ZOOM_MIN, ZOOM_MAX, OVERLAY_ALPHA removed (unused)
