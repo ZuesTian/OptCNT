@@ -89,8 +89,24 @@ OptCNT/
 ├── widgets.py        # 自定义控件
 ├── models.py         # 数据模型
 ├── utils.py          # 工具函数
-├── requirements.txt  # 依赖列表
+├── requirements.txt  # 运行依赖
+├── requirements-dev.txt # 开发/测试依赖
+├── tests/            # 单元测试
 └── README.md         # 说明文档
+```
+
+## 测试
+
+安装开发依赖：
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+运行测试：
+
+```bash
+pytest -q
 ```
 
 ## 参数说明

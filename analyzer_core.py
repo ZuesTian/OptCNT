@@ -14,11 +14,13 @@ from utils import (
     SCALE_BAR_BLUE_THRESHOLD, SCALE_BAR_BLUE_SCORE_MIN, SCALE_BAR_MIN_SPAN_PX,
     SCALE_BAR_BGR_DIST_MAX, SCALE_BAR_ROI_X_RATIO, SCALE_BAR_ROI_Y_RATIO,
     SCALE_BAR_ASPECT_RATIO_MIN, SCALE_BAR_ASPECT_RATIO_STRICT,
-    SCALE_BAR_OCR_MATCH_THRESHOLD, SCALE_BAR_VALUE_RANGE, SCALE_BAR_DEFAULT_UM,
+    SCALE_BAR_OCR_MATCH_THRESHOLD, SCALE_BAR_OCR_EARLY_STOP_SCORE,
+    SCALE_BAR_VALUE_RANGE, SCALE_BAR_DEFAULT_UM,
     ANALYSIS_BLACKHAT_KERNEL, CALIBRATED_BLUR_KERNEL,
     CALIBRATED_ADAPTIVE_BLOCK, CALIBRATED_ADAPTIVE_C, SKELETON_ANGLE_THRESHOLDS,
     SKELETON_WALK_ANGLE_DEG,
-    CNT_MERGE_MAX_ANGLE_DIFF_DEG, CNT_MERGE_MAX_ALIGNMENT_DEG
+    CNT_MERGE_MAX_ANGLE_DIFF_DEG, CNT_MERGE_MAX_ALIGNMENT_DEG,
+    LENGTH_DISTRIBUTION_BINS_UM, LENGTH_DISTRIBUTION_LABELS
 )
 
 logger = logging.getLogger(__name__)
@@ -224,7 +226,8 @@ class CNTAnalyzer:
                 image_data = np.fromfile(path, dtype=np.uint8)
                 if image_data.size > 0:
                     image = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-            except Exception:
+            except (OSError, ValueError, cv2.error) as exc:
+                logger.warning("Windows path image load fallback failed for %s: %s", path, exc)
                 image = None
         if image is None:
             image = cv2.imread(path)
@@ -519,12 +522,18 @@ class CNTAnalyzer:
             norm = normalize(crop)
             best_char = None
             best_score = None
+            early_stop = False
             for k, temps in self.ocr_templates.items():
                 for temp in temps:
                     score = float(cv2.matchTemplate(norm, temp, cv2.TM_CCOEFF_NORMED)[0][0])
                     if best_score is None or score > best_score:
                         best_score = score
                         best_char = k
+                        if score >= SCALE_BAR_OCR_EARLY_STOP_SCORE:
+                            early_stop = True
+                            break
+                if early_stop:
+                    break
             if best_char is not None and best_score is not None and best_score >= SCALE_BAR_OCR_MATCH_THRESHOLD:
                 tokens.append(best_char)
         
@@ -548,8 +557,8 @@ class CNTAnalyzer:
                     value = float(value_text)
                     if SCALE_BAR_VALUE_RANGE[0] <= value <= SCALE_BAR_VALUE_RANGE[1]:
                         return value
-        except Exception:
-            pass
+        except ValueError as exc:
+            logger.debug("Failed to parse OCR scale value from %r: %s", text, exc)
         return None
 
     def _recognize_scale_value(self, text_roi: np.ndarray) -> Optional[float]:
@@ -1882,6 +1891,15 @@ class CNTAnalyzer:
             'overall': overall_score,
         }
 
+    def _calculate_aggregation_scores(self, uniformity_scores: Dict[str, float]) -> Dict[str, float]:
+        """基于均匀性得分派生团聚风险得分，数值越大表示越团聚。"""
+        keys = ('nearest_neighbor', 'grid_density', 'moran', 'overall')
+        aggregation_scores: Dict[str, float] = {}
+        for key in keys:
+            score = float(uniformity_scores.get(key, 0.0))
+            aggregation_scores[key] = float(np.clip(100.0 - score, 0.0, 100.0))
+        return aggregation_scores
+
     def analyze_spatial_distribution(self,
                                      roi: Optional[ROIRegion] = None,
                                      grid_size: int = 10) -> Dict[str, object]:
@@ -1915,6 +1933,7 @@ class CNTAnalyzer:
             morans_i,
             len(centroids),
         )
+        aggregation_scores = self._calculate_aggregation_scores(uniformity_scores)
 
         return {
             'grid_size': int(grid_size),
@@ -1944,6 +1963,7 @@ class CNTAnalyzer:
             'point_density_grid': point_density_grid.tolist(),
             'coverage_density_grid': coverage_density_grid.tolist(),
             'uniformity_scores': uniformity_scores,
+            'aggregation_scores': aggregation_scores,
         }
 
     def get_statistics(self, roi: Optional[ROIRegion] = None) -> Dict[str, object]:
@@ -1962,12 +1982,10 @@ class CNTAnalyzer:
 
         lengths = [m.length_um for m in measurements]
 
-        length_bins = [0, 5, 15, 30, float('inf')]
-        length_labels = ['<5μm', '5-15μm', '15-30μm', '>30μm']
         length_dist = {}
-        for i, label in enumerate(length_labels):
+        for i, label in enumerate(LENGTH_DISTRIBUTION_LABELS):
             count = sum(1 for l in lengths
-                        if length_bins[i] <= l < length_bins[i + 1])
+                        if LENGTH_DISTRIBUTION_BINS_UM[i] <= l < LENGTH_DISTRIBUTION_BINS_UM[i + 1])
             length_dist[label] = count
 
         spatial_distribution = self.analyze_spatial_distribution(roi)

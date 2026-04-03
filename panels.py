@@ -674,17 +674,32 @@ class ResultPanel(ttk.Frame):
         self.variables = variables
         self.tree: Optional[SortableTreeview] = None
         self.stats_text: Optional[tk.Text] = None
+        self._result_paned: Optional[tk.PanedWindow] = None
+        self._tree_columns = ('ID', '长度(μm)')
 
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         """设置UI"""
-        # 统计信息（固定高度，不随窗口拉伸）
-        stats_frame = ttk.LabelFrame(self, text="统计信息")
-        stats_frame.pack(fill=tk.X, padx=5, pady=5)
+        result_paned = tk.PanedWindow(
+            self,
+            orient=tk.VERTICAL,
+            sashwidth=6,
+            bd=0,
+            bg=self.colors.get('bg_primary', '#FAFBFC'),
+        )
+        result_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self._result_paned = result_paned
 
-        self.stats_text = tk.Text(stats_frame,
+        stats_frame = ttk.LabelFrame(result_paned, text="统计信息")
+        result_paned.add(stats_frame, minsize=150, height=240)
+
+        stats_text_frame = ttk.Frame(stats_frame)
+        stats_text_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
+
+        self.stats_text = tk.Text(stats_text_frame,
                                    height=10,
+                                   wrap=tk.WORD,
                                    bg=self.variables.get('text_bg', '#FFFFFF'),
                                    fg=self.variables.get('text_fg', '#2D3748'),
                                    relief='flat',
@@ -693,7 +708,10 @@ class ResultPanel(ttk.Frame):
                                    highlightcolor=self.colors['accent_primary'],
                                    highlightbackground=self.colors['border'],
                                    font=('Segoe UI', 9))
-        self.stats_text.pack(fill=tk.X, padx=8, pady=5)
+        stats_scrollbar = ttk.Scrollbar(stats_text_frame, orient=tk.VERTICAL, command=self.stats_text.yview)
+        self.stats_text.configure(yscrollcommand=stats_scrollbar.set)
+        self.stats_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        stats_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.stats_text.tag_configure('header', foreground=self.colors['accent_primary'], font=('Segoe UI', 9, 'bold'))
         self.stats_text.tag_configure('value', foreground=self.colors['accent_secondary'], font=('Segoe UI', 9, 'bold'))
@@ -701,14 +719,12 @@ class ResultPanel(ttk.Frame):
         self.stats_text.tag_configure('warning', foreground=self.colors['warning'])
         self.stats_text.tag_configure('error', foreground=self.colors['error'])
 
-        # 测量列表（占据剩余空间）
-        list_frame = ttk.LabelFrame(self, text="测量列表 (点击列标题排序)")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        list_frame = ttk.LabelFrame(result_paned, text="测量列表 (点击列标题排序)")
+        result_paned.add(list_frame, minsize=220)
 
-        columns = ('ID', '长度(μm)')
-        self.tree = SortableTreeview(list_frame, columns=columns, show='headings')
+        self.tree = SortableTreeview(list_frame, columns=self._tree_columns, show='headings')
 
-        for col in columns:
+        for col in self._tree_columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=80 if col == 'ID' else 120)
 
@@ -720,6 +736,37 @@ class ResultPanel(ttk.Frame):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.tree.bind('<<TreeviewSelect>>', self.callbacks.get('on_select_cnt'))
+        self.tree.bind('<Configure>', self._on_tree_resize, add='+')
+        self.after(120, self._set_initial_split)
+
+    def _set_initial_split(self) -> None:
+        """设置结果面板的初始上下分栏比例。"""
+        if self._result_paned is None or not self._result_paned.winfo_exists():
+            return
+
+        total_height = max(1, self._result_paned.winfo_height())
+        if total_height <= 1:
+            self.after(80, self._set_initial_split)
+            return
+
+        stats_height = min(280, max(180, int(total_height * 0.34)))
+        try:
+            self._result_paned.sash_place(0, 0, stats_height)
+        except tk.TclError:
+            return
+
+    def _on_tree_resize(self, event=None) -> None:
+        """根据可用宽度自适应结果列表列宽。"""
+        if self.tree is None:
+            return
+
+        total_width = int(event.width) if event is not None else self.tree.winfo_width()
+        total_width = max(180, total_width)
+        id_width = max(56, min(88, int(total_width * 0.28)))
+        length_width = max(96, total_width - id_width - 6)
+
+        self.tree.column(self._tree_columns[0], width=id_width, minwidth=56, stretch=False)
+        self.tree.column(self._tree_columns[1], width=length_width, minwidth=96, stretch=True)
 
     def clear_stats(self) -> None:
         """清空统计信息"""
@@ -925,7 +972,7 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
             "comparison_summary",
             "对比分析摘要",
             "尚未执行对比分析。使用顶部“对比分析”按钮后，结果会显示在这里。",
-            height=200,
+            height=160,
             title_color=self.colors['accent_amber'],
         )
         self._create_chart_container(

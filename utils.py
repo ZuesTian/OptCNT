@@ -16,6 +16,7 @@ SCALE_BAR_ROI_Y_RATIO = 0.6           # 比例尺搜索区域 y 起始比例
 SCALE_BAR_ASPECT_RATIO_MIN = 5        # 比例尺最小宽高比
 SCALE_BAR_ASPECT_RATIO_STRICT = 8     # 严格宽高比（灰度检测）
 SCALE_BAR_OCR_MATCH_THRESHOLD = 0.4   # OCR 模板匹配最低分
+SCALE_BAR_OCR_EARLY_STOP_SCORE = 0.88 # 高置信模板命中后直接早停，减少无效遍历
 SCALE_BAR_VALUE_RANGE = (0.1, 1000)   # 比例尺数值合法范围
 
 # 预处理
@@ -37,4 +38,23 @@ CNT_MERGE_MAX_ALIGNMENT_DEG = 32.0    # 连接线与CNT主方向夹角上限
 
 # GUI
 DEBOUNCE_DELAY_MS = 380               # 滑块防抖延迟(毫秒)
+CHART_REBUILD_DRAW_LIMIT = 24         # 图表重复刷新一定次数后重建 Figure，减少长期占用
 # ZOOM_FACTOR, ZOOM_MIN, ZOOM_MAX, OVERLAY_ALPHA removed (unused)
+# 缁熻鍒嗗竷
+LENGTH_DISTRIBUTION_BINS_UM = [0.0, 5.0, 15.0, 30.0, float('inf')]
+LENGTH_DISTRIBUTION_LABELS = ['<5μm', '5-15μm', '15-30μm', '>30μm']
+
+
+def get_length_histogram_bins(lengths: list) -> np.ndarray:
+    """Return histogram bins aligned with the exported length distribution."""
+    finite_lengths = [float(v) for v in lengths if np.isfinite(v)]
+    if not finite_lengths:
+        return np.array([0.0, 5.0, 15.0, 30.0, 45.0], dtype=float)
+
+    max_len = max(finite_lengths)
+    base_bins = [edge for edge in LENGTH_DISTRIBUTION_BINS_UM if np.isfinite(edge)]
+    right_edge = max(base_bins[-1], max_len * 1.05 if max_len > 0 else 45.0)
+    bins = np.array(base_bins + [right_edge], dtype=float)
+    if bins[-1] <= bins[-2]:
+        bins[-1] = bins[-2] + 1.0
+    return bins
