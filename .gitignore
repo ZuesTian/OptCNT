@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.whl
+.venv/
+venv/
+env/
+.env
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+*.spec
+*.manifest
+
+# UPX
+upx.exe
+upx.zip
+upx-*/
+
+# YOLO outputs and weights
+runs/
+*.pt
+*.pkl
+*.pkg
+
+# Images (from runs)
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
