@@ -164,18 +164,117 @@ class CNTAnalyzer:
                                     bar_x: int,
                                     bar_y: int,
                                     bar_w: int,
-                                    bar_h: int) -> tuple:
+                                    bar_h: int,
+                                    text_rect: Optional[tuple] = None) -> tuple:
         """根据比例尺条位置构建固定排除区域"""
         height, width = image_shape[:2]
-        pad_x = max(10, int(bar_w * 0.35))
-        pad_top = max(36, int(max(bar_h * 12, bar_w * 0.9)))
-        pad_bottom = max(12, int(bar_h * 3))
+        pad_x = max(14, int(bar_w * 0.45))
+        pad_top = max(28, int(max(bar_h * 9, bar_w * 0.65)))
+        # 比例尺文字更常出现在横线下方，因此下方排除区比上方更宽裕
+        pad_bottom = max(34, int(max(bar_h * 14, bar_w * 0.95)))
 
         x1 = max(0, bar_x - pad_x)
         x2 = min(width, bar_x + bar_w + pad_x)
         y1 = max(0, bar_y - pad_top)
         y2 = min(height, bar_y + bar_h + pad_bottom)
+
+        if text_rect is not None:
+            tx1, ty1, tx2, ty2 = text_rect
+            text_pad_x = max(10, int(max(1, tx2 - tx1) * 0.10))
+            text_pad_y = max(8, int(max(1, ty2 - ty1) * 0.18))
+            x1 = max(0, min(x1, tx1 - text_pad_x))
+            x2 = min(width, max(x2, tx2 + text_pad_x))
+            y1 = max(0, min(y1, ty1 - text_pad_y))
+            y2 = min(height, max(y2, ty2 + text_pad_y))
         return (int(x1), int(y1), int(x2), int(y2))
+
+    def _find_scale_text_rect(self,
+                              image: np.ndarray,
+                              bar_x: int,
+                              bar_y: int,
+                              bar_w: int,
+                              bar_h: int) -> Optional[tuple]:
+        """查找比例尺附近的文字区域，并返回全图坐标。"""
+        h, w = image.shape[:2]
+        search_x1 = max(0, bar_x - int(bar_w * 1.8))
+        search_x2 = min(w, bar_x + bar_w + int(bar_w * 1.2))
+        search_y1 = max(0, bar_y - int(bar_h * 14) - 24)
+        search_y2 = min(h, bar_y + int(bar_h * 14) + 28)
+
+        if search_y2 <= search_y1 or search_x2 <= search_x1:
+            return None
+
+        search_roi = image[search_y1:search_y2, search_x1:search_x2]
+        hsv_t = cv2.cvtColor(search_roi, cv2.COLOR_BGR2HSV)
+        white_mask = (hsv_t[:, :, 1] <= 96) & (hsv_t[:, :, 2] >= 148)
+        white_mask = (white_mask.astype(np.uint8) * 255)
+        white_mask = cv2.morphologyEx(
+            white_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 9)),
+        )
+        white_contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_white = None
+        best_score = None
+        for c in white_contours:
+            x, y, cw, ch = cv2.boundingRect(c)
+            area = cw * ch
+            if area < 40:
+                continue
+            if cw < max(14, int(bar_w * 0.18)) or ch < max(8, int(bar_h * 1.2)):
+                continue
+
+            contour_center_y = search_y1 + y + ch / 2.0
+            # 文字可能位于比例尺上方或下方，但通常不会离横线太远
+            dist_y = abs(contour_center_y - (bar_y + bar_h / 2.0))
+            score = area / (1.0 + dist_y * 0.08)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_white = (x, y, cw, ch)
+
+        if best_white is not None:
+            x, y, cw, ch = best_white
+            return (
+                int(search_x1 + x),
+                int(search_y1 + y),
+                int(search_x1 + x + cw),
+                int(search_y1 + y + ch),
+            )
+
+        # 白底文字框未被稳定识别时，退回到更保守的宽区域，优先覆盖比例尺下方文字
+        fallback_x1 = max(0, bar_x - int(bar_w * 1.6))
+        fallback_x2 = min(w, bar_x + bar_w + int(bar_w * 0.9))
+        fallback_y1 = max(0, bar_y - int(bar_h * 8) - 12)
+        fallback_y2 = min(h, bar_y + int(bar_h * 16) + 28)
+        if fallback_x2 <= fallback_x1 or fallback_y2 <= fallback_y1:
+            return None
+        return (int(fallback_x1), int(fallback_y1), int(fallback_x2), int(fallback_y2))
+
+    def _set_scale_exclusion_from_line(self,
+                                       start: Tuple[float, float],
+                                       end: Tuple[float, float]) -> Optional[tuple]:
+        """根据手动选中的比例尺线段构建排除区域。"""
+        if self.original_image is None:
+            return None
+
+        x1, y1 = start
+        x2, y2 = end
+        min_x = int(round(min(x1, x2)))
+        min_y = int(round(min(y1, y2)))
+        length = max(1, int(round(np.hypot(x2 - x1, y2 - y1))))
+        thickness = max(2, int(round(abs(y2 - y1))) + 2)
+        text_rect = self._find_scale_text_rect(self.original_image, min_x, min_y, length, thickness)
+        rect = self._build_scale_exclusion_rect(
+            self.original_image.shape,
+            min_x,
+            min_y,
+            length,
+            thickness,
+            text_rect=text_rect,
+        )
+        self._set_scale_exclusion_rect(rect)
+        return rect
 
     def get_scale_exclusion_mask(self, roi: Optional[ROIRegion] = None) -> Optional[np.ndarray]:
         """返回全图或 ROI 内的比例尺排除掩码"""
@@ -245,9 +344,12 @@ class CNTAnalyzer:
                             pixels: float,
                             micrometers: float,
                             source: str = "manual",
-                            confidence: str = "high"):
+                            confidence: str = "high",
+                            selection_line: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None):
         """记录手动或界面触发的比例尺应用状态"""
         self.set_scale(pixels, micrometers)
+        if selection_line is not None:
+            self._set_scale_exclusion_from_line(selection_line[0], selection_line[1])
         ocr_hint = None if not self.scale_bar_info else self.scale_bar_info.get('micrometers')
         self._update_scale_status(source, confidence, pixels, micrometers, ocr_hint)
 
@@ -403,51 +505,13 @@ class CNTAnalyzer:
 
     def _extract_text_roi(self, image: np.ndarray, bar_x: int, bar_y: int, bar_w: int, bar_h: int) -> Optional[np.ndarray]:
         """提取比例尺文字区域"""
-        h, w = image.shape[:2]
-        search_x1 = max(0, bar_x - int(bar_w * 0.3))
-        search_x2 = min(w, bar_x + bar_w + int(bar_w * 0.3))
-        search_y1 = max(0, bar_y - int(bar_h * 10) - 20)
-        search_y2 = min(h, bar_y + int(bar_h * 8) + 20)
-
-        if search_y2 <= search_y1 or search_x2 <= search_x1:
+        text_rect = self._find_scale_text_rect(image, bar_x, bar_y, bar_w, bar_h)
+        if text_rect is None:
             return None
-
-        search_roi = image[search_y1:search_y2, search_x1:search_x2]
-        hsv_t = cv2.cvtColor(search_roi, cv2.COLOR_BGR2HSV)
-        white_mask = (hsv_t[:, :, 1] <= 80) & (hsv_t[:, :, 2] >= 160)
-        white_mask = (white_mask.astype(np.uint8) * 255)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 7)))
-        white_contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if white_contours:
-            best_white = None
-            best_score = None
-            for c in white_contours:
-                x, y, cw, ch = cv2.boundingRect(c)
-                area = cw * ch
-                if area < 30:
-                    continue
-                if cw < bar_w * 0.2 or ch < bar_h * 1.0:
-                    continue
-                center_y = search_y1 + y + ch / 2
-                dist = abs(center_y - bar_y)
-                score = area / (1 + dist)
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_white = (x, y, cw, ch)
-            if best_white is not None:
-                x, y, cw, ch = best_white
-                return search_roi[y:y + ch, x:x + cw]
-
-        # 备选方案
-        text_x1 = max(0, bar_x - int(bar_w * 0.2))
-        text_x2 = min(w, bar_x + bar_w + int(bar_w * 0.2))
-        text_y2 = max(0, bar_y - 2)
-        text_y1 = max(0, bar_y - int(bar_h * 10) - 20)
-        if text_y2 > text_y1 and text_x2 > text_x1:
-            return image[text_y1:text_y2, text_x1:text_x2]
-
-        return None
+        x1, y1, x2, y2 = text_rect
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return image[y1:y2, x1:x2]
 
     def _preprocess_ocr_image(self, text_roi: np.ndarray) -> np.ndarray:
         """OCR图像预处理"""
@@ -599,14 +663,23 @@ class CNTAnalyzer:
         bar_x += x0
         bar_y += y0
 
-        text_roi = self._extract_text_roi(image, bar_x, bar_y, bar_w, bar_h)
+        text_rect = self._find_scale_text_rect(image, bar_x, bar_y, bar_w, bar_h)
+        text_roi = None if text_rect is None else image[text_rect[1]:text_rect[3], text_rect[0]:text_rect[2]]
         micrometers = self._recognize_scale_value(text_roi) if text_roi is not None else None
-        exclusion_rect = self._build_scale_exclusion_rect(image.shape, bar_x, bar_y, bar_w, bar_h)
+        exclusion_rect = self._build_scale_exclusion_rect(
+            image.shape,
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            text_rect=text_rect,
+        )
 
         self.scale_bar_info = {
             "pixels": float(bar_w),
             "micrometers": micrometers,
             "bar_rect": (int(bar_x), int(bar_y), int(bar_w), int(bar_h)),
+            "text_rect": text_rect,
             "exclusion_rect": exclusion_rect,
         }
         self._set_scale_exclusion_rect(exclusion_rect)
@@ -1802,6 +1875,67 @@ class CNTAnalyzer:
                 grid[row, col] = float(np.count_nonzero(cell) / max(1, cell.size))
         return grid
 
+    def _build_shadow_density_grid(self,
+                                   offset_x: int,
+                                   offset_y: int,
+                                   width: int,
+                                   height: int,
+                                   grid_size: int,
+                                   roi: Optional[ROIRegion] = None) -> np.ndarray:
+        """按原图阴影强度构建网格，捕捉大束 CNT 下方的暗影团聚区。"""
+        grid = np.zeros((grid_size, grid_size), dtype=float)
+        if width <= 0 or height <= 0:
+            return grid
+
+        if self.original_image is not None:
+            gray_source = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_source = self._get_analysis_gray_image()
+
+        y1 = max(0, int(offset_y))
+        y2 = min(gray_source.shape[0], int(offset_y + height))
+        x1 = max(0, int(offset_x))
+        x2 = min(gray_source.shape[1], int(offset_x + width))
+        if y2 <= y1 or x2 <= x1:
+            return grid
+
+        local_gray = gray_source[y1:y2, x1:x2].copy()
+        if local_gray.size == 0:
+            return grid
+
+        exclusion_mask = self.get_scale_exclusion_mask(roi)
+        if exclusion_mask is not None and exclusion_mask.shape == local_gray.shape and np.any(exclusion_mask):
+            valid_pixels = local_gray[exclusion_mask == 0]
+            fill_value = int(np.median(valid_pixels)) if valid_pixels.size else 255
+            local_gray[exclusion_mask > 0] = fill_value
+
+        kernel_size = max(9, int(round(min(local_gray.shape[:2]) / 18.0)))
+        kernel_size = min(kernel_size, 61)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        blurred = cv2.GaussianBlur(local_gray, (kernel_size, kernel_size), 0)
+
+        darkness = 255.0 - blurred.astype(np.float32)
+        low = float(np.percentile(darkness, 55))
+        high = float(np.percentile(darkness, 96))
+        if high <= low:
+            return grid
+
+        shadow_response = np.clip((darkness - low) / (high - low), 0.0, 1.0)
+
+        local_height, local_width = shadow_response.shape[:2]
+        for row in range(grid_size):
+            cell_y1 = int(row * local_height / grid_size)
+            cell_y2 = int((row + 1) * local_height / grid_size)
+            for col in range(grid_size):
+                cell_x1 = int(col * local_width / grid_size)
+                cell_x2 = int((col + 1) * local_width / grid_size)
+                cell = shadow_response[cell_y1:cell_y2, cell_x1:cell_x2]
+                if cell.size == 0:
+                    continue
+                grid[row, col] = float(np.mean(cell))
+        return grid
+
     def _summarize_density_grid(self, grid: np.ndarray) -> Dict[str, float]:
         """汇总网格分布统计量。"""
         flat_grid = np.asarray(grid, dtype=float).ravel()
@@ -1924,8 +2058,10 @@ class CNTAnalyzer:
         nn_stats = self._calculate_nearest_neighbor_stats(centroid_array, width, height)
         point_density_grid = self._build_centroid_count_grid(centroids, width, height, grid_size)
         coverage_density_grid = self._build_coverage_ratio_grid(local_contours, width, height, grid_size)
+        shadow_density_grid = self._build_shadow_density_grid(offset_x, offset_y, width, height, grid_size, roi=roi)
         point_grid_stats = self._summarize_density_grid(point_density_grid)
         coverage_grid_stats = self._summarize_density_grid(coverage_density_grid)
+        shadow_grid_stats = self._summarize_density_grid(shadow_density_grid)
         morans_i = self._calculate_grid_morans_i(point_density_grid)
         uniformity_scores = self._calculate_uniformity_scores(
             nn_stats['nearest_neighbor_cv'],
@@ -1958,12 +2094,278 @@ class CNTAnalyzer:
             'coverage_grid_entropy': coverage_grid_stats['entropy'],
             'coverage_occupancy_ratio': coverage_grid_stats['occupancy_ratio'],
             'coverage_dispersion_index': coverage_grid_stats['dispersion_index'],
+            'shadow_density_mean': shadow_grid_stats['mean'],
+            'shadow_density_std': shadow_grid_stats['std'],
+            'shadow_density_cv': shadow_grid_stats['cv'],
+            'shadow_grid_entropy': shadow_grid_stats['entropy'],
+            'shadow_occupancy_ratio': shadow_grid_stats['occupancy_ratio'],
+            'shadow_dispersion_index': shadow_grid_stats['dispersion_index'],
             'morans_i': morans_i,
             'density_grid': point_density_grid.tolist(),
             'point_density_grid': point_density_grid.tolist(),
             'coverage_density_grid': coverage_density_grid.tolist(),
+            'shadow_density_grid': shadow_density_grid.tolist(),
             'uniformity_scores': uniformity_scores,
             'aggregation_scores': aggregation_scores,
+        }
+
+    def _is_cnt_in_hotspot(self, measurement: CNTMeasurement, hotspot_mask: np.ndarray, 
+                           offset_x: int, offset_y: int, width: int, height: int, 
+                           grid_size: int) -> bool:
+        """判断CNT的中心点是否落在团聚热点网格内
+        
+        Args:
+            measurement: CNT测量结果
+            hotspot_mask: 热点网格掩码
+            offset_x: ROI的X偏移
+            offset_y: ROI的Y偏移
+            width: ROI宽度
+            height: ROI高度
+            grid_size: 网格大小
+            
+        Returns:
+            bool: True表示CNT在团聚区域内
+        """
+        if hotspot_mask is None or hotspot_mask.size == 0:
+            return False
+            
+        # 计算CNT中心点
+        contour = np.asarray(measurement.contour, dtype=np.int32)
+        if contour.size == 0:
+            return False
+            
+        moments = cv2.moments(contour)
+        if moments["m00"] == 0:
+            return False
+            
+        cx = float(moments["m10"] / moments["m00"])
+        cy = float(moments["m01"] / moments["m00"])
+        
+        # 转换为局部坐标
+        local_cx = cx - offset_x
+        local_cy = cy - offset_y
+        
+        # 转换为网格坐标
+        if width <= 0 or height <= 0:
+            return False
+            
+        grid_col = int(local_cx / width * grid_size)
+        grid_row = int(local_cy / height * grid_size)
+        
+        # 检查是否在网格范围内
+        if grid_row < 0 or grid_row >= grid_size or grid_col < 0 or grid_col >= grid_size:
+            return False
+            
+        return bool(hotspot_mask[grid_row, grid_col])
+
+    @staticmethod
+    def _normalize_hotspot_grid(grid: np.ndarray, percentile: float = 85.0) -> np.ndarray:
+        """Normalize a hotspot grid into 0-1 range using a high-percentile cap."""
+        grid = np.asarray(grid, dtype=float)
+        if grid.size == 0:
+            return np.zeros((0, 0), dtype=float)
+
+        positive = grid[grid > 0]
+        if positive.size == 0:
+            return np.zeros_like(grid, dtype=float)
+
+        upper = float(np.percentile(positive, percentile))
+        if upper <= 0:
+            upper = max(float(np.max(positive)), 1e-6)
+        return np.clip(grid / upper, 0.0, 1.0)
+
+    def _build_spatial_hotspot_masks(self, spatial_distribution: Dict[str, object]) -> Dict[str, np.ndarray]:
+        """Build hotspot masks from spatial-distribution grids."""
+        point_grid = np.array(
+            spatial_distribution.get('point_density_grid') or spatial_distribution.get('density_grid') or [],
+            dtype=float,
+        )
+        coverage_grid = np.array(spatial_distribution.get('coverage_density_grid') or [], dtype=float)
+        shadow_grid = np.array(spatial_distribution.get('shadow_density_grid') or [], dtype=float)
+
+        if point_grid.size == 0 and coverage_grid.size == 0 and shadow_grid.size == 0:
+            empty = np.zeros((0, 0), dtype=float)
+            return {
+                'point_grid': empty,
+                'coverage_grid': empty,
+                'shadow_grid': empty,
+                'hotspot_grid': empty,
+                'hotspot_mask': np.zeros((0, 0), dtype=bool),
+                'severe_mask': np.zeros((0, 0), dtype=bool),
+            }
+
+
+        point_norm = self._normalize_hotspot_grid(point_grid, percentile=86.0)
+        coverage_norm = self._normalize_hotspot_grid(coverage_grid, percentile=82.0)
+        shadow_norm = self._normalize_hotspot_grid(shadow_grid, percentile=84.0)
+        hotspot_grid = np.clip(point_norm * 0.46 + coverage_norm * 0.20 + shadow_norm * 0.34, 0.0, 1.0)
+
+        active_mask = (point_grid > 0) | (coverage_grid > 0) | (shadow_grid > 0)
+        active_scores = hotspot_grid[active_mask]
+        hotspot_mask = np.zeros_like(hotspot_grid, dtype=bool)
+        severe_mask = np.zeros_like(hotspot_grid, dtype=bool)
+
+        if active_scores.size > 0 and float(np.max(active_scores) - np.min(active_scores)) >= 0.08:
+            hotspot_percentile = 78.0 if active_scores.size >= 6 else 65.0
+            severe_percentile = 91.0 if active_scores.size >= 8 else 82.0
+            hotspot_threshold = float(np.percentile(active_scores, hotspot_percentile))
+            severe_threshold = float(np.percentile(active_scores, severe_percentile))
+            hotspot_mask = active_mask & (hotspot_grid >= hotspot_threshold) & (hotspot_grid > 0)
+            severe_mask = active_mask & (hotspot_grid >= severe_threshold) & (hotspot_grid > 0)
+
+        return {
+            'point_grid': point_grid,
+            'coverage_grid': coverage_grid,
+            'shadow_grid': shadow_grid,
+            'hotspot_grid': hotspot_grid,
+            'hotspot_mask': hotspot_mask,
+            'severe_mask': severe_mask,
+        }
+
+    @staticmethod
+    def _summarize_length_statistics(measurements: List[CNTMeasurement]) -> Dict[str, object]:
+        """Summarize CNT length statistics for a measurement subset."""
+        lengths = [float(m.length_um) for m in measurements if m.length_um is not None]
+        length_dist = {label: 0 for label in LENGTH_DISTRIBUTION_LABELS}
+        if not lengths:
+            return {
+                'count': 0,
+                'length_mean': 0.0,
+                'length_std': 0.0,
+                'length_min': 0.0,
+                'length_max': 0.0,
+                'lengths': [],
+                'length_distribution': length_dist,
+            }
+
+        for i, label in enumerate(LENGTH_DISTRIBUTION_LABELS):
+            length_dist[label] = int(sum(
+                1 for length in lengths
+                if LENGTH_DISTRIBUTION_BINS_UM[i] <= length < LENGTH_DISTRIBUTION_BINS_UM[i + 1]
+            ))
+
+        return {
+            'count': int(len(lengths)),
+            'length_mean': float(np.mean(lengths)),
+            'length_std': float(np.std(lengths)),
+            'length_min': float(np.min(lengths)),
+            'length_max': float(np.max(lengths)),
+            'lengths': lengths,
+            'length_distribution': length_dist,
+        }
+
+    def get_dispersed_statistics(self,
+                                 roi: Optional[ROIRegion] = None,
+                                 strictness: str = "all_hotspots") -> Dict[str, object]:
+        """获取排除团聚区域后的分散CNT统计信息
+        
+        Args:
+            roi (Optional[ROIRegion]): 指定ROI区域，若为None则使用全局测量结果
+            
+        Returns:
+            Dict: 包含分散CNT和团聚CNT的统计信息
+        """
+        measurements = roi.measurements if roi else self.measurements
+        mode = str(strictness or "all_hotspots").lower()
+        if mode not in {"all_hotspots", "hotspot_only", "severe_only"}:
+            raise ValueError(f"Unsupported hotspot strictness: {strictness}")
+
+        empty_length_stats = self._summarize_length_statistics([])
+        if not measurements:
+            return {
+                'strictness': mode,
+                'total_count': 0,
+                'dispersed_count': 0,
+                'agglomerated_count': 0,
+                'dispersed_ratio': 0.0,
+                'agglomerated_ratio': 0.0,
+                'dispersed_measurements': [],
+                'agglomerated_measurements': [],
+                'dispersed_length_stats': empty_length_stats,
+                'agglomerated_length_stats': empty_length_stats,
+            }
+        
+        # 获取空间分布分析结果
+        spatial_distribution = self.analyze_spatial_distribution(roi)
+        if not spatial_distribution:
+            dispersed_length_stats = self._summarize_length_statistics(measurements)
+            # 如果没有空间分布数据，返回全部作为分散CNT
+            return {
+                'strictness': mode,
+                'total_count': len(measurements),
+                'dispersed_count': len(measurements),
+                'agglomerated_count': 0,
+                'dispersed_ratio': 1.0,
+                'agglomerated_ratio': 0.0,
+                'dispersed_measurements': list(measurements),
+                'agglomerated_measurements': [],
+                'dispersed_length_stats': dispersed_length_stats,
+                'agglomerated_length_stats': empty_length_stats,
+            }
+        
+        # 获取热点掩码
+        hotspot_info = self._build_spatial_hotspot_masks(spatial_distribution)
+        hotspot_mask = hotspot_info['hotspot_mask']
+        severe_mask = hotspot_info['severe_mask']
+        active_mask = severe_mask if mode == 'severe_only' else hotspot_mask
+        
+        if active_mask.size == 0:
+            dispersed_length_stats = self._summarize_length_statistics(measurements)
+            return {
+                'strictness': mode,
+                'total_count': len(measurements),
+                'dispersed_count': len(measurements),
+                'agglomerated_count': 0,
+                'dispersed_ratio': 1.0,
+                'agglomerated_ratio': 0.0,
+                'dispersed_measurements': list(measurements),
+                'agglomerated_measurements': [],
+                'dispersed_length_stats': dispersed_length_stats,
+                'agglomerated_length_stats': empty_length_stats,
+                'hotspot_mask': hotspot_mask,
+                'severe_mask': severe_mask,
+            }
+        
+        # 构建热点网格
+            
+        # 归一化网格
+        
+        
+        # 构建热点掩码
+        
+        # 获取ROI信息
+        _, offset_x, offset_y, width, height = self._get_local_measurements(roi)
+        grid_size = int(spatial_distribution.get('grid_size', 10))
+        
+        # 分类CNT
+        dispersed_measurements = []
+        agglomerated_measurements = []
+        
+        for measurement in measurements:
+            if self._is_cnt_in_hotspot(measurement, active_mask, offset_x, offset_y, width, height, grid_size):
+                agglomerated_measurements.append(measurement)
+            else:
+                dispersed_measurements.append(measurement)
+        
+        dispersed_count = len(dispersed_measurements)
+        agglomerated_count = len(agglomerated_measurements)
+        total_count = len(measurements)
+        dispersed_ratio = dispersed_count / total_count if total_count > 0 else 0.0
+        agglomerated_ratio = agglomerated_count / total_count if total_count > 0 else 0.0
+
+        return {
+            'strictness': mode,
+            'total_count': total_count,
+            'dispersed_count': dispersed_count,
+            'agglomerated_count': agglomerated_count,
+            'dispersed_ratio': dispersed_ratio,
+            'agglomerated_ratio': agglomerated_ratio,
+            'dispersed_measurements': dispersed_measurements,
+            'agglomerated_measurements': agglomerated_measurements,
+            'dispersed_length_stats': self._summarize_length_statistics(dispersed_measurements),
+            'agglomerated_length_stats': self._summarize_length_statistics(agglomerated_measurements),
+            'hotspot_mask': hotspot_mask,
+            'severe_mask': severe_mask,
         }
 
     def get_statistics(self, roi: Optional[ROIRegion] = None) -> Dict[str, object]:
@@ -1980,23 +2382,10 @@ class CNTAnalyzer:
         if not measurements:
             return {}
 
-        lengths = [m.length_um for m in measurements]
-
-        length_dist = {}
-        for i, label in enumerate(LENGTH_DISTRIBUTION_LABELS):
-            count = sum(1 for l in lengths
-                        if LENGTH_DISTRIBUTION_BINS_UM[i] <= l < LENGTH_DISTRIBUTION_BINS_UM[i + 1])
-            length_dist[label] = count
-
+        length_stats = self._summarize_length_statistics(measurements)
         spatial_distribution = self.analyze_spatial_distribution(roi)
 
         return {
-            'count': int(len(measurements)),
-            'length_mean': float(np.mean(lengths)),
-            'length_std': float(np.std(lengths)),
-            'length_min': float(np.min(lengths)),
-            'length_max': float(np.max(lengths)),
-            'lengths': [float(l) for l in lengths],
-            'length_distribution': {k: int(v) for k, v in length_dist.items()},
+            **length_stats,
             'spatial_distribution': spatial_distribution,
         }

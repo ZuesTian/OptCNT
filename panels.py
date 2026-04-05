@@ -28,6 +28,15 @@ class ControlPanel(ttk.Frame):
         self.colors = colors
         self.callbacks = callbacks
         self.variables = variables
+        self.display_mode_buttons: List[ttk.Radiobutton] = []
+        self.select_scale_button: Optional[ttk.Button] = None
+        self.apply_scale_button: Optional[ttk.Button] = None
+        self.select_roi_button: Optional[ttk.Button] = None
+        self.remove_roi_button: Optional[ttk.Button] = None
+        self.clear_rois_button: Optional[ttk.Button] = None
+        self.auto_suggest_button: Optional[ttk.Button] = None
+        self.detect_button: Optional[ttk.Button] = None
+        self.live_preview_checkbutton: Optional[ttk.Checkbutton] = None
 
         self._setup_ui()
 
@@ -58,9 +67,13 @@ class ControlPanel(ttk.Frame):
         scale_frame = ttk.LabelFrame(parent, text="比例尺设置")
         scale_frame.pack(fill=tk.X, padx=10, pady=8)
 
-        ttk.Button(scale_frame, text="🖱️ 图上选择比例尺",
-                   style='Accent.TButton',
-                   command=self.callbacks.get('select_scale')).pack(fill=tk.X, padx=8, pady=5)
+        self.select_scale_button = ttk.Button(
+            scale_frame,
+            text="🖱️ 图上选择比例尺",
+            style='Accent.TButton',
+            command=self.callbacks.get('select_scale'),
+        )
+        self.select_scale_button.pack(fill=tk.X, padx=8, pady=5)
 
         ttk.Label(scale_frame, text="或手动输入:").pack(anchor=tk.W, padx=8, pady=2)
 
@@ -72,8 +85,12 @@ class ControlPanel(ttk.Frame):
         ttk.Entry(scale_frame, textvariable=self.variables.get('scale_um'),
                   width=15).pack(fill=tk.X, padx=8, pady=2)
 
-        ttk.Button(scale_frame, text="应用比例尺",
-                   command=self.callbacks.get('apply_scale')).pack(fill=tk.X, padx=8, pady=8)
+        self.apply_scale_button = ttk.Button(
+            scale_frame,
+            text="应用比例尺",
+            command=self.callbacks.get('apply_scale'),
+        )
+        self.apply_scale_button.pack(fill=tk.X, padx=8, pady=8)
 
         self.scale_label = ttk.Label(scale_frame, text=f"当前比例尺: 默认 {SCALE_BAR_DEFAULT_UM:g}μm（待应用）",
                                      foreground=self.colors['accent_primary'],
@@ -95,9 +112,13 @@ class ControlPanel(ttk.Frame):
         roi_frame = ttk.LabelFrame(parent, text="ROI管理")
         roi_frame.pack(fill=tk.X, padx=10, pady=8)
 
-        ttk.Button(roi_frame, text="➕ 选择新ROI",
-                   style='Accent.TButton',
-                   command=self.callbacks.get('select_roi')).pack(fill=tk.X, padx=8, pady=5)
+        self.select_roi_button = ttk.Button(
+            roi_frame,
+            text="➕ 选择新ROI",
+            style='Accent.TButton',
+            command=self.callbacks.get('select_roi'),
+        )
+        self.select_roi_button.pack(fill=tk.X, padx=8, pady=5)
 
         ttk.Label(roi_frame, text="已选择的ROI:").pack(anchor=tk.W, padx=8, pady=2)
 
@@ -118,10 +139,18 @@ class ControlPanel(ttk.Frame):
         btn_frame = ttk.Frame(roi_frame)
         btn_frame.pack(fill=tk.X, padx=8, pady=5)
         
-        ttk.Button(btn_frame, text="❌ 删除",
-                   command=self.callbacks.get('remove_roi')).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        ttk.Button(btn_frame, text="🗑️ 清空",
-                   command=self.callbacks.get('clear_rois')).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        self.remove_roi_button = ttk.Button(
+            btn_frame,
+            text="❌ 删除",
+            command=self.callbacks.get('remove_roi'),
+        )
+        self.remove_roi_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        self.clear_rois_button = ttk.Button(
+            btn_frame,
+            text="🗑️ 清空",
+            command=self.callbacks.get('clear_rois'),
+        )
+        self.clear_rois_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
 
     def _create_display_frame(self, parent: tk.Widget) -> None:
         """创建显示模式框架"""
@@ -136,11 +165,17 @@ class ControlPanel(ttk.Frame):
             ("实时骨架预览", "skeleton_preview")
         ]
 
+        self.display_mode_buttons.clear()
         for text, value in modes:
-            ttk.Radiobutton(display_frame, text=text,
-                            variable=self.variables.get('display_mode'),
-                            value=value,
-                            command=self.callbacks.get('on_display_mode_change')).pack(anchor=tk.W, padx=12, pady=4)
+            radio = ttk.Radiobutton(
+                display_frame,
+                text=text,
+                variable=self.variables.get('display_mode'),
+                value=value,
+                command=self.callbacks.get('on_display_mode_change'),
+            )
+            radio.pack(anchor=tk.W, padx=12, pady=4)
+            self.display_mode_buttons.append(radio)
 
     def _create_preprocess_frame(self, parent: tk.Widget) -> None:
         """创建预处理参数框架"""
@@ -214,11 +249,20 @@ class ControlPanel(ttk.Frame):
             command=self.callbacks.get('on_bridge_change'))
         self.bridge_scale.pack(fill=tk.X, padx=12, pady=(0, 8))
 
-        ttk.Button(
+        self.live_preview_checkbutton = ttk.Checkbutton(
+            preprocess_frame,
+            text="启用实时预览（调整参数时自动刷新）",
+            variable=self.variables.get('live_preview'),
+            command=self.callbacks.get('on_live_preview_toggle'),
+        )
+        self.live_preview_checkbutton.pack(anchor=tk.W, padx=12, pady=(0, 8))
+
+        self.auto_suggest_button = ttk.Button(
             preprocess_frame,
             text="♻ 重新自动推荐参数",
             command=self.callbacks.get('auto_suggest_params'),
-        ).pack(fill=tk.X, padx=12, pady=(0, 10))
+        )
+        self.auto_suggest_button.pack(fill=tk.X, padx=12, pady=(0, 10))
 
     def _create_analysis_frame(self, parent: tk.Widget) -> None:
         """创建分析按钮框架"""
@@ -280,9 +324,13 @@ class ControlPanel(ttk.Frame):
             command=self.callbacks.get('on_merge_distance_change'))
         self.merge_distance_scale.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Button(analysis_frame, text="🔍 开始检测CNT",
-                   style='Danger.TButton',
-                   command=self.callbacks.get('detect_cnt')).pack(fill=tk.X, padx=8, pady=10)
+        self.detect_button = ttk.Button(
+            analysis_frame,
+            text="🔍 开始检测CNT",
+            style='Danger.TButton',
+            command=self.callbacks.get('detect_cnt'),
+        )
+        self.detect_button.pack(fill=tk.X, padx=8, pady=10)
 
         self.analysis_status_label = ttk.Label(
             analysis_frame,
@@ -342,6 +390,29 @@ class ControlPanel(ttk.Frame):
         """获取选中的ROI索引"""
         selection = self.roi_listbox.curselection()
         return selection[0] if selection else -1
+
+    @staticmethod
+    def _set_widget_enabled(widget: Optional[ttk.Widget], enabled: bool) -> None:
+        """统一设置 ttk 控件启用状态。"""
+        if widget is None:
+            return
+        if enabled:
+            widget.state(['!disabled'])
+        else:
+            widget.state(['disabled'])
+
+    def set_interaction_state(self, *, has_image: bool, has_rois: bool) -> None:
+        """根据当前上下文启用或禁用关键交互入口。"""
+        self._set_widget_enabled(self.select_scale_button, has_image)
+        self._set_widget_enabled(self.apply_scale_button, has_image)
+        self._set_widget_enabled(self.select_roi_button, has_image)
+        self._set_widget_enabled(self.remove_roi_button, has_rois)
+        self._set_widget_enabled(self.clear_rois_button, has_rois)
+        self._set_widget_enabled(self.auto_suggest_button, has_image)
+        self._set_widget_enabled(self.detect_button, has_image)
+
+        for radio in self.display_mode_buttons:
+            self._set_widget_enabled(radio, has_image)
 
 
 class ImagePanel(ttk.Frame):
@@ -498,9 +569,23 @@ class ImagePanel(ttk.Frame):
             elif self.select_mode == 'scale':
                 x1, y1 = self.select_start
                 x2, y2 = self.select_end
-                length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                ox, oy = self._image_origin
+                iw, ih = self._image_size
+                if iw <= 0 or ih <= 0:
+                    self.cancel_selection()
+                    return
+
+                ix1 = max(0.0, min(float(iw), x1 - ox))
+                iy1 = max(0.0, min(float(ih), y1 - oy))
+                ix2 = max(0.0, min(float(iw), x2 - ox))
+                iy2 = max(0.0, min(float(ih), y2 - oy))
+                length = ((ix2 - ix1) ** 2 + (iy2 - iy1) ** 2) ** 0.5
                 if length > MIN_SCALE_LENGTH:  # 最小长度限制
-                    self.on_select_complete(length)
+                    self.on_select_complete({
+                        'length': float(length),
+                        'start': (float(ix1), float(iy1)),
+                        'end': (float(ix2), float(iy2)),
+                    })
 
         # 清除选择图形
         if self.select_rect_id:
@@ -647,6 +732,14 @@ class ImagePanel(ttk.Frame):
         """清空画布"""
         self.canvas.delete("all")
 
+    def set_image_actions_enabled(self, has_image: bool) -> None:
+        """同步图像区交互按钮状态。"""
+        if hasattr(self, 'fit_button') and self.fit_button is not None:
+            if has_image:
+                self.fit_button.state(['!disabled'])
+            else:
+                self.fit_button.state(['disabled'])
+
     def create_image(self, photo, center: bool = True) -> int:
         """创建图像，默认居中显示"""
         if center:
@@ -792,6 +885,7 @@ class ScrollableDashboardPanel(ttk.Frame):
         super().__init__(parent, **kwargs)
         self.colors = colors
         self.chart_frames = {}
+        self.chart_placeholders = {}
         self.text_widgets = {}
         self.section_containers = {}
         self.scrollable_frame: Optional[ScrollableFrame] = None
@@ -847,6 +941,10 @@ class ScrollableDashboardPanel(ttk.Frame):
 
         self.section_containers[key] = container
         self.chart_frames[key] = chart_area
+        self.chart_placeholders[key] = placeholder or ""
+
+        if placeholder:
+            self.clear_chart_content(key)
 
     def _create_text_container(self,
                                key: str,
@@ -896,6 +994,27 @@ class ScrollableDashboardPanel(ttk.Frame):
         """获取指定图表容器"""
         return self.chart_frames.get(key)
 
+    def clear_chart_content(self, key: str, placeholder: Optional[str] = None) -> None:
+        """清空图表容器并恢复占位态。"""
+        frame = self.chart_frames.get(key)
+        if frame is None:
+            return
+
+        for child in frame.winfo_children():
+            child.destroy()
+
+        placeholder_text = self.chart_placeholders.get(key, "") if placeholder is None else placeholder
+        self.chart_placeholders[key] = placeholder_text or ""
+        if placeholder_text:
+            ttk.Label(
+                frame,
+                text=placeholder_text,
+                style='Card.TLabel',
+                foreground=self.colors['text_secondary'],
+                justify=tk.CENTER,
+                wraplength=560,
+            ).pack(expand=True, padx=14, pady=14)
+
     def set_section_height(self, key: str, height: int) -> None:
         """调整指定区域的高度"""
         container = self.section_containers.get(key)
@@ -943,22 +1062,14 @@ class AdvancedAnalysisPanel(ScrollableDashboardPanel):
         """设置高级分析布局"""
         self._create_chart_container(
             "histogram",
-            "长度分布直方图",
+            "阴影团聚与均匀度",
+            placeholder="完成检测后，这里会显示当前图像或当前 ROI 的阴影团聚与均匀度双指标。",
             title_color=self.colors['accent_primary'],
         )
         self._create_chart_container(
-            "pie",
-            "长度占比饼状图",
-            title_color=self.colors['accent_secondary'],
-        )
-        self._create_chart_container(
-            "cluster",
-            "聚类分析 (长度 vs 宽度)",
-            title_color=self.colors['accent_tertiary'],
-        )
-        self._create_chart_container(
             "heatmap",
-            "空间分布热图",
+            "阴影团聚热图",
+            placeholder="完成检测后，这里会显示阴影团聚的空间热点热图。",
             title_color=self.colors['accent_teal'],
         )
 

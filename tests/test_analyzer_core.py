@@ -15,12 +15,73 @@ def _make_measurement(measurement_id: int, length_um: float) -> CNTMeasurement:
     )
 
 
+def _make_square_measurement(measurement_id: int, length_um: float, center_x: int, center_y: int) -> CNTMeasurement:
+    contour = np.array(
+        [
+            [[center_x - 2, center_y - 2]],
+            [[center_x + 2, center_y - 2]],
+            [[center_x + 2, center_y + 2]],
+            [[center_x - 2, center_y + 2]],
+        ],
+        dtype=np.int32,
+    )
+    return CNTMeasurement(
+        id=measurement_id,
+        length_pixels=length_um,
+        length_um=length_um,
+        contour=contour,
+    )
+
+
 def test_parse_scale_value_accepts_numeric_text_and_rejects_out_of_range_values():
     analyzer = CNTAnalyzer()
 
     assert analyzer._parse_scale_value("Scale 10.5 um") == 10.5
     assert analyzer._parse_scale_value("0.05 um") is None
     assert analyzer._parse_scale_value("10000 um") is None
+
+
+def test_record_manual_scale_builds_exclusion_rect_from_selected_line():
+    analyzer = CNTAnalyzer()
+    analyzer.original_image = np.zeros((240, 320, 3), dtype=np.uint8)
+
+    analyzer.record_manual_scale(
+        60.0,
+        10.0,
+        selection_line=((220.0, 190.0), (280.0, 190.0)),
+    )
+
+    rect = analyzer.scale_exclusion_rect
+    assert rect is not None
+    x1, y1, x2, y2 = rect
+    assert x1 <= 220
+    assert x2 >= 280
+    assert y1 < 190
+    assert y2 > 220
+    assert analyzer.get_scale_status()["exclusion_enabled"] is True
+
+    mask = analyzer.get_scale_exclusion_mask()
+    assert mask is not None
+    assert mask[200, 250] == 255
+
+
+def test_build_scale_exclusion_rect_expands_to_cover_text_rect():
+    analyzer = CNTAnalyzer()
+
+    rect = analyzer._build_scale_exclusion_rect(
+        (240, 320, 3),
+        248,
+        184,
+        42,
+        4,
+        text_rect=(176, 190, 302, 226),
+    )
+
+    x1, y1, x2, y2 = rect
+    assert x1 <= 176
+    assert x2 >= 302
+    assert y1 <= 190
+    assert y2 >= 226
 
 
 def test_get_statistics_uses_shared_length_distribution_bins():
@@ -108,10 +169,16 @@ def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
         "_build_coverage_ratio_grid",
         lambda local_contours, width, height, grid_size: np.full((grid_size, grid_size), 0.25, dtype=float),
     )
+    monkeypatch.setattr(
+        analyzer,
+        "_build_shadow_density_grid",
+        lambda offset_x, offset_y, width, height, grid_size, roi=None: np.full((grid_size, grid_size), 0.4, dtype=float),
+    )
 
     summary_values = iter([
         {"mean": 1.0, "std": 0.5, "cv": 0.5, "entropy": 0.8, "occupancy_ratio": 0.6, "dispersion_index": 1.1},
         {"mean": 0.25, "std": 0.1, "cv": 0.4, "entropy": 0.7, "occupancy_ratio": 0.5, "dispersion_index": 0.9},
+        {"mean": 0.4, "std": 0.2, "cv": 0.3, "entropy": 0.65, "occupancy_ratio": 0.55, "dispersion_index": 0.8},
     ])
     monkeypatch.setattr(analyzer, "_summarize_density_grid", lambda grid: next(summary_values))
     monkeypatch.setattr(analyzer, "_calculate_grid_morans_i", lambda grid: 0.2)
@@ -119,7 +186,49 @@ def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
     result = analyzer.analyze_spatial_distribution(grid_size=4)
 
     assert "aggregation_scores" in result
+    assert result["shadow_density_mean"] == pytest.approx(0.4)
+    assert np.allclose(np.array(result["shadow_density_grid"], dtype=float), np.full((4, 4), 0.4))
     uniformity_scores = result["uniformity_scores"]
     aggregation_scores = result["aggregation_scores"]
     for key in ("nearest_neighbor", "grid_density", "moran", "overall"):
         assert aggregation_scores[key] == pytest.approx(100.0 - uniformity_scores[key])
+
+
+def test_get_dispersed_statistics_filters_hotspots_and_supports_strictness(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurements = [
+        _make_square_measurement(0, 10.0, 25, 25),
+        _make_square_measurement(1, 20.0, 75, 25),
+        _make_square_measurement(2, 30.0, 75, 75),
+    ]
+    analyzer.measurements = measurements
+
+    monkeypatch.setattr(analyzer, "analyze_spatial_distribution", lambda roi=None: {"grid_size": 2})
+    monkeypatch.setattr(
+        analyzer,
+        "_build_spatial_hotspot_masks",
+        lambda spatial_distribution: {
+            "hotspot_mask": np.array([[True, True], [False, False]], dtype=bool),
+            "severe_mask": np.array([[True, False], [False, False]], dtype=bool),
+        },
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 100, 100),
+    )
+
+    stats = analyzer.get_dispersed_statistics()
+
+    assert stats["strictness"] == "all_hotspots"
+    assert stats["dispersed_count"] == 1
+    assert stats["agglomerated_count"] == 2
+    assert [m.id for m in stats["dispersed_measurements"]] == [2]
+    assert stats["dispersed_length_stats"]["length_mean"] == pytest.approx(30.0)
+
+    severe_only = analyzer.get_dispersed_statistics(strictness="severe_only")
+
+    assert severe_only["strictness"] == "severe_only"
+    assert severe_only["dispersed_count"] == 2
+    assert severe_only["agglomerated_count"] == 1
+    assert [m.id for m in severe_only["agglomerated_measurements"]] == [0]

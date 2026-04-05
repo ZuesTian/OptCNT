@@ -4,7 +4,10 @@ GUI主控制器模块 - 负责协调各个面板和核心分析功能
 import json
 import logging
 import csv
+import os
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from itertools import repeat
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -98,6 +101,12 @@ class CNTAnalyzerGUI:
         self._analysis_cache_limit = 48
         self._last_auto_suggest_result = None
         self._last_root_size: Optional[Tuple[int, int]] = None
+        self._pending_scale_selection = None
+        self.open_image_button: Optional[ttk.Button] = None
+        self.paste_image_button: Optional[ttk.Button] = None
+        self.save_results_button: Optional[ttk.Button] = None
+        self.export_report_button: Optional[ttk.Button] = None
+        self.compare_analysis_button: Optional[ttk.Button] = None
         
         # 图表缓存
         self._charts = {
@@ -121,6 +130,7 @@ class CNTAnalyzerGUI:
 
         # 设置UI
         self._setup_ui()
+        self._refresh_interaction_state()
 
         # 快捷键：从剪贴板粘贴图像
         self.root.bind_all("<Control-v>", self._paste_image_from_clipboard)
@@ -395,6 +405,22 @@ class CNTAnalyzerGUI:
                 return key
         return 'image'
 
+    def _select_center_tab(self, tab_key: str) -> bool:
+        """切换到指定的中间标签页；标签不存在时安全返回。"""
+        if not hasattr(self, 'center_notebook'):
+            return False
+
+        target_tab = self._center_tabs.get(tab_key)
+        if target_tab is None:
+            return False
+
+        current_tab = str(self.center_notebook.select())
+        if current_tab != str(target_tab):
+            self.center_notebook.select(target_tab)
+            self.center_notebook.update_idletasks()
+
+        return True
+
     def _get_pane_layout_profile(self, tab_key: Optional[str] = None) -> dict:
         """根据当前标签页返回三栏布局配置。"""
         active_key = tab_key or self._get_active_center_tab_key()
@@ -509,16 +535,41 @@ class CNTAnalyzerGUI:
         button_frame = tk.Frame(toolbar, bg=self.MODERN_COLORS['bg_secondary'])
         button_frame.pack(side=tk.LEFT, padx=10, pady=8)
 
-        ttk.Button(button_frame, text="📂 打开图像", style='Accent.TButton',
-                   command=self._open_image).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="📋 粘贴图像", style='Accent.TButton',
-                   command=self._paste_image_from_clipboard).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="💾 保存结果", style='Success.TButton',
-                   command=self._save_results).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="📊 导出报告", style='Warning.TButton',
-                   command=self._export_report).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="🔬 对比分析", style='Accent.TButton',
-                   command=self._open_compare_mode_dialog).pack(side=tk.LEFT, padx=2)
+        self.open_image_button = ttk.Button(
+            button_frame,
+            text="📂 打开图像",
+            style='Accent.TButton',
+            command=self._open_image,
+        )
+        self.open_image_button.pack(side=tk.LEFT, padx=2)
+        self.paste_image_button = ttk.Button(
+            button_frame,
+            text="📋 粘贴图像",
+            style='Accent.TButton',
+            command=self._paste_image_from_clipboard,
+        )
+        self.paste_image_button.pack(side=tk.LEFT, padx=2)
+        self.save_results_button = ttk.Button(
+            button_frame,
+            text="💾 保存结果",
+            style='Success.TButton',
+            command=self._save_results,
+        )
+        self.save_results_button.pack(side=tk.LEFT, padx=2)
+        self.export_report_button = ttk.Button(
+            button_frame,
+            text="📊 导出报告",
+            style='Warning.TButton',
+            command=self._export_report,
+        )
+        self.export_report_button.pack(side=tk.LEFT, padx=2)
+        self.compare_analysis_button = ttk.Button(
+            button_frame,
+            text="🔬 对比分析",
+            style='Accent.TButton',
+            command=self._open_compare_mode_dialog,
+        )
+        self.compare_analysis_button.pack(side=tk.LEFT, padx=2)
         
         ttk.Separator(button_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
         
@@ -548,6 +599,100 @@ class CNTAnalyzerGUI:
         color = colors.get(state, self.MODERN_COLORS['text_muted'])
         self.status_indicator.delete('all')
         self.status_indicator.create_oval(2, 2, 10, 10, fill=color, outline='')
+
+    @staticmethod
+    def _set_ttk_widget_enabled(widget: Optional[ttk.Widget], enabled: bool) -> None:
+        """统一设置 ttk 控件状态。"""
+        if widget is None:
+            return
+        if enabled:
+            widget.state(['!disabled'])
+        else:
+            widget.state(['disabled'])
+
+    def _get_active_measurements(self) -> List[CNTMeasurement]:
+        """返回当前上下文下的测量结果。"""
+        if self.current_roi is not None:
+            return list(self.current_roi.measurements)
+        return list(self.analyzer.measurements)
+
+    def _refresh_interaction_state(self) -> None:
+        """根据当前上下文启用或禁用关键交互入口。"""
+        has_image = self.analyzer.image is not None
+        has_rois = bool(self.analyzer.rois)
+        has_measurements = bool(self._get_active_measurements())
+
+        if self.control_panel is not None:
+            self.control_panel.set_interaction_state(has_image=has_image, has_rois=has_rois)
+        if self.image_panel is not None:
+            self.image_panel.set_image_actions_enabled(has_image)
+
+        self._set_ttk_widget_enabled(self.save_results_button, has_measurements)
+        self._set_ttk_widget_enabled(self.export_report_button, has_measurements)
+        self._set_ttk_widget_enabled(self.compare_analysis_button, True)
+
+    def _sync_views(self,
+                    *,
+                    refresh_display: bool = True,
+                    refresh_results: bool = True,
+                    refresh_analysis: bool = True,
+                    refresh_controls: bool = True,
+                    refresh_comparison: bool = False,
+                    clear_comparison: bool = False) -> None:
+        """统一刷新主界面各视图，避免局部更新导致状态不一致。"""
+        if refresh_display:
+            if self.analyzer.image is not None:
+                self._update_display()
+            elif self.image_panel is not None:
+                self.current_image = None
+                self.photo = None
+                self.image_panel.clear_canvas()
+                self.image_panel.hide_status()
+
+        if refresh_results:
+            self._update_results()
+
+        if refresh_analysis:
+            self._update_advanced_analysis()
+
+        if refresh_comparison:
+            if clear_comparison:
+                self._clear_comparison_analysis()
+            elif self.comparison_panel is not None:
+                self.comparison_panel.refresh_layout()
+
+        if refresh_controls:
+            self._refresh_interaction_state()
+
+    def _clear_advanced_analysis(self, reset_scroll: bool = False) -> None:
+        """清空高级分析图表并恢复占位态。"""
+        if self.analysis_panel is None:
+            return
+
+        for key in ('histogram', 'pie', 'cluster', 'heatmap'):
+            self._dispose_chart(key)
+            self.analysis_panel.clear_chart_content(key)
+
+        self.analysis_panel.refresh_layout()
+        if reset_scroll:
+            self.analysis_panel.scroll_to_top()
+
+    def _clear_comparison_analysis(self, reset_scroll: bool = False) -> None:
+        """清空对比分析内容并恢复占位态。"""
+        if self.comparison_panel is None:
+            return
+
+        self._dispose_chart('comparison')
+        self.comparison_panel.set_section_height('comparison_summary', 160)
+        self.comparison_panel.set_section_height('comparison', 1120)
+        self.comparison_panel.set_text_content(
+            'comparison_summary',
+            "尚未执行对比分析。使用顶部“对比分析”按钮后，结果会显示在这里。",
+        )
+        self.comparison_panel.clear_chart_content('comparison')
+        self.comparison_panel.refresh_layout()
+        if reset_scroll:
+            self.comparison_panel.scroll_to_top()
 
     def _setup_control_panel(self, parent):
         """设置控制面板"""
@@ -738,7 +883,6 @@ class CNTAnalyzerGUI:
     def _load_image_common(self):
         """加载图像后的通用流程"""
         self._reset_display()
-        self._update_display()
 
         self.scale_um_var.set(SCALE_BAR_DEFAULT_UM)
         scale_result = self.analyzer.apply_detected_scale(default_micrometers=SCALE_BAR_DEFAULT_UM)
@@ -834,6 +978,7 @@ class CNTAnalyzerGUI:
     def _reset_display(self):
         """重置显示"""
         self.zoom_level = 1.0
+        self._pending_scale_selection = None
         if self.image_panel is not None:
             self.image_panel.set_zoom_level(self.zoom_level)
         self.current_roi = None
@@ -846,7 +991,7 @@ class CNTAnalyzerGUI:
         self.analyzer.skeleton_overlay = None
         self._last_preprocess_signature = None
         self.control_panel.clear_roi_list()
-        self._update_results()
+        self._sync_views()
         self._refresh_scale_status_ui()
         self._refresh_analysis_status_ui()
 
@@ -854,16 +999,36 @@ class CNTAnalyzerGUI:
     def _select_scale_on_image(self):
         """在图像上选择比例尺"""
         if self.analyzer.image is None:
-            messagebox.showwarning("警告", "请先打开图像！")
+            self.control_panel.update_scale_status(
+                "比例尺状态: 请先加载图像后再选择比例尺",
+                color=self.MODERN_COLORS['warning'],
+            )
+            self.image_panel.show_status("请先加载图像后再选择比例尺")
             return
 
         def on_scale_selected(length):
-            # 画布像素 → 原图像素（消除缩放影响）
-            real_length = length / self.zoom_level
+            selection = length if isinstance(length, dict) else None
+            if selection is not None:
+                zoom = self.zoom_level if self.zoom_level > 0 else 1.0
+                real_length = float(selection.get('length', 0.0)) / zoom
+                start = selection.get('start') or (0.0, 0.0)
+                end = selection.get('end') or (0.0, 0.0)
+                self._pending_scale_selection = {
+                    'start': (float(start[0]) / zoom, float(start[1]) / zoom),
+                    'end': (float(end[0]) / zoom, float(end[1]) / zoom),
+                }
+            else:
+                # 兼容旧回调格式
+                real_length = length / self.zoom_level
+                self._pending_scale_selection = None
             self.scale_pixels_var.set(real_length)
-            messagebox.showinfo("比例尺选择",
-                                f"已选择比例尺长度: {real_length:.1f}像素\n"
-                                "请输入对应的微米数并点击'应用比例尺'")
+            self.control_panel.update_scale_status(
+                f"比例尺状态: 已选中 {real_length:.1f}px，请输入对应微米数后应用",
+                color=self.MODERN_COLORS['info'],
+            )
+            self.image_panel.show_status(
+                f"已选择比例尺长度 {real_length:.1f}px，请输入对应微米数并点击“应用比例尺”"
+            )
 
         self.image_panel.start_scale_selection(on_scale_selected)
         self.image_panel.show_status("请在图像上拖拽绘制比例尺线段")
@@ -880,8 +1045,21 @@ class CNTAnalyzerGUI:
 
             # 修复2: 比例尺变更后，重算所有已有测量结果的长度和宽度
             old_scale = self.analyzer.scale_um_per_pixel
-            self.analyzer.record_manual_scale(pixels, micrometers, source='manual', confidence='high')
+            selection_line = None
+            if isinstance(self._pending_scale_selection, dict):
+                start = self._pending_scale_selection.get('start')
+                end = self._pending_scale_selection.get('end')
+                if start is not None and end is not None:
+                    selection_line = (start, end)
+            self.analyzer.record_manual_scale(
+                pixels,
+                micrometers,
+                source='manual',
+                confidence='high',
+                selection_line=selection_line,
+            )
             new_scale = self.analyzer.scale_um_per_pixel
+            self._last_preprocess_signature = None
             
             # 重算全局测量结果
             for m in self.analyzer.measurements:
@@ -912,10 +1090,9 @@ class CNTAnalyzerGUI:
 
             self._refresh_scale_status_ui()
             self._refresh_analysis_status_ui()
-            
-            # 刷新结果显示
-            self._update_results()
-            self._update_display()
+            if self._is_preprocess_mode():
+                self._apply_preprocessing(force=True)
+            self._sync_views()
             
             messagebox.showinfo("成功", "比例尺已应用，测量结果已更新！")
 
@@ -930,7 +1107,11 @@ class CNTAnalyzerGUI:
     def _select_roi(self):
         """选择ROI"""
         if self.analyzer.image is None:
-            messagebox.showwarning("警告", "请先打开图像！")
+            self.control_panel.update_analysis_status(
+                "检测输入状态: 请先加载图像后再选择 ROI",
+                color=self.MODERN_COLORS['warning'],
+            )
+            self.image_panel.show_status("请先加载图像后再选择 ROI")
             return
 
         def on_roi_selected(coords):
@@ -959,8 +1140,7 @@ class CNTAnalyzerGUI:
                 self._apply_preprocessing(force=True)
             elif self.live_preview_var.get():
                 self._schedule_preprocessing()
-            else:
-                self._update_display()
+            self._sync_views()
 
         self.image_panel.start_roi_selection(on_roi_selected)
         self.image_panel.show_status("请在图像上拖拽绘制ROI矩形")
@@ -975,9 +1155,7 @@ class CNTAnalyzerGUI:
                 self._apply_preprocessing(force=True)
             elif self.live_preview_var.get():
                 self._schedule_preprocessing()
-            else:
-                self._update_display()
-            self._update_results()
+            self._sync_views()
 
     def _remove_selected_roi(self):
         """删除选中的ROI"""
@@ -991,9 +1169,7 @@ class CNTAnalyzerGUI:
             self._last_preprocess_signature = None
             if self._is_preprocess_mode():
                 self._apply_preprocessing(force=True)
-            else:
-                self._update_display()
-            self._update_results()
+            self._sync_views()
 
     def _clear_all_rois(self):
         """清空所有ROI"""
@@ -1003,9 +1179,7 @@ class CNTAnalyzerGUI:
         self._last_preprocess_signature = None
         if self._is_preprocess_mode():
             self._apply_preprocessing(force=True)
-        else:
-            self._update_display()
-        self._update_results()
+        self._sync_views()
 
     # ===== 自适应参数推荐 =====
     def _get_detection_profile_key(self) -> str:
@@ -1045,7 +1219,11 @@ class CNTAnalyzerGUI:
     def _on_reapply_auto_suggest(self):
         """手动触发一次自动参数推荐"""
         if self.analyzer.image is None:
-            messagebox.showwarning("警告", "请先打开图像！")
+            self.control_panel.update_analysis_status(
+                "检测输入状态: 请先加载图像后再自动推荐参数",
+                color=self.MODERN_COLORS['warning'],
+            )
+            self.image_panel.show_status("请先加载图像后再自动推荐参数")
             return
         params = self._auto_suggest_params()
         if self.live_preview_var.get() and self._is_preprocess_mode():
@@ -1088,6 +1266,7 @@ class CNTAnalyzerGUI:
         """构建用于判断缓存有效性的预处理签名"""
         roi = self._get_active_preprocess_roi()
         roi_signature = None if roi is None else (roi.name, roi.x, roi.y, roi.width, roi.height)
+        scale_exclusion_signature = tuple(self.analyzer.scale_exclusion_rect) if self.analyzer.scale_exclusion_rect is not None else None
         return (
             int(self.blur_kernel_var.get()),
             int(self.adaptive_block_var.get()),
@@ -1095,6 +1274,7 @@ class CNTAnalyzerGUI:
             int(self.bridge_strength_var.get()),
             True,  # threshold_invert
             roi_signature,
+            scale_exclusion_signature,
         )
 
     def _needs_preprocessing(self) -> bool:
@@ -1223,7 +1403,11 @@ class CNTAnalyzerGUI:
     def _detect_cnt(self):
         """检测CNT"""
         if self.analyzer.image is None:
-            messagebox.showwarning("警告", "请先打开图像！")
+            self.control_panel.update_analysis_status(
+                "检测输入状态: 请先加载图像后再开始检测",
+                color=self.MODERN_COLORS['warning'],
+            )
+            self.image_panel.show_status("请先加载图像后再开始检测")
             return
 
         try:
@@ -1251,9 +1435,7 @@ class CNTAnalyzerGUI:
                 roi=self.current_roi
             )
 
-            self._update_results()
-            self._update_advanced_analysis()
-            self._update_display()
+            self._sync_views()
 
             roi_text = f" ({self.current_roi.name})" if self.current_roi else ""
             messagebox.showinfo("检测完成",
@@ -1449,39 +1631,60 @@ class CNTAnalyzerGUI:
         self.result_panel.clear_stats()
         self.result_panel.clear_tree()
 
-        measurements = self.current_roi.measurements if self.current_roi else self.analyzer.measurements
+        measurements = self._get_active_measurements()
         if not measurements:
             return
 
         stats = self.analyzer.get_statistics(self.current_roi)
-
         text_widget = self.result_panel.stats_text
-        
-        text_widget.insert(tk.END, "检测到的CNT数量: ", 'header')
-        text_widget.insert(tk.END, f"{stats['count']}\n\n", 'value')
-        
-        text_widget.insert(tk.END, "===== 长度统计 (μm) =====\n", 'header')
+
+        dispersed_stats = None
+        primary_count = int(stats.get('count', len(measurements)))
+        length_stats = stats
+        display_measurements = measurements
+        try:
+            dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
+            if dispersed_stats:
+                primary_count = int(dispersed_stats.get('dispersed_count', primary_count))
+                length_stats = dispersed_stats.get('dispersed_length_stats') or stats
+                display_measurements = dispersed_stats.get('dispersed_measurements') or []
+        except Exception as e:
+            logger.debug(f"获取分散统计失败: {e}")
+
+        if dispersed_stats:
+            text_widget.insert(tk.END, "分散CNT数量: ", 'header')
+            text_widget.insert(tk.END, f"{primary_count}\n", 'value')
+            text_widget.insert(tk.END, "总CNT数量: ", 'header')
+            text_widget.insert(tk.END, f"{dispersed_stats['total_count']}\n", 'value')
+            text_widget.insert(tk.END, "团聚区域CNT数量: ", 'header')
+            text_widget.insert(tk.END, f"{dispersed_stats['agglomerated_count']}\n", 'value')
+            text_widget.insert(tk.END, "分散比例: ", 'header')
+            text_widget.insert(tk.END, f"{dispersed_stats['dispersed_ratio']:.1%}\n\n", 'value')
+        else:
+            text_widget.insert(tk.END, "检测到的CNT数量: ", 'header')
+            text_widget.insert(tk.END, f"{primary_count}\n\n", 'value')
+
+        text_widget.insert(tk.END, "===== 分散CNT长度统计 (μm) =====\n", 'header')
         text_widget.insert(tk.END, "平均值: ", 'header')
-        text_widget.insert(tk.END, f"{stats['length_mean']:.2f}\n", 'value')
+        text_widget.insert(tk.END, f"{length_stats['length_mean']:.2f}\n", 'value')
         text_widget.insert(tk.END, "标准差: ", 'header')
-        text_widget.insert(tk.END, f"{stats['length_std']:.2f}\n", 'value')
+        text_widget.insert(tk.END, f"{length_stats['length_std']:.2f}\n", 'value')
         text_widget.insert(tk.END, "最小值: ", 'header')
-        text_widget.insert(tk.END, f"{stats['length_min']:.2f}\n", 'value')
+        text_widget.insert(tk.END, f"{length_stats['length_min']:.2f}\n", 'value')
         text_widget.insert(tk.END, "最大值: ", 'header')
-        text_widget.insert(tk.END, f"{stats['length_max']:.2f}\n\n", 'value')
-        
-        text_widget.insert(tk.END, "===== 长度分布 =====\n", 'header')
-        for label, count in stats['length_distribution'].items():
+        text_widget.insert(tk.END, f"{length_stats['length_max']:.2f}\n\n", 'value')
+
+        text_widget.insert(tk.END, "===== 分散CNT长度分布 =====\n", 'header')
+        for label, count in length_stats['length_distribution'].items():
             text_widget.insert(tk.END, f"{label}: ", 'header')
             text_widget.insert(tk.END, f"{count}根\n", 'value')
 
-        # 宽度鲁棒统计汇总
-        widths_median = [m.width_median_um for m in measurements if m.width_median_um]
+        widths_median = [m.width_median_um for m in display_measurements if m.width_median_um]
         if widths_median:
-            text_widget.insert(tk.END, "\n===== 宽度统计 (μm) =====\n", 'header')
+            text_widget.insert(tk.END, "\n===== 分散CNT宽度统计 (μm) =====\n", 'header')
             text_widget.insert(tk.END, "中位数均值: ", 'header')
             text_widget.insert(tk.END, f"{np.mean(widths_median):.3f}\n", 'value')
-            widths_iqr = [m.width_iqr_um for m in measurements if m.width_iqr_um]
+            widths_iqr = [m.width_iqr_um for m in display_measurements if m.width_iqr_um]
             if widths_iqr:
                 text_widget.insert(tk.END, "IQR均值: ", 'header')
                 text_widget.insert(tk.END, f"{np.mean(widths_iqr):.3f}\n", 'value')
@@ -1522,7 +1725,7 @@ class CNTAnalyzerGUI:
             return
 
         vis_image = self.analyzer.image.copy()
-        measurements = self.current_roi.measurements if self.current_roi else self.analyzer.measurements
+        measurements = self._get_active_measurements()
 
         for m in measurements:
             if m.id == cnt_id:
@@ -1548,18 +1751,19 @@ class CNTAnalyzerGUI:
     # ===== 高级分析 =====
     def _update_advanced_analysis(self):
         """更新高级分析内容"""
-        measurements = self.current_roi.measurements if self.current_roi else self.analyzer.measurements
+        measurements = self._get_active_measurements()
         if not measurements:
+            self._clear_advanced_analysis()
             return
 
         stats = self.analyzer.get_statistics(self.current_roi)
+        spatial = stats.get('spatial_distribution') or {}
+        cnt_count = int(stats.get('count', len(measurements)))
 
-        # 绘制图表
-        self._draw_distribution_chart(measurements)
-        self._draw_pie_chart(stats['length_distribution'])
-        self._draw_cluster_analysis(measurements)
-        self._draw_spatial_heatmap(stats.get('spatial_distribution') or {})
-        
+        # 高级分析保留数量信息，并聚焦阴影团聚与均匀度
+        self._draw_spatial_score_chart(spatial, cnt_count=cnt_count)
+        self._draw_spatial_heatmap(spatial, cnt_count=cnt_count)
+
         # 强制刷新布局
         self.analysis_panel.refresh_layout()
 
@@ -1595,6 +1799,8 @@ class CNTAnalyzerGUI:
         )
         if should_rebuild:
             self._dispose_chart(key)
+            for child in frame.winfo_children():
+                child.destroy()
             chart['fig'] = Figure(figsize=figsize, dpi=100)
             chart['fig'].patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
             chart['ax'] = chart['fig'].add_subplot(111)
@@ -1605,6 +1811,75 @@ class CNTAnalyzerGUI:
 
         chart['draw_count'] = chart.get('draw_count', 0) + 1
         return chart
+
+    def _draw_spatial_score_chart(self, spatial: dict, cnt_count: Optional[int] = None):
+        """绘制阴影团聚、均匀度与数量概览。"""
+        try:
+            chart = self._init_chart('histogram', figsize=(6.2, 4.3))
+            ax = chart['ax']
+            canvas = chart['canvas']
+            if not canvas:
+                return
+
+            metrics = self._get_shadow_aggregation_metrics(spatial)
+            values = [metrics['score'], metrics['uniformity_score']]
+            labels = ['阴影团聚↓', '均匀度↑']
+            colors = [
+                self.MODERN_COLORS['accent_rose'],
+                self.MODERN_COLORS['accent_teal'],
+            ]
+
+            y_positions = np.arange(len(labels))
+            bars = ax.barh(y_positions, values, color=colors, alpha=0.9, height=0.54)
+            ax.set_yticks(y_positions)
+            ax.set_yticklabels(labels)
+            ax.invert_yaxis()
+            ax.set_xlim(0, 100)
+            ax.set_xlabel('得分 (0-100)', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
+            ax.set_title('当前图像 / ROI 双指标概览', fontsize=10, color=self.MODERN_COLORS['text_primary'])
+            ax.grid(True, axis='x', alpha=0.25, linestyle='--', color=self.MODERN_COLORS['border'])
+            ax.set_facecolor(self.MODERN_COLORS['bg_secondary'])
+            ax.tick_params(axis='x', colors=self.MODERN_COLORS['text_secondary'])
+            ax.tick_params(axis='y', colors=self.MODERN_COLORS['text_secondary'])
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_color(self.MODERN_COLORS['border'])
+            ax.spines['bottom'].set_color(self.MODERN_COLORS['border'])
+
+            for bar, value in zip(bars, values):
+                ax.text(
+                    min(value + 2.0, 98.0),
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{value:.1f}",
+                    va='center',
+                    fontsize=9,
+                    color=self.MODERN_COLORS['text_primary'],
+                )
+
+            ax.text(
+                0.02,
+                0.98,
+                (
+                    f"CNT数量 {int(cnt_count)}\n" if cnt_count is not None else ""
+                ) + "阴影团聚越低越好；均匀度越高越好",
+                transform=ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize=8.4,
+                color=self.MODERN_COLORS['text_secondary'],
+                bbox={
+                    'boxstyle': 'round,pad=0.22',
+                    'facecolor': self.MODERN_COLORS['bg_tertiary'],
+                    'edgecolor': self.MODERN_COLORS['border'],
+                    'alpha': 0.95,
+                },
+            )
+
+            chart['fig'].tight_layout()
+            canvas.draw()
+
+        except Exception as e:
+            logger.exception(f"绘制双指标概览错误: {e}")
 
     def _draw_distribution_chart(self, measurements: List[CNTMeasurement]):
         """绘制长度分布图 (直方图)"""
@@ -1815,8 +2090,218 @@ class CNTAnalyzerGUI:
         except Exception as e:
             logger.exception(f"绘制聚类图错误: {e}")
 
-    def _draw_spatial_heatmap(self, spatial: dict):
-        """绘制CNT空间分布热图"""
+    @staticmethod
+    def _normalize_hotspot_grid(grid: np.ndarray, percentile: float = 85.0) -> np.ndarray:
+        """将网格值归一化到 0-1，并放大高分位热点。"""
+        grid = np.asarray(grid, dtype=float)
+        if grid.size == 0:
+            return np.zeros((0, 0), dtype=float)
+
+        positive = grid[grid > 0]
+        if positive.size == 0:
+            return np.zeros_like(grid, dtype=float)
+
+        upper = float(np.percentile(positive, percentile))
+        upper = max(upper, float(np.max(positive)), 1e-6) if upper <= 0 else upper
+        return np.clip(grid / upper, 0.0, 1.0)
+
+    @staticmethod
+    def _count_grid_regions(mask: np.ndarray) -> int:
+        """统计热点网格中的连通区域数。"""
+        mask = np.asarray(mask, dtype=bool)
+        if mask.size == 0:
+            return 0
+
+        visited = np.zeros_like(mask, dtype=bool)
+        region_count = 0
+        rows, cols = mask.shape
+
+        for row in range(rows):
+            for col in range(cols):
+                if not mask[row, col] or visited[row, col]:
+                    continue
+                region_count += 1
+                stack = [(row, col)]
+                visited[row, col] = True
+                while stack:
+                    cur_row, cur_col = stack.pop()
+                    for d_row, d_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        next_row = cur_row + d_row
+                        next_col = cur_col + d_col
+                        if not (0 <= next_row < rows and 0 <= next_col < cols):
+                            continue
+                        if visited[next_row, next_col] or not mask[next_row, next_col]:
+                            continue
+                        visited[next_row, next_col] = True
+                        stack.append((next_row, next_col))
+        return region_count
+
+    def _build_spatial_hotspot_grid(self, spatial: dict) -> Tuple[np.ndarray, dict]:
+        """基于点密度与覆盖率构建更强调局部团聚的热点强度图。"""
+        point_grid = np.array(
+            spatial.get('point_density_grid') or spatial.get('density_grid') or [],
+            dtype=float,
+        )
+        coverage_grid = np.array(spatial.get('coverage_density_grid') or [], dtype=float)
+        shadow_grid = np.array(spatial.get('shadow_density_grid') or [], dtype=float)
+
+        if point_grid.size == 0 and coverage_grid.size == 0 and shadow_grid.size == 0:
+            empty = np.zeros((0, 0), dtype=float)
+            return empty, {
+                'hotspot_mask': np.zeros((0, 0), dtype=bool),
+                'severe_mask': np.zeros((0, 0), dtype=bool),
+                'hotspot_regions': 0,
+                'severe_regions': 0,
+                'hotspot_cell_ratio': 0.0,
+                'hotspot_mass_ratio': 0.0,
+                'peak_share': 0.0,
+                'peak_count': 0.0,
+            }
+
+        if point_grid.size == 0:
+            reference = coverage_grid if coverage_grid.size else shadow_grid
+            point_grid = np.zeros_like(reference, dtype=float)
+        if coverage_grid.size == 0:
+            coverage_grid = np.zeros_like(point_grid, dtype=float)
+        if shadow_grid.size == 0:
+            shadow_grid = np.zeros_like(point_grid, dtype=float)
+
+        point_norm = self._normalize_hotspot_grid(point_grid, percentile=86.0)
+        coverage_norm = self._normalize_hotspot_grid(coverage_grid, percentile=82.0)
+        shadow_norm = self._normalize_hotspot_grid(shadow_grid, percentile=84.0)
+        hotspot_grid = np.clip(point_norm * 0.46 + coverage_norm * 0.20 + shadow_norm * 0.34, 0.0, 1.0)
+
+        active_mask = (point_grid > 0) | (coverage_grid > 0) | (shadow_grid > 0)
+        active_scores = hotspot_grid[active_mask]
+        if active_scores.size == 0:
+            hotspot_mask = np.zeros_like(hotspot_grid, dtype=bool)
+            severe_mask = np.zeros_like(hotspot_grid, dtype=bool)
+        elif float(np.max(active_scores) - np.min(active_scores)) < 0.08:
+            hotspot_mask = np.zeros_like(hotspot_grid, dtype=bool)
+            severe_mask = np.zeros_like(hotspot_grid, dtype=bool)
+        else:
+            hotspot_percentile = 78.0 if active_scores.size >= 6 else 65.0
+            severe_percentile = 91.0 if active_scores.size >= 8 else 82.0
+            hotspot_threshold = float(np.percentile(active_scores, hotspot_percentile))
+            severe_threshold = float(np.percentile(active_scores, severe_percentile))
+            hotspot_mask = active_mask & (hotspot_grid >= hotspot_threshold) & (hotspot_grid > 0)
+            severe_mask = active_mask & (hotspot_grid >= severe_threshold) & (hotspot_grid > 0)
+
+        total_points = float(np.sum(point_grid))
+        hotspot_points = float(np.sum(point_grid[hotspot_mask])) if hotspot_mask.size else 0.0
+        peak_count = float(np.max(point_grid)) if point_grid.size else 0.0
+        peak_share = float(peak_count / total_points) if total_points > 0 else 0.0
+        hotspot_mass_ratio = float(hotspot_points / total_points) if total_points > 0 else 0.0
+        active_cells = int(np.count_nonzero(active_mask))
+        hotspot_cells = int(np.count_nonzero(hotspot_mask))
+        hotspot_cell_ratio = float(hotspot_cells / active_cells) if active_cells > 0 else 0.0
+
+        return hotspot_grid, {
+            'hotspot_mask': hotspot_mask,
+            'severe_mask': severe_mask,
+            'hotspot_regions': self._count_grid_regions(hotspot_mask),
+            'severe_regions': self._count_grid_regions(severe_mask),
+            'hotspot_cell_ratio': hotspot_cell_ratio,
+            'hotspot_mass_ratio': hotspot_mass_ratio,
+            'peak_share': peak_share,
+            'peak_count': peak_count,
+            'shadow_support_ratio': float(np.mean(shadow_norm[hotspot_mask])) if np.any(hotspot_mask) else 0.0,
+        }
+
+    def _get_shadow_aggregation_metrics(self, spatial: Optional[dict]) -> dict:
+        """提取用于界面展示的阴影团聚核心指标。"""
+        spatial = spatial or {}
+        uniformity_scores = spatial.get('uniformity_scores') or {}
+        aggregation_scores = spatial.get('aggregation_scores') or {}
+        overall_uniformity = float(uniformity_scores.get('overall', 0.0))
+        fallback_score = float(aggregation_scores.get('overall', 100.0 - overall_uniformity))
+        shadow_grid = np.array(spatial.get('shadow_density_grid') or [], dtype=float)
+        shadow_mean = float(spatial.get('shadow_density_mean', 0.0))
+
+        _, hotspot_info = self._build_spatial_hotspot_grid(spatial)
+        shadow_support = float(hotspot_info.get('shadow_support_ratio', 0.0))
+        hotspot_mass = float(hotspot_info.get('hotspot_mass_ratio', 0.0))
+        peak_share = float(hotspot_info.get('peak_share', 0.0))
+        shadow_available = shadow_grid.size > 0 or shadow_mean > 0.0
+
+        if shadow_available:
+            score = np.clip(
+                fallback_score * 0.25 +
+                shadow_support * 38.0 +
+                hotspot_mass * 23.0 +
+                peak_share * 8.0 +
+                shadow_mean * 18.0,
+                0.0,
+                100.0,
+            )
+        else:
+            score = fallback_score
+
+        return {
+            **hotspot_info,
+            'score': float(score),
+            'uniformity_score': overall_uniformity,
+            'fallback_score': fallback_score,
+        }
+
+    def _format_hotspot_summary(self, spatial: dict) -> str:
+        """为典型图叠加说明生成双指标摘要。"""
+        metrics = self._get_shadow_aggregation_metrics(spatial)
+        return f"阴影团聚{metrics['score']:.1f} | 均匀度{metrics['uniformity_score']:.1f}"
+
+    def _overlay_spatial_hotspots_on_image(self,
+                                           image: Optional[np.ndarray],
+                                           spatial: Optional[dict]) -> Optional[np.ndarray]:
+        """在代表图上叠加热点框，让局部团聚区域一眼可见。"""
+        if image is None or getattr(image, 'size', 0) == 0 or not spatial:
+            return image
+
+        hotspot_grid, hotspot_info = self._build_spatial_hotspot_grid(spatial)
+        hotspot_mask = hotspot_info.get('hotspot_mask')
+        severe_mask = hotspot_info.get('severe_mask')
+        if hotspot_grid.size == 0 or hotspot_mask is None or not np.any(hotspot_mask):
+            return image
+
+        output = image.copy()
+        rows, cols = hotspot_grid.shape
+        height, width = output.shape[:2]
+        hotspot_fill = np.array([245, 158, 11], dtype=np.uint8)
+        severe_fill = np.array([244, 63, 94], dtype=np.uint8)
+
+        for row in range(rows):
+            for col in range(cols):
+                if not hotspot_mask[row, col]:
+                    continue
+
+                x1 = int(col * width / cols)
+                x2 = int((col + 1) * width / cols)
+                y1 = int(row * height / rows)
+                y2 = int((row + 1) * height / rows)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                intensity = float(np.clip(hotspot_grid[row, col], 0.0, 1.0))
+                is_severe = bool(severe_mask[row, col]) if severe_mask is not None else False
+                fill_color = severe_fill if is_severe else hotspot_fill
+                alpha = min(0.48, 0.18 + intensity * 0.24 + (0.08 if is_severe else 0.0))
+                cell = output[y1:y2, x1:x2]
+                overlay = np.empty_like(cell)
+                overlay[:] = fill_color
+                output[y1:y2, x1:x2] = cv2.addWeighted(cell, 1.0 - alpha, overlay, alpha, 0)
+
+                border_color = (190, 24, 93) if is_severe else (217, 119, 6)
+                cv2.rectangle(
+                    output,
+                    (x1, y1),
+                    (max(x1, x2 - 1), max(y1, y2 - 1)),
+                    border_color,
+                    2 if is_severe else 1,
+                )
+
+        return output
+
+    def _draw_spatial_heatmap(self, spatial: dict, cnt_count: Optional[int] = None):
+        """绘制阴影团聚空间热图。"""
         try:
             chart = self._init_chart('heatmap')
             ax = chart['ax']
@@ -1824,28 +2309,69 @@ class CNTAnalyzerGUI:
             if not canvas:
                 return
 
-            density_grid = np.array(spatial.get('density_grid') or [])
-            if density_grid.size == 0:
-                ax.text(0.5, 0.5, "暂无空间分布数据",
+            metrics = self._get_shadow_aggregation_metrics(spatial)
+            hotspot_grid, hotspot_info = self._build_spatial_hotspot_grid(spatial)
+            if hotspot_grid.size == 0:
+                ax.text(0.5, 0.5, "暂无阴影团聚数据",
                         horizontalalignment='center', verticalalignment='center',
                         transform=ax.transAxes, color=self.MODERN_COLORS['text_muted'])
                 canvas.draw()
                 return
 
-            heatmap = ax.imshow(density_grid, cmap='YlOrRd', interpolation='nearest')
-            ax.set_title('CNT网格数量热图', fontsize=10, color=self.MODERN_COLORS['text_primary'])
+            heatmap = ax.imshow(hotspot_grid * 100.0, cmap='magma', interpolation='nearest', vmin=0, vmax=100)
+            ax.set_title('阴影团聚热图', fontsize=10, color=self.MODERN_COLORS['text_primary'])
             ax.set_xlabel('X网格', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
             ax.set_ylabel('Y网格', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
             ax.tick_params(axis='x', colors=self.MODERN_COLORS['text_secondary'])
             ax.tick_params(axis='y', colors=self.MODERN_COLORS['text_secondary'])
             ax.set_facecolor(self.MODERN_COLORS['bg_secondary'])
+            ax.grid(False)
+
+            hotspot_mask = hotspot_info.get('hotspot_mask')
+            severe_mask = hotspot_info.get('severe_mask')
+            if hotspot_mask is not None:
+                rows, cols = hotspot_mask.shape
+                for row in range(rows):
+                    for col in range(cols):
+                        if not hotspot_mask[row, col]:
+                            continue
+                        edge_color = self.MODERN_COLORS['accent_rose'] if severe_mask is not None and severe_mask[row, col] else self.MODERN_COLORS['accent_amber']
+                        ax.add_patch(
+                            plt.Rectangle(
+                                (col - 0.5, row - 0.5),
+                                1.0,
+                                1.0,
+                                fill=False,
+                                linewidth=2.2 if severe_mask is not None and severe_mask[row, col] else 1.3,
+                                edgecolor=edge_color,
+                            )
+                        )
+
+            ax.text(
+                0.02,
+                0.98,
+                (
+                    f"CNT数量{int(cnt_count)} | " if cnt_count is not None else ""
+                ) + f"阴影团聚{metrics['score']:.1f} | 均匀度{metrics['uniformity_score']:.1f}",
+                transform=ax.transAxes,
+                ha='left',
+                va='top',
+                fontsize=8.4,
+                color='white',
+                bbox={
+                    'boxstyle': 'round,pad=0.24',
+                    'facecolor': '#111827',
+                    'edgecolor': '#111827',
+                    'alpha': 0.76,
+                },
+            )
 
             if 'colorbar' not in chart or chart['colorbar'] is None:
                 chart['colorbar'] = chart['fig'].colorbar(heatmap, ax=ax, fraction=0.046, pad=0.04)
             else:
                 chart['colorbar'].update_normal(heatmap)
             chart['colorbar'].ax.tick_params(colors=self.MODERN_COLORS['text_secondary'])
-            chart['colorbar'].set_label('每格CNT数量', color=self.MODERN_COLORS['text_secondary'])
+            chart['colorbar'].set_label('阴影团聚强度 (0-100)', color=self.MODERN_COLORS['text_secondary'])
 
             chart['fig'].tight_layout()
             canvas.draw()
@@ -1924,7 +2450,11 @@ class CNTAnalyzerGUI:
             self._analysis_cache.popitem(last=False)
         return result
 
-    def _run_image_analysis(self, image_path: str, context: dict, include_visualization: bool = False) -> dict:
+    def _run_image_analysis(self,
+                            image_path: str,
+                            context: dict,
+                            include_visualization: bool = False,
+                            preview_visualization: bool = False) -> dict:
         """执行单张图片分析，支持缓存复用"""
         analyzer = CNTAnalyzer()
         analyzer.load_image(image_path)
@@ -1939,19 +2469,96 @@ class CNTAnalyzerGUI:
         analyzer.preprocess(**context['preprocess_settings'])
         analyzer.detect_cnts_hybrid(**context['detect_settings'])
         stats = analyzer.get_statistics()
+        dispersed_stats = analyzer.get_dispersed_statistics()
 
         visualization = None
         if include_visualization:
             visualization = cv2.cvtColor(analyzer.get_visualization(), cv2.COLOR_BGR2RGB)
+            if preview_visualization:
+                visualization = self._prepare_comparison_display_image(
+                    visualization,
+                    max_width=1000,
+                    max_height=560,
+                )
 
         return {
             'path': image_path,
             'name': Path(image_path).name,
             'stats': stats,
+            'dispersed_stats': dispersed_stats,
             'scale_info': scale_info,
             'scale_status': analyzer.get_scale_status(),
             'visualization': visualization,
         }
+
+    def _get_group_analysis_worker_count(self, image_count: int) -> int:
+        """根据待分析图片数量和 CPU 数量决定组图并行线程数。"""
+        if image_count <= 1:
+            return 1
+
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(image_count, max(1, cpu_count - 1), 4))
+
+    def _run_group_analysis_task(self,
+                                 task: Tuple[int, str],
+                                 context: dict,
+                                 include_visualization: bool = False,
+                                 preview_visualization: bool = False) -> Tuple[int, Optional[dict], Optional[str]]:
+        """执行单张组图分析任务，并将异常转换为可汇总的失败信息。"""
+        index, image_path = task
+        try:
+            return index, self._run_image_analysis(
+                image_path,
+                context,
+                include_visualization=include_visualization,
+                preview_visualization=preview_visualization,
+            ), None
+        except Exception as exc:
+            return index, None, f"{Path(image_path).name}: {exc}"
+
+    def _run_group_analysis_tasks(self,
+                                  tasks: List[Tuple[int, str]],
+                                  context: dict,
+                                  include_visualization: bool = False,
+                                  preview_visualization: bool = False) -> List[Tuple[int, Optional[dict], Optional[str]]]:
+        """并行执行一批组图分析任务；若线程池异常则自动回退到串行。"""
+        if not tasks:
+            return []
+
+        worker_count = self._get_group_analysis_worker_count(len(tasks))
+        if worker_count <= 1:
+            return [
+                self._run_group_analysis_task(
+                    task,
+                    context,
+                    include_visualization=include_visualization,
+                    preview_visualization=preview_visualization,
+                )
+                for task in tasks
+            ]
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="cnt-group") as executor:
+                return list(
+                    executor.map(
+                        self._run_group_analysis_task,
+                        tasks,
+                        repeat(context),
+                        repeat(include_visualization),
+                        repeat(preview_visualization),
+                    )
+                )
+        except Exception as exc:
+            logger.warning("组图并行分析失败，已回退到串行模式: %s", exc)
+            return [
+                self._run_group_analysis_task(
+                    task,
+                    context,
+                    include_visualization=include_visualization,
+                    preview_visualization=preview_visualization,
+                )
+                for task in tasks
+            ]
 
     def _analyze_image_file(self, image_path: str, include_visualization: bool = False) -> dict:
         """在不影响当前主界面的前提下分析单张图像"""
@@ -1981,15 +2588,43 @@ class CNTAnalyzerGUI:
         return stored
 
     def _analyze_image_files(self, image_paths: List[str], group_label: str) -> Tuple[List[dict], List[str]]:
-        """批量分析一组图像，返回成功结果与失败信息"""
-        results: List[dict] = []
+        """批量分析一组图像，优先复用缓存并并行处理未命中的图片。"""
+        context = self._build_analysis_context()
+        ordered_results: List[Optional[dict]] = [None] * len(image_paths)
         failures: List[str] = []
+        pending_tasks: List[Tuple[int, str]] = []
+        pending_cache_keys = {}
 
-        for image_path in image_paths:
-            try:
-                results.append(self._analyze_image_file(image_path))
-            except Exception as e:
-                failures.append(f"{Path(image_path).name}: {e}")
+        for index, image_path in enumerate(image_paths):
+            base_cache_key = self._make_analysis_cache_key(image_path, context, False)
+            visual_cache_key = self._make_analysis_cache_key(image_path, context, True)
+            cached = self._get_cached_analysis_result(base_cache_key)
+            if cached is None:
+                cached = self._get_cached_analysis_result(visual_cache_key)
+
+            if cached is not None:
+                ordered_results[index] = cached
+                continue
+
+            pending_tasks.append((index, image_path))
+            pending_cache_keys[index] = base_cache_key
+
+        for index, result, error in self._run_group_analysis_tasks(
+            pending_tasks,
+            context,
+            include_visualization=True,
+            preview_visualization=True,
+        ):
+            if result is not None:
+                stored = self._store_analysis_result(pending_cache_keys[index], result)
+                ordered_results[index] = stored
+                if stored.get('visualization') is not None:
+                    visual_cache_key = self._make_analysis_cache_key(stored['path'], context, True)
+                    self._store_analysis_result(visual_cache_key, stored)
+            elif error:
+                failures.append(error)
+
+        results = [result for result in ordered_results if result is not None]
 
         if not results:
             raise ValueError(f"{group_label}未成功分析任何图像")
@@ -2021,7 +2656,11 @@ class CNTAnalyzerGUI:
     def _summarize_group_results(self, group_label: str, results: List[dict]) -> dict:
         """汇总一组图像的CNT统计结果"""
         count_values: List[float] = []
+        dispersed_count_values: List[float] = []
+        agglomerated_count_values: List[float] = []
+        dispersed_ratio_values: List[float] = []
         length_mean_values: List[float] = []
+        dispersed_length_mean_values: List[float] = []
         nn_values: List[float] = []
         nn_index_values: List[float] = []
         grid_values: List[float] = []
@@ -2036,17 +2675,23 @@ class CNTAnalyzerGUI:
         aggregation_grid_values: List[float] = []
         aggregation_moran_values: List[float] = []
         aggregation_values: List[float] = []
+        shadow_aggregation_values: List[float] = []
         density_grids: List[np.ndarray] = []
         file_details: List[dict] = []
 
         for result in results:
             stats = result.get('stats', {})
+            dispersed_stats = result.get('dispersed_stats', {})
             spatial = stats.get('spatial_distribution') or {}
             uniformity_scores = spatial.get('uniformity_scores') or {}
             aggregation_scores = spatial.get('aggregation_scores') or {}
 
             count = float(stats.get('count', 0))
+            dispersed_count = float(dispersed_stats.get('dispersed_count', count))
+            agglomerated_count = float(dispersed_stats.get('agglomerated_count', 0.0))
+            dispersed_ratio = float(dispersed_stats.get('dispersed_ratio', 1.0 if count > 0 else 0.0))
             length_mean = float(stats.get('length_mean', 0.0))
+            dispersed_length_mean = float((dispersed_stats.get('dispersed_length_stats') or {}).get('length_mean', length_mean))
             nn_cv = float(spatial.get('nearest_neighbor_cv', 0.0))
             nn_index = float(spatial.get('nearest_neighbor_index', 0.0))
             grid_cv = float(spatial.get('grid_density_cv', 0.0))
@@ -2061,9 +2706,14 @@ class CNTAnalyzerGUI:
             aggregation_grid = float(aggregation_scores.get('grid_density', 100.0 - uniformity_grid))
             aggregation_moran = float(aggregation_scores.get('moran', 100.0 - uniformity_moran))
             aggregation_overall = float(aggregation_scores.get('overall', 100.0 - uniformity_overall))
+            shadow_aggregation = float(self._get_shadow_aggregation_metrics(spatial).get('score', aggregation_overall))
 
             count_values.append(count)
+            dispersed_count_values.append(dispersed_count)
+            agglomerated_count_values.append(agglomerated_count)
+            dispersed_ratio_values.append(dispersed_ratio)
             length_mean_values.append(length_mean)
+            dispersed_length_mean_values.append(dispersed_length_mean)
             nn_values.append(nn_cv)
             nn_index_values.append(nn_index)
             grid_values.append(grid_cv)
@@ -2078,6 +2728,7 @@ class CNTAnalyzerGUI:
             aggregation_grid_values.append(aggregation_grid)
             aggregation_moran_values.append(aggregation_moran)
             aggregation_values.append(aggregation_overall)
+            shadow_aggregation_values.append(shadow_aggregation)
 
             density_grid = np.array(spatial.get('density_grid') or np.zeros((10, 10)), dtype=float)
             density_grids.append(density_grid)
@@ -2085,7 +2736,11 @@ class CNTAnalyzerGUI:
             file_details.append({
                 'name': result['name'],
                 'count': count,
+                'dispersed_count': dispersed_count,
+                'agglomerated_count': agglomerated_count,
+                'dispersed_ratio': dispersed_ratio,
                 'length_mean': length_mean,
+                'dispersed_length_mean': dispersed_length_mean,
                 'nearest_neighbor_cv': nn_cv,
                 'nearest_neighbor_index': nn_index,
                 'grid_density_cv': grid_cv,
@@ -2094,6 +2749,7 @@ class CNTAnalyzerGUI:
                 'aggregation_grid_score': aggregation_grid,
                 'aggregation_moran_score': aggregation_moran,
                 'aggregation_score': aggregation_overall,
+                'shadow_aggregation_score': shadow_aggregation,
                 'uniformity_nn_score': uniformity_nn,
                 'uniformity_grid_score': uniformity_grid,
                 'uniformity_moran_score': uniformity_moran,
@@ -2108,7 +2764,11 @@ class CNTAnalyzerGUI:
             'results': results,
             'file_details': file_details,
             'count_stats': self._summarize_numeric_series(count_values),
+            'dispersed_count_stats': self._summarize_numeric_series(dispersed_count_values),
+            'agglomerated_count_stats': self._summarize_numeric_series(agglomerated_count_values),
+            'dispersed_ratio_stats': self._summarize_numeric_series(dispersed_ratio_values),
             'length_mean_stats': self._summarize_numeric_series(length_mean_values),
+            'dispersed_length_mean_stats': self._summarize_numeric_series(dispersed_length_mean_values),
             'spatial_stats': {
                 'nearest_neighbor_cv': self._summarize_numeric_series(nn_values),
                 'nearest_neighbor_index': self._summarize_numeric_series(nn_index_values),
@@ -2120,6 +2780,7 @@ class CNTAnalyzerGUI:
                 'aggregation_grid_score': self._summarize_numeric_series(aggregation_grid_values),
                 'aggregation_moran_score': self._summarize_numeric_series(aggregation_moran_values),
                 'aggregation_score': self._summarize_numeric_series(aggregation_values),
+                'shadow_aggregation_score': self._summarize_numeric_series(shadow_aggregation_values),
                 'uniformity_nn_score': self._summarize_numeric_series(uniformity_nn_values),
                 'uniformity_grid_score': self._summarize_numeric_series(uniformity_grid_values),
                 'uniformity_moran_score': self._summarize_numeric_series(uniformity_moran_values),
@@ -2251,6 +2912,10 @@ class CNTAnalyzerGUI:
                 self._get_group_detail_series(base_group, 'aggregation_score'),
                 self._get_group_detail_series(exp_group, 'aggregation_score'),
             ),
+            'shadow_aggregation_score': self._compute_two_group_tests(
+                self._get_group_detail_series(base_group, 'shadow_aggregation_score'),
+                self._get_group_detail_series(exp_group, 'shadow_aggregation_score'),
+            ),
         }
 
     def _collect_group_image_paths(self, group_dir: Path) -> List[str]:
@@ -2270,23 +2935,25 @@ class CNTAnalyzerGUI:
         if not details:
             raise ValueError(f"{group_summary.get('label', '该组')}没有可用结果")
 
-        count_mean = group_summary['count_stats']['mean']
-        count_std = max(group_summary['count_stats']['std'], 1.0)
+        shadow_mean = group_summary['spatial_stats'].get('shadow_aggregation_score', {}).get('mean', 0.0)
+        shadow_std = max(group_summary['spatial_stats'].get('shadow_aggregation_score', {}).get('std', 0.0), 1.0)
         uniformity_mean = group_summary['spatial_stats']['uniformity_score']['mean']
         uniformity_std = max(group_summary['spatial_stats']['uniformity_score']['std'], 1.0)
 
         def score(detail: dict) -> float:
             return (
-                abs(detail['count'] - count_mean) / count_std +
+                abs(detail.get('shadow_aggregation_score', 0.0) - shadow_mean) / shadow_std +
                 abs(detail.get('uniformity_score', 0.0) - uniformity_mean) / uniformity_std
             )
 
         representative_detail = min(details, key=score)
-        representative_path = next(
-            result['path'] for result in group_summary['results']
+        representative_result = next(
+            result for result in group_summary['results']
             if result['name'] == representative_detail['name']
         )
-        return self._analyze_image_file(representative_path, include_visualization=True)
+        if representative_result.get('visualization') is not None:
+            return representative_result
+        return self._analyze_image_file(representative_result['path'], include_visualization=True)
 
     def _annotate_heatmap_cells(self, ax, grid: np.ndarray):
         """在热图格子上标注数值"""
@@ -2403,96 +3070,10 @@ class CNTAnalyzerGUI:
 
         return "\n".join(lines)
 
-    def _format_comparison_summary(self,
-                                   left_result: dict,
-                                   right_result: dict,
-                                   left_label: str,
-                                   right_label: str,
-                                   note: Optional[str] = None) -> str:
-        """生成双图对比摘要"""
-        left_spatial = left_result['stats'].get('spatial_distribution') or {}
-        right_spatial = right_result['stats'].get('spatial_distribution') or {}
-        left_uniformity = left_spatial.get('uniformity_scores') or {}
-        right_uniformity = right_spatial.get('uniformity_scores') or {}
-
-        left_count = int(left_result['stats']['count'])
-        right_count = int(right_result['stats']['count'])
-        count_diff = left_count - right_count
-        count_ratio = (count_diff / right_count * 100.0) if right_count > 0 else 0.0
-
-        left_uniformity_score = float(left_uniformity.get('overall', 0.0))
-        right_uniformity_score = float(right_uniformity.get('overall', 0.0))
-        uniformity_diff = left_uniformity_score - right_uniformity_score
-        left_more_uniform = uniformity_diff > 1.0
-        right_more_uniform = uniformity_diff < -1.0
-        right_more_clustered = right_spatial.get('morans_i', 0) > left_spatial.get('morans_i', 0)
-
-        split_mode_label = self.split_mode_var.get()
-        profile_label = self.detect_profile_var.get()
-        lines = []
-        if note:
-            lines.append(note)
-            lines.append("")
-
-        lines.extend([
-            f"相同识别条件: 模糊={self.blur_kernel_var.get()} / 自适应块={self.adaptive_block_var.get()} / C={self.adaptive_c_var.get()} / 桥接={self.bridge_strength_var.get()} / 最小长度={self.min_length_um_var.get():.1f}μm / 最小长宽比={self.min_slenderness_var.get():.1f} / 检测风格={profile_label} / 拆分模式={split_mode_label} / 合并距离={self.merge_distance_px_var.get()}px",
-            f"{left_label}: {left_result['name']}，识别到 {left_count} 根CNT",
-            f"{right_label}: {right_result['name']}，识别到 {right_count} 根CNT",
-        ])
-
-        if count_diff >= 0:
-            lines.append(f"CNT数量差异: {left_label}多 {count_diff} 根（+{count_ratio:.1f}%）")
-        else:
-            lines.append(f"CNT数量差异: {right_label}多 {abs(count_diff)} 根（+{abs(count_ratio):.1f}%）")
-
-        lines.extend([
-            "",
-            "分布均匀性分析:",
-            f"综合均匀性得分: {left_label} {left_uniformity_score:.1f}，{right_label} {right_uniformity_score:.1f}。该得分范围 0-100，越大越均匀。",
-            f"方法一 中心点最近邻CV: {left_label} {left_spatial.get('nearest_neighbor_cv', 0):.3f}，{right_label} {right_spatial.get('nearest_neighbor_cv', 0):.3f}。该值越小越均匀。",
-            f"补充指标 最近邻指数NNI: {left_label} {left_spatial.get('nearest_neighbor_index', 0):.3f}，{right_label} {right_spatial.get('nearest_neighbor_index', 0):.3f}。该值大于 1 表示更均匀。",
-            f"方法二 网格CNT数CV: {left_label} {left_spatial.get('grid_density_cv', 0):.3f}，{right_label} {right_spatial.get('grid_density_cv', 0):.3f}。该值越小越均匀。",
-            f"方法三 Moran's I: {left_label} {left_spatial.get('morans_i', 0):.3f}，{right_label} {right_spatial.get('morans_i', 0):.3f}。该值越大越聚集。",
-            "",
-        ])
-
-        if left_count > right_count and left_more_uniform:
-            conclusion = f"结论: 在相同识别条件下，{left_label}识别CNT数量更多，且分布更均匀。"
-            if right_more_clustered:
-                conclusion += f" {right_label}的空间自相关更高，CNT团聚更明显。"
-        elif left_count < right_count and right_more_uniform:
-            conclusion = f"结论: 在相同识别条件下，{right_label}识别CNT数量更多，且分布更均匀。"
-            if not right_more_clustered:
-                conclusion += f" {left_label}的空间自相关更高，CNT团聚更明显。"
-        else:
-            conclusion = "结论: 当前这组参数下，两张图的数量和均匀性差异没有同时完全拉开，可继续微调识别条件。"
-        lines.append(conclusion)
-
-        return "\n".join(lines)
-
-    def _select_center_tab(self, tab_key: str):
-        """切换到指定的中间页签"""
-        if not hasattr(self, 'center_notebook'):
-            return
-
-        tab = self._center_tabs.get(tab_key)
-        if tab is not None:
-            self.center_notebook.select(tab)
-
-    def _apply_standard_axes_style(self, axes: List):
-        """统一普通图表坐标轴样式"""
-        for ax in axes:
-            ax.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-            ax.tick_params(axis='x', colors=self.MODERN_COLORS['text_secondary'])
-            ax.tick_params(axis='y', colors=self.MODERN_COLORS['text_secondary'])
-            for spine in ax.spines.values():
-                spine.set_color(self.MODERN_COLORS['border'])
-
     def _get_comparison_image_aspect(self, image: Optional[np.ndarray]) -> float:
-        """返回对比图像的宽高比"""
+        """返回对比图像的宽高比。"""
         if image is None or getattr(image, 'size', 0) == 0:
             return 1.0
-
         height, width = image.shape[:2]
         if height <= 0:
             return 1.0
@@ -2501,7 +3082,7 @@ class CNTAnalyzerGUI:
     def _should_stack_comparison_images(self,
                                         *images: Optional[np.ndarray],
                                         threshold: float = 1.3) -> bool:
-        """宽图优先采用上下排布，避免代表图被压扁"""
+        """宽图优先采用上下排布，避免代表图被压扁。"""
         aspects = [
             self._get_comparison_image_aspect(image)
             for image in images
@@ -2509,14 +3090,13 @@ class CNTAnalyzerGUI:
         ]
         if not aspects:
             return False
-
         return max(aspects) >= threshold or (sum(aspects) / len(aspects)) >= (threshold - 0.15)
 
     def _build_comparison_layout(self,
                                  *images: Optional[np.ndarray],
                                  stacked: bool,
                                  variant: str) -> dict:
-        """根据图像宽高比动态分配图表与图像区域。"""
+        """根据图像宽高比动态分配对比页布局。"""
         aspects = [
             self._get_comparison_image_aspect(image)
             for image in images
@@ -2580,11 +3160,10 @@ class CNTAnalyzerGUI:
                              bars,
                              fmt: str = "{:.0f}",
                              offset_ratio: float = 0.03) -> None:
-        """为柱状图补充数值标签"""
+        """为柱状图补充数值标签。"""
         bar_list = list(bars)
         if not bar_list:
             return
-
         heights = [bar.get_height() for bar in bar_list]
         span = max(abs(value) for value in heights) or 1.0
         offset = max(span * offset_ratio, 0.015)
@@ -2600,1120 +3179,22 @@ class CNTAnalyzerGUI:
                 color=self.MODERN_COLORS['text_primary'],
             )
 
-    def _configure_comparison_image_axis(self, ax, image: np.ndarray, title: str):
-        """以正确比例显示对比中的代表图"""
-        if image is None or getattr(image, 'size', 0) == 0:
-            ax.text(
-                0.5, 0.5, "暂无图像",
-                ha='center', va='center',
-                transform=ax.transAxes,
-                color=self.MODERN_COLORS['text_secondary'],
-            )
-            ax.axis('off')
-            return
-
-        display_image = self._prepare_comparison_display_image(image)
-        ax.imshow(display_image, interpolation='nearest', aspect='equal')
-        ax.set_aspect('equal', adjustable='box')
-        ax.margins(0.0)
-        ax.set_anchor('C')
-        ax.text(
-            0.02,
-            0.98,
-            title,
-            transform=ax.transAxes,
-            ha='left',
-            va='top',
-            fontsize=9,
-            linespacing=1.15,
-            color=self.MODERN_COLORS['text_primary'],
-            bbox={
-                'boxstyle': 'round,pad=0.28',
-                'facecolor': self.MODERN_COLORS['bg_secondary'],
-                'edgecolor': self.MODERN_COLORS['border'],
-                'alpha': 0.84,
-            },
-        )
-        ax.axis('off')
-
-    def _estimate_comparison_summary_height(self, summary_text: str) -> int:
-        """根据摘要文本估算更紧凑的摘要区高度。"""
-        logical_lines = summary_text.splitlines() or [summary_text]
-        wrapped_lines = sum(max(1, (len(line) + 71) // 72) for line in logical_lines)
-        return min(220, max(128, 34 + wrapped_lines * 14))
-
-    def _render_comparison_figure(self, summary_text: str, figure: Figure):
-        """将对比摘要和图表渲染到对比分析面板"""
-        if not self.comparison_panel:
-            return
-
-        self._select_center_tab('comparison')
-        self.comparison_panel.refresh_layout()
-        chart_frame = self.comparison_panel.get_chart_frame('comparison')
-        self._fit_comparison_figure_to_frame(figure, chart_frame, allow_expand=True)
-
-        summary_height = self._estimate_comparison_summary_height(summary_text)
-        chart_height = min(1600, max(720, int(figure.get_size_inches()[1] * figure.dpi) + 40))
-        self.comparison_panel.set_section_height('comparison_summary', summary_height)
-        self.comparison_panel.set_section_height('comparison', chart_height)
-        self.comparison_panel.set_text_content('comparison_summary', summary_text)
-        if chart_frame is None:
-            return
-
-        for child in chart_frame.winfo_children():
-            child.destroy()
-
-        chart = self._charts['comparison']
-        self._dispose_chart('comparison')
-
-        canvas = FigureCanvasTkAgg(figure, master=chart_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-        chart['fig'] = figure
-        chart['ax'] = None
-        chart['canvas'] = canvas
-        chart['draw_count'] = 1
-
-        self.comparison_panel.refresh_layout()
-        self.comparison_panel.scroll_to_top()
-        self._schedule_comparison_layout_refresh(delay_ms=60)
-        self._schedule_comparison_layout_refresh(delay_ms=180)
-
-    def _ensure_result_visualization(self, result: dict) -> dict:
-        """确保结果中带有检测可视化图像"""
-        if result.get('visualization') is not None:
-            return result
-        return self._analyze_image_file(result['path'], include_visualization=True)
-
-    def _show_comparison_window(self,
-                                left_result: dict,
-                                right_result: dict,
-                                left_label: str,
-                                right_label: str,
-                                note: Optional[str] = None):
-        """将双图对比结果显示到对比分析面板"""
-        left_result = self._ensure_result_visualization(left_result)
-        right_result = self._ensure_result_visualization(right_result)
-
-        left_spatial = left_result['stats'].get('spatial_distribution') or {}
-        right_spatial = right_result['stats'].get('spatial_distribution') or {}
-        left_uniformity = left_spatial.get('uniformity_scores') or {}
-        right_uniformity = right_spatial.get('uniformity_scores') or {}
-        summary_text = self._format_comparison_summary(left_result, right_result, left_label, right_label, note)
-        left_display_image = self._prepare_comparison_display_image(
-            left_result.get('visualization'),
-            max_width=1000,
-            max_height=560,
-        )
-        right_display_image = self._prepare_comparison_display_image(
-            right_result.get('visualization'),
-            max_width=1000,
-            max_height=560,
-        )
-        stack_images = self._should_stack_comparison_images(
-            left_display_image,
-            right_display_image,
-            threshold=1.7,
-        )
-
-        layout = self._build_comparison_layout(
-            left_display_image,
-            right_display_image,
-            stacked=stack_images,
-            variant='pair',
-        )
-        pair_width, pair_height = layout['figsize']
-        figure = Figure(figsize=(min(13.2, pair_width), min(10.8, pair_height)), dpi=90)
-        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-        if stack_images:
-            grid_spec = figure.add_gridspec(
-                3,
-                2,
-                height_ratios=layout['height_ratios'],
-                hspace=layout['hspace'],
-                wspace=layout['wspace'],
-            )
-            ax_count = figure.add_subplot(grid_spec[0, 0])
-            ax_metric = figure.add_subplot(grid_spec[0, 1])
-            ax_left = figure.add_subplot(grid_spec[1, :])
-            ax_right = figure.add_subplot(grid_spec[2, :])
-        else:
-            grid_spec = figure.add_gridspec(
-                2,
-                2,
-                height_ratios=layout['height_ratios'],
-                hspace=layout['hspace'],
-                wspace=layout['wspace'],
-            )
-            ax_count = figure.add_subplot(grid_spec[0, 0])
-            ax_metric = figure.add_subplot(grid_spec[0, 1])
-            ax_left = figure.add_subplot(grid_spec[1, 0])
-            ax_right = figure.add_subplot(grid_spec[1, 1])
-        figure.subplots_adjust(**layout['adjust'])
-
-        labels = [left_label, right_label]
-        counts = [left_result['stats']['count'], right_result['stats']['count']]
-        count_colors = [self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']]
-        bars = ax_count.bar(labels, counts, color=count_colors, alpha=0.9)
-        ax_count.set_title('CNT数量对比', color=self.MODERN_COLORS['text_primary'])
-        ax_count.set_ylabel('数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_count.grid(True, axis='y', alpha=0.25, linestyle='--')
-        count_top = max(counts) if counts else 1.0
-        ax_count.set_ylim(0, count_top * 1.28 if count_top > 0 else 1.0)
-        for bar, value in zip(bars, counts):
-            ax_count.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + max(count_top * 0.03, 1.0),
-                f"{int(value)}",
-                ha='center',
-                va='bottom',
-                fontsize=9,
-                color=self.MODERN_COLORS['text_primary'],
-            )
-
-        metric_names = ["最近邻得分", "网格得分", "Moran得分", "综合得分"]
-        left_metrics = [
-            left_uniformity.get('nearest_neighbor', 0.0),
-            left_uniformity.get('grid_density', 0.0),
-            left_uniformity.get('moran', 0.0),
-            left_uniformity.get('overall', 0.0),
-        ]
-        right_metrics = [
-            right_uniformity.get('nearest_neighbor', 0.0),
-            right_uniformity.get('grid_density', 0.0),
-            right_uniformity.get('moran', 0.0),
-            right_uniformity.get('overall', 0.0),
-        ]
-        x = np.arange(len(metric_names))
-        width = 0.35
-        left_metric_bars = ax_metric.bar(
-            x - width / 2,
-            left_metrics,
-            width,
-            label=left_label,
-            color=self.MODERN_COLORS['accent_teal'],
-        )
-        right_metric_bars = ax_metric.bar(
-            x + width / 2,
-            right_metrics,
-            width,
-            label=right_label,
-            color=self.MODERN_COLORS['accent_rose'],
-        )
-        ax_metric.set_xticks(x)
-        ax_metric.set_xticklabels(metric_names)
-        ax_metric.set_ylabel('得分 (0-100，越大越均匀)', color=self.MODERN_COLORS['text_secondary'])
-        ax_metric.set_title('均匀性得分对比', color=self.MODERN_COLORS['text_primary'])
-        ax_metric.legend(frameon=False)
-        ax_metric.grid(True, axis='y', alpha=0.25, linestyle='--')
-        self._annotate_bar_values(ax_metric, left_metric_bars, fmt="{:.1f}", offset_ratio=0.012)
-        self._annotate_bar_values(ax_metric, right_metric_bars, fmt="{:.1f}", offset_ratio=0.012)
-        ax_metric.set_ylim(0, 105)
-
-        self._configure_comparison_image_axis(
-            ax_left,
-            left_result['visualization'],
-            f"{left_label}典型CNT分布\n{left_result['name']}\nCNT={int(left_result['stats']['count'])}",
-        )
-
-        self._configure_comparison_image_axis(
-            ax_right,
-            right_result['visualization'],
-            f"{right_label}典型CNT分布\n{right_result['name']}\nCNT={int(right_result['stats']['count'])}",
-        )
-
-        self._apply_standard_axes_style([ax_count, ax_metric])
-        for ax in (ax_left, ax_right):
-            ax.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-            for spine in ax.spines.values():
-                spine.set_color(self.MODERN_COLORS['border'])
-
-        self._render_comparison_figure(summary_text, figure)
-        return
-
     def _prepare_comparison_display_image(self,
                                           image: Optional[np.ndarray],
                                           max_width: int = 1200,
                                           max_height: int = 700) -> Optional[np.ndarray]:
-        """为对比页显示预先缩小大图，降低 Tk + Matplotlib 渲染压力。"""
+        """为对比页预缩放大图，降低渲染压力。"""
         if image is None or getattr(image, 'size', 0) == 0:
             return image
-
         height, width = image.shape[:2]
         if width <= 0 or height <= 0:
             return image
-
         scale = min(max_width / width, max_height / height, 1.0)
         if scale >= 0.999:
             return image
-
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))
         return cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-
-    def _fit_comparison_figure_to_frame(self,
-                                        figure: Figure,
-                                        chart_frame: Optional[tk.Widget],
-                                        min_width_px: int = 620,
-                                        padding_px: int = 24,
-                                        max_width_px: int = 1260,
-                                        allow_expand: bool = False) -> None:
-        """按当前中间栏可用宽度等比缩放对比图，避免切页后显示不全。"""
-        if chart_frame is None:
-            return
-
-        chart_frame.update_idletasks()
-        available_width = max(
-            int(chart_frame.winfo_width()) - padding_px,
-            int(getattr(self, 'center_notebook', chart_frame).winfo_width()) - padding_px,
-            min_width_px,
-        )
-        target_width_px = max(min_width_px, min(max_width_px, available_width))
-
-        current_width_px = max(1, int(round(figure.get_figwidth() * figure.dpi)))
-        current_height_px = max(1, int(round(figure.get_figheight() * figure.dpi)))
-        if current_width_px <= target_width_px + 8 and (not allow_expand or current_width_px >= target_width_px - 24):
-            return
-
-        scale = target_width_px / current_width_px
-        resized_width_px = max(min_width_px, int(round(current_width_px * scale)))
-        resized_height_px = max(420, int(round(current_height_px * scale)))
-        figure.set_size_inches(
-            resized_width_px / figure.dpi,
-            resized_height_px / figure.dpi,
-            forward=False,
-        )
-
-    def _schedule_comparison_layout_refresh(self, delay_ms: int = 80) -> None:
-        """防抖刷新对比分析页的图表尺寸与滚动区域。"""
-        if self._comparison_layout_job is not None:
-            self.root.after_cancel(self._comparison_layout_job)
-        self._comparison_layout_job = self.root.after(delay_ms, self._refresh_comparison_layout)
-
-    def _refresh_comparison_layout(self) -> None:
-        """在标签页显示或窗口尺寸变化后，重新贴合对比图尺寸。"""
-        self._comparison_layout_job = None
-        if not self.comparison_panel or not hasattr(self, 'center_notebook'):
-            return
-
-        comparison_tab = self._center_tabs.get('comparison')
-        if comparison_tab is None or str(self.center_notebook.select()) != str(comparison_tab):
-            return
-
-        chart = self._charts.get('comparison') or {}
-        figure = chart.get('fig')
-        canvas = chart.get('canvas')
-        chart_frame = self.comparison_panel.get_chart_frame('comparison')
-        if figure is None or canvas is None or chart_frame is None:
-            self.comparison_panel.refresh_layout()
-            return
-
-        old_size = (
-            int(round(figure.get_figwidth() * figure.dpi)),
-            int(round(figure.get_figheight() * figure.dpi)),
-        )
-        self._fit_comparison_figure_to_frame(figure, chart_frame, allow_expand=True)
-        new_height = min(1600, max(720, int(round(figure.get_figheight() * figure.dpi)) + 40))
-        self.comparison_panel.set_section_height('comparison', new_height)
-
-        new_size = (
-            int(round(figure.get_figwidth() * figure.dpi)),
-            int(round(figure.get_figheight() * figure.dpi)),
-        )
-        if new_size != old_size:
-            canvas.draw()
-
-        self.comparison_panel.refresh_layout()
-
-    def _legacy_show_group_comparison_window(self,
-                                      base_group: dict,
-                                      exp_group: dict,
-                                      note: Optional[str] = None,
-                                      failures: Optional[List[str]] = None):
-        """将base组与实验组的多图对比结果显示到对比分析面板"""
-        base_counts = [detail['count'] for detail in base_group['file_details']]
-        exp_counts = [detail['count'] for detail in exp_group['file_details']]
-        count_tests = self._compute_two_group_tests(base_counts, exp_counts)
-        nn_tests = self._compute_two_group_tests(
-            [detail['nearest_neighbor_cv'] for detail in base_group['file_details']],
-            [detail['nearest_neighbor_cv'] for detail in exp_group['file_details']],
-        )
-        grid_tests = self._compute_two_group_tests(
-            [detail['grid_density_cv'] for detail in base_group['file_details']],
-            [detail['grid_density_cv'] for detail in exp_group['file_details']],
-        )
-        uniformity_nn_tests = self._compute_two_group_tests(
-            [detail.get('uniformity_nn_score', 0.0) for detail in base_group['file_details']],
-            [detail.get('uniformity_nn_score', 0.0) for detail in exp_group['file_details']],
-        )
-        uniformity_grid_tests = self._compute_two_group_tests(
-            [detail.get('uniformity_grid_score', 0.0) for detail in base_group['file_details']],
-            [detail.get('uniformity_grid_score', 0.0) for detail in exp_group['file_details']],
-        )
-        uniformity_moran_tests = self._compute_two_group_tests(
-            [detail.get('uniformity_moran_score', 0.0) for detail in base_group['file_details']],
-            [detail.get('uniformity_moran_score', 0.0) for detail in exp_group['file_details']],
-        )
-        uniformity_tests = self._compute_two_group_tests(
-            [detail.get('uniformity_score', 0.0) for detail in base_group['file_details']],
-            [detail.get('uniformity_score', 0.0) for detail in exp_group['file_details']],
-        )
-        base_typical = self._select_representative_result(base_group)
-        exp_typical = self._select_representative_result(exp_group)
-        summary_text = self._format_group_comparison_summary(base_group, exp_group, note, failures)
-        stack_typical_images = self._should_stack_comparison_images(
-            base_typical.get('visualization'),
-            exp_typical.get('visualization'),
-            threshold=1.25,
-        )
-
-        layout = self._build_comparison_layout(
-            base_typical.get('visualization'),
-            exp_typical.get('visualization'),
-            stacked=stack_typical_images,
-            variant='group',
-        )
-        figure = Figure(figsize=layout['figsize'], dpi=100)
-        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-        if stack_typical_images:
-            grid_spec = figure.add_gridspec(
-                4,
-                6,
-                height_ratios=layout['height_ratios'],
-                hspace=layout['hspace'],
-                wspace=layout['wspace'],
-            )
-            ax_mean = figure.add_subplot(grid_spec[0, 0:2])
-            ax_box = figure.add_subplot(grid_spec[0, 2:4])
-            ax_metric = figure.add_subplot(grid_spec[0, 4:6])
-            ax_detail = figure.add_subplot(grid_spec[1, 0:6])
-            ax_base_typical = figure.add_subplot(grid_spec[2, 0:6])
-            ax_exp_typical = figure.add_subplot(grid_spec[3, 0:6])
-        else:
-            grid_spec = figure.add_gridspec(
-                3,
-                6,
-                height_ratios=layout['height_ratios'],
-                hspace=layout['hspace'],
-                wspace=layout['wspace'],
-            )
-            ax_mean = figure.add_subplot(grid_spec[0, 0:2])
-            ax_box = figure.add_subplot(grid_spec[0, 2:4])
-            ax_metric = figure.add_subplot(grid_spec[0, 4:6])
-            ax_detail = figure.add_subplot(grid_spec[1, 0:6])
-            ax_base_typical = figure.add_subplot(grid_spec[2, 0:3])
-            ax_exp_typical = figure.add_subplot(grid_spec[2, 3:6])
-        figure.subplots_adjust(**layout['adjust'])
-
-        base_count = base_group['count_stats']
-        exp_count = exp_group['count_stats']
-        labels = ['base组', '实验组']
-        means = [base_count['mean'], exp_count['mean']]
-        stds = [base_count['std'], exp_count['std']]
-
-        mean_bars = ax_mean.bar(
-            labels,
-            means,
-            yerr=stds,
-            capsize=6,
-            color=[self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']],
-            alpha=0.9,
-        )
-        ax_mean.set_title('每图CNT数量均值 ± 标准差', color=self.MODERN_COLORS['text_primary'])
-        ax_mean.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_mean.grid(True, axis='y', alpha=0.25, linestyle='--')
-
-        diff_ratio = ((exp_count['mean'] - base_count['mean']) / base_count['mean'] * 100.0) if base_count['mean'] > 0 else 0.0
-        y_max = max(means[i] + stds[i] for i in range(len(means))) if means else 1.0
-        for bar, mean, std in zip(mean_bars, means, stds):
-            ax_mean.text(
-                bar.get_x() + bar.get_width() / 2,
-                mean + std + max(y_max * 0.03, 1.0),
-                f"{mean:.1f}",
-                ha='center',
-                va='bottom',
-                fontsize=8.5,
-                color=self.MODERN_COLORS['text_primary'],
-            )
-        ax_mean.text(
-            0.5,
-            y_max * 1.08 if y_max > 0 else 0.5,
-            f"实验组相对base组 {diff_ratio:+.1f}%\n"
-            f"t检验 p={self._format_pvalue(count_tests['t_pvalue'])} ({self._get_significance_marker(count_tests['t_pvalue'])})",
-            ha='center',
-            va='bottom',
-            fontsize=9,
-            color=self.MODERN_COLORS['text_primary'],
-        )
-        ax_mean.set_ylim(0, y_max * 1.34 if y_max > 0 else 1.0)
-
-        box = ax_box.boxplot([base_counts, exp_counts], tick_labels=labels, patch_artist=True)
-        for patch, color in zip(box['boxes'], [self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']]):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.5)
-        ax_box.set_title('组内CNT数量分布', color=self.MODERN_COLORS['text_primary'])
-        ax_box.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_box.grid(True, axis='y', alpha=0.25, linestyle='--')
-
-        rng = np.random.default_rng(42)
-        ax_box.scatter(
-            1 + rng.normal(0, 0.04, len(base_counts)),
-            base_counts,
-            s=24,
-            alpha=0.75,
-            color=self.MODERN_COLORS['accent_rose'],
-            edgecolors='white',
-            linewidths=0.4,
-            zorder=3,
-        )
-        ax_box.scatter(
-            2 + rng.normal(0, 0.04, len(exp_counts)),
-            exp_counts,
-            s=24,
-            alpha=0.75,
-            color=self.MODERN_COLORS['accent_teal'],
-            edgecolors='white',
-            linewidths=0.4,
-            zorder=3,
-        )
-        box_top = max(max(base_counts), max(exp_counts)) if base_counts and exp_counts else 1.0
-        ax_box.text(
-            1.5,
-            box_top * 1.05 if box_top > 0 else 0.5,
-            f"Mann-Whitney p={self._format_pvalue(count_tests['mw_pvalue'])}",
-            ha='center',
-            va='bottom',
-            fontsize=8.5,
-            color=self.MODERN_COLORS['text_primary'],
-        )
-        ax_box.set_ylim(0, box_top * 1.18 if box_top > 0 else 1.0)
-
-        metric_names = ["最近邻得分", "网格得分", "Moran得分", "综合得分"]
-        base_metric_means = [
-            base_group['spatial_stats']['uniformity_nn_score']['mean'],
-            base_group['spatial_stats']['uniformity_grid_score']['mean'],
-            base_group['spatial_stats']['uniformity_moran_score']['mean'],
-            base_group['spatial_stats']['uniformity_score']['mean'],
-        ]
-        exp_metric_means = [
-            exp_group['spatial_stats']['uniformity_nn_score']['mean'],
-            exp_group['spatial_stats']['uniformity_grid_score']['mean'],
-            exp_group['spatial_stats']['uniformity_moran_score']['mean'],
-            exp_group['spatial_stats']['uniformity_score']['mean'],
-        ]
-        x = np.arange(len(metric_names))
-        width = 0.35
-        base_metric_bars = ax_metric.bar(
-            x - width / 2,
-            base_metric_means,
-            width,
-            label='base组',
-            color=self.MODERN_COLORS['accent_rose'],
-        )
-        exp_metric_bars = ax_metric.bar(
-            x + width / 2,
-            exp_metric_means,
-            width,
-            label='实验组',
-            color=self.MODERN_COLORS['accent_teal'],
-        )
-        ax_metric.set_xticks(x)
-        ax_metric.set_xticklabels(metric_names)
-        ax_metric.set_ylabel('得分 (0-100，越大越均匀)', color=self.MODERN_COLORS['text_secondary'])
-        ax_metric.set_title('组别均匀性得分均值', color=self.MODERN_COLORS['text_primary'])
-        ax_metric.legend(frameon=False)
-        ax_metric.grid(True, axis='y', alpha=0.25, linestyle='--')
-        self._annotate_bar_values(ax_metric, base_metric_bars, fmt="{:.1f}", offset_ratio=0.012)
-        self._annotate_bar_values(ax_metric, exp_metric_bars, fmt="{:.1f}", offset_ratio=0.012)
-
-        metric_tests = [uniformity_nn_tests, uniformity_grid_tests, uniformity_moran_tests, uniformity_tests]
-        metric_y = np.maximum(base_metric_means, exp_metric_means)
-        metric_pad = max(float(np.max(metric_y)) * 0.05, 1.5) if len(metric_y) else 2.0
-        for idx, test in enumerate(metric_tests):
-            ax_metric.text(
-                x[idx],
-                metric_y[idx] + metric_pad,
-                f"p={self._format_pvalue(test['t_pvalue'])}\n{self._get_significance_marker(test['t_pvalue'])}",
-                ha='center',
-                va='bottom',
-                fontsize=8,
-                color=self.MODERN_COLORS['text_primary'],
-            )
-        ax_metric.set_ylim(0, 108)
-
-        base_x = np.arange(1, len(base_counts) + 1)
-        exp_x = np.arange(1, len(exp_counts) + 1)
-        ax_detail.plot(
-            base_x,
-            base_counts,
-            marker='o',
-            linewidth=1.8,
-            color=self.MODERN_COLORS['accent_rose'],
-            label='base组',
-        )
-        ax_detail.plot(
-            exp_x,
-            exp_counts,
-            marker='o',
-            linewidth=1.8,
-            color=self.MODERN_COLORS['accent_teal'],
-            label='实验组',
-        )
-        ax_detail.set_title('组内逐图CNT数量', color=self.MODERN_COLORS['text_primary'])
-        ax_detail.set_xlabel('组内图像序号', color=self.MODERN_COLORS['text_secondary'])
-        ax_detail.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_detail.legend(frameon=False)
-        ax_detail.grid(True, alpha=0.25, linestyle='--')
-
-        self._configure_comparison_image_axis(
-            ax_base_typical,
-            base_typical['visualization'],
-            f"base组典型CNT分布\n{base_typical['name']}\nCNT={int(base_typical['stats']['count'])}",
-        )
-
-        self._configure_comparison_image_axis(
-            ax_exp_typical,
-            exp_typical['visualization'],
-            f"实验组典型CNT分布\n{exp_typical['name']}\nCNT={int(exp_typical['stats']['count'])}",
-        )
-
-        self._apply_standard_axes_style([ax_mean, ax_box, ax_metric, ax_detail])
-        for ax in (ax_base_typical, ax_exp_typical):
-            ax.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-            for spine in ax.spines.values():
-                spine.set_color(self.MODERN_COLORS['border'])
-
-        self._render_comparison_figure(summary_text, figure)
-        return
-
-    def _format_group_detail_lines(self, group_summary: dict) -> List[str]:
-        """生成组内逐图统计明细，优先展示团聚风险与均匀性。"""
-        lines = [f"{group_summary['label']}逐图结果:"]
-        for detail in group_summary.get('file_details', []):
-            lines.append(
-                f"  - {detail['name']}: CNT={detail['count']:.0f}，团聚风险总分={detail.get('aggregation_score', 0.0):.1f}，"
-                f"综合均匀性得分={detail.get('uniformity_score', 0.0):.1f}，Moran's I={detail.get('morans_i', 0.0):.3f}，"
-                f"最近邻CV={detail.get('nearest_neighbor_cv', 0.0):.3f}，网格CNT数CV={detail.get('grid_density_cv', 0.0):.3f}"
-            )
-        return lines
-
-    def _format_group_comparison_summary(self,
-                                         base_group: dict,
-                                         exp_group: dict,
-                                         note: Optional[str] = None,
-                                         failures: Optional[List[str]] = None) -> str:
-        """生成组别对比摘要，优先强调团聚风险与均匀性差异。"""
-        base_count = base_group['count_stats']
-        exp_count = exp_group['count_stats']
-        base_spatial = base_group['spatial_stats']
-        exp_spatial = exp_group['spatial_stats']
-        tests = self._compute_group_comparison_tests(base_group, exp_group)
-        count_tests = tests['count']
-        nn_tests = tests['nearest_neighbor_cv']
-        grid_tests = tests['grid_density_cv']
-        uniformity_tests = tests['uniformity_score']
-        aggregation_tests = tests['aggregation_score']
-
-        split_mode_label = self.split_mode_var.get()
-        profile_label = self.detect_profile_var.get()
-        count_diff = exp_count['mean'] - base_count['mean']
-        count_ratio = (count_diff / base_count['mean'] * 100.0) if base_count['mean'] > 0 else 0.0
-
-        base_aggregation_mean = base_spatial['aggregation_score']['mean']
-        exp_aggregation_mean = exp_spatial['aggregation_score']['mean']
-        aggregation_diff = base_aggregation_mean - exp_aggregation_mean
-        uniformity_diff = exp_spatial['uniformity_score']['mean'] - base_spatial['uniformity_score']['mean']
-        evidence_significant = (
-            self._is_test_significant(aggregation_tests) or
-            self._is_test_significant(uniformity_tests)
-        )
-        strong_conclusion = (
-            aggregation_diff >= 5.0 and
-            uniformity_diff >= 5.0 and
-            evidence_significant
-        )
-        directional_advantage = aggregation_diff > 0 and uniformity_diff > 0
-
-        if strong_conclusion:
-            headline = (
-                "主结论: [团聚更明显] [分布更均匀] [统计显著] "
-                "base组团聚影响更明显，实验组CNT分布更均匀。"
-            )
-        elif directional_advantage:
-            headline = (
-                "主结论: [团聚更明显] [分布更均匀] [趋势存在但证据有限] "
-                "实验组在均匀性方向上更优，base组存在更高团聚倾向，但统计证据有限/差异未完全拉开。"
-            )
-        else:
-            headline = (
-                "主结论: [方向未完全一致] "
-                "当前两组在团聚风险和均匀性上的差异未形成一致优势，仍需结合更多图像或继续优化参数。"
-            )
-
-        aggregation_marker = self._get_significance_marker(self._get_preferred_pvalue(aggregation_tests))
-        uniformity_marker = self._get_significance_marker(self._get_preferred_pvalue(uniformity_tests))
-        count_marker = self._get_significance_marker(self._get_preferred_pvalue(count_tests))
-
-        lines: List[str] = []
-        if note:
-            lines.append(note)
-            lines.append("")
-
-        lines.extend([
-            headline,
-            (
-                f"团聚风险总分: base组 {base_aggregation_mean:.1f}±{base_spatial['aggregation_score']['std']:.1f}，"
-                f"实验组 {exp_aggregation_mean:.1f}±{exp_spatial['aggregation_score']['std']:.1f}。"
-                f"该得分范围 0-100，越大越团聚；当前 base 组相对实验组高 {aggregation_diff:.1f} 分。"
-            ),
-            (
-                f"综合均匀性得分: base组 {base_spatial['uniformity_score']['mean']:.1f}±{base_spatial['uniformity_score']['std']:.1f}，"
-                f"实验组 {exp_spatial['uniformity_score']['mean']:.1f}±{exp_spatial['uniformity_score']['std']:.1f}。"
-                f"该得分范围 0-100，越大越均匀；当前实验组相对 base 组高 {uniformity_diff:.1f} 分。"
-            ),
-            (
-                f"统计支持: 团聚风险总分 t检验 p={self._format_pvalue(aggregation_tests['t_pvalue'])}，"
-                f"Mann-Whitney p={self._format_pvalue(aggregation_tests['mw_pvalue'])}，显著性 {aggregation_marker}；"
-                f"综合均匀性得分 t检验 p={self._format_pvalue(uniformity_tests['t_pvalue'])}，"
-                f"Mann-Whitney p={self._format_pvalue(uniformity_tests['mw_pvalue'])}，显著性 {uniformity_marker}。"
-            ),
-            "",
-            f"相同识别条件: 模糊={self.blur_kernel_var.get()} / 自适应块={self.adaptive_block_var.get()} / C={self.adaptive_c_var.get()} / 桥接={self.bridge_strength_var.get()} / 最小长度={self.min_length_um_var.get():.1f}μm / 最小长宽比={self.min_slenderness_var.get():.1f} / 检测风格={profile_label} / 拆分模式={split_mode_label} / 合并距离={self.merge_distance_px_var.get()}px",
-            f"base组: 共 {base_group['image_count']} 张图，总CNT {int(round(base_count['total']))}，平均 {base_count['mean']:.2f}，标准差 {base_count['std']:.2f}，方差 {base_count['var']:.2f}，范围 {base_count['min']:.0f}~{base_count['max']:.0f}",
-            f"实验组: 共 {exp_group['image_count']} 张图，总CNT {int(round(exp_count['total']))}，平均 {exp_count['mean']:.2f}，标准差 {exp_count['std']:.2f}，方差 {exp_count['var']:.2f}，范围 {exp_count['min']:.0f}~{exp_count['max']:.0f}",
-        ])
-
-        if count_diff >= 0:
-            lines.append(f"CNT数量均值差异: 实验组比base组高 {count_diff:.2f}（{count_ratio:.1f}%）")
-        else:
-            lines.append(f"CNT数量均值差异: base组比实验组高 {abs(count_diff):.2f}（{abs(count_ratio):.1f}%）")
-
-        lines.extend([
-            "",
-            "组别空间分布统计:",
-            f"方法一 中心点最近邻CV: base组 {base_spatial['nearest_neighbor_cv']['mean']:.3f}±{base_spatial['nearest_neighbor_cv']['std']:.3f}，实验组 {exp_spatial['nearest_neighbor_cv']['mean']:.3f}±{exp_spatial['nearest_neighbor_cv']['std']:.3f}。该值越小越均匀。",
-            f"补充指标 最近邻指数NNI: base组 {base_spatial['nearest_neighbor_index']['mean']:.3f}±{base_spatial['nearest_neighbor_index']['std']:.3f}，实验组 {exp_spatial['nearest_neighbor_index']['mean']:.3f}±{exp_spatial['nearest_neighbor_index']['std']:.3f}。该值大于 1 表示比随机分布更均匀。",
-            f"方法二 网格CNT数CV: base组 {base_spatial['grid_density_cv']['mean']:.3f}±{base_spatial['grid_density_cv']['std']:.3f}，实验组 {exp_spatial['grid_density_cv']['mean']:.3f}±{exp_spatial['grid_density_cv']['std']:.3f}。该值越小越均匀。",
-            f"方法三 Moran's I: base组 {base_spatial['morans_i']['mean']:.3f}±{base_spatial['morans_i']['std']:.3f}，实验组 {exp_spatial['morans_i']['mean']:.3f}±{exp_spatial['morans_i']['std']:.3f}。该值越大越聚集。",
-            "",
-            "统计检验:",
-            f"CNT数量 t检验 p={self._format_pvalue(count_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(count_tests['mw_pvalue'])}，显著性 {count_marker}",
-            f"综合团聚风险 t检验 p={self._format_pvalue(aggregation_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(aggregation_tests['mw_pvalue'])}，显著性 {aggregation_marker}",
-            f"综合均匀性得分 t检验 p={self._format_pvalue(uniformity_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(uniformity_tests['mw_pvalue'])}，显著性 {uniformity_marker}",
-            f"最近邻CV t检验 p={self._format_pvalue(nn_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(nn_tests['mw_pvalue'])}，显著性 {self._get_significance_marker(self._get_preferred_pvalue(nn_tests))}",
-            f"网格CNT数CV t检验 p={self._format_pvalue(grid_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(grid_tests['mw_pvalue'])}，显著性 {self._get_significance_marker(self._get_preferred_pvalue(grid_tests))}",
-            "",
-        ])
-
-        lines.extend(self._format_group_detail_lines(base_group))
-        lines.append("")
-        lines.extend(self._format_group_detail_lines(exp_group))
-
-        if failures:
-            lines.append("")
-            lines.append("未成功分析的文件:")
-            lines.extend([f"  - {item}" for item in failures])
-
-        return "\n".join(lines)
-
-    def _plot_group_aggregation_risk_chart(self, ax, base_group: dict, exp_group: dict, tests: dict) -> None:
-        """绘制组别团聚风险主图卡。"""
-        metric_names = ["团聚风险总分", "Moran 团聚风险", "最近邻离散风险", "网格密度离散风险"]
-        base_metric_means = [
-            base_group['spatial_stats']['aggregation_score']['mean'],
-            base_group['spatial_stats']['aggregation_moran_score']['mean'],
-            base_group['spatial_stats']['aggregation_nn_score']['mean'],
-            base_group['spatial_stats']['aggregation_grid_score']['mean'],
-        ]
-        exp_metric_means = [
-            exp_group['spatial_stats']['aggregation_score']['mean'],
-            exp_group['spatial_stats']['aggregation_moran_score']['mean'],
-            exp_group['spatial_stats']['aggregation_nn_score']['mean'],
-            exp_group['spatial_stats']['aggregation_grid_score']['mean'],
-        ]
-        metric_tests = [
-            tests['aggregation_score'],
-            tests['aggregation_moran_score'],
-            tests['aggregation_nn_score'],
-            tests['aggregation_grid_score'],
-        ]
-
-        x = np.arange(len(metric_names))
-        width = 0.34
-        base_color = self.MODERN_COLORS['accent_rose']
-        exp_color = self.MODERN_COLORS['accent_teal']
-
-        base_metric_bars = ax.bar(
-            x - width / 2,
-            base_metric_means,
-            width,
-            label='base组',
-            color=base_color,
-            alpha=0.95,
-        )
-        exp_metric_bars = ax.bar(
-            x + width / 2,
-            exp_metric_means,
-            width,
-            label='实验组',
-            color=exp_color,
-            alpha=0.82,
-        )
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(metric_names)
-        ax.set_ylabel('团聚风险得分 (0-100)', color=self.MODERN_COLORS['text_secondary'])
-        ax.set_title('团聚风险 vs 均匀性优势', color=self.MODERN_COLORS['text_primary'])
-        legend = ax.legend(title='数值越大 = 越团聚', frameon=False, loc='upper right')
-        if legend is not None:
-            legend.get_title().set_color(self.MODERN_COLORS['text_secondary'])
-        ax.grid(True, axis='y', alpha=0.25, linestyle='--')
-        self._annotate_bar_values(ax, base_metric_bars, fmt="{:.1f}", offset_ratio=0.01)
-        self._annotate_bar_values(ax, exp_metric_bars, fmt="{:.1f}", offset_ratio=0.01)
-
-        ax.text(
-            0.01,
-            0.97,
-            "base高 / 实验低 = 实验组更均匀",
-            transform=ax.transAxes,
-            ha='left',
-            va='top',
-            fontsize=8.5,
-            color=self.MODERN_COLORS['text_secondary'],
-            bbox={
-                'boxstyle': 'round,pad=0.25',
-                'facecolor': self.MODERN_COLORS['bg_tertiary'],
-                'edgecolor': self.MODERN_COLORS['border'],
-                'alpha': 0.95,
-            },
-        )
-
-        for idx, test in enumerate(metric_tests):
-            pvalue = self._get_preferred_pvalue(test)
-            marker = self._get_significance_marker(pvalue)
-            annotation_y = min(97.5, max(base_metric_means[idx], exp_metric_means[idx]) + 7.0)
-            ax.text(
-                x[idx],
-                annotation_y,
-                f"p={self._format_pvalue(pvalue)}\n{marker}",
-                ha='center',
-                va='bottom',
-                fontsize=8,
-                color=self.MODERN_COLORS['text_primary'],
-            )
-
-        ax.set_ylim(0, 100)
-
-    def _shorten_distribution_label(self, label: str, max_length: int = 22) -> str:
-        """缩短逐图标签，避免文件名把坐标轴挤坏。"""
-        if len(label) <= max_length:
-            return label
-        return label[:max_length - 3] + "..."
-
-    def _render_group_count_distribution_views(self,
-                                               ax_box,
-                                               ax_detail,
-                                               base_group: dict,
-                                               exp_group: dict,
-                                               count_tests: dict) -> None:
-        """根据样本量自适应显示组内数量分布，避免单点时出现失真的箱线图/折线图。"""
-        base_counts = self._get_group_detail_series(base_group, 'count')
-        exp_counts = self._get_group_detail_series(exp_group, 'count')
-        base_names = [self._shorten_distribution_label(detail['name']) for detail in base_group.get('file_details', [])]
-        exp_names = [self._shorten_distribution_label(detail['name']) for detail in exp_group.get('file_details', [])]
-        labels = ['base组', '实验组']
-        colors = [self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']]
-        min_samples = min(len(base_counts), len(exp_counts)) if base_counts and exp_counts else 0
-
-        if min_samples <= 1:
-            for x_pos, values, color in zip((1, 2), (base_counts, exp_counts), colors):
-                if not values:
-                    continue
-                ax_box.scatter(
-                    [x_pos] * len(values),
-                    values,
-                    s=48,
-                    alpha=0.82,
-                    color=color,
-                    edgecolors='white',
-                    linewidths=0.6,
-                    zorder=3,
-                )
-                mean_value = float(np.mean(values))
-                ax_box.hlines(mean_value, x_pos - 0.18, x_pos + 0.18, colors=color, linewidth=2.0, zorder=2)
-                ax_box.text(
-                    x_pos,
-                    mean_value + max(mean_value * 0.03, 1.0),
-                    f"{mean_value:.1f}",
-                    ha='center',
-                    va='bottom',
-                    fontsize=8.5,
-                    color=self.MODERN_COLORS['text_primary'],
-                )
-            ax_box.set_xticks([1, 2])
-            ax_box.set_xticklabels(labels)
-            ax_box.set_title('组内CNT样本点（样本量较少）', color=self.MODERN_COLORS['text_primary'])
-            ax_box.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-            ax_box.grid(True, axis='y', alpha=0.25, linestyle='--')
-            max_count = max(base_counts + exp_counts) if (base_counts or exp_counts) else 1.0
-            ax_box.text(
-                1.5,
-                max_count * 1.08 if max_count > 0 else 0.5,
-                f"每组仅 {min_samples} 张图，已切换为单点概览 | {self._format_compact_significance(count_tests)}",
-                ha='center',
-                va='bottom',
-                fontsize=8.5,
-                color=self.MODERN_COLORS['text_primary'],
-            )
-            ax_box.set_ylim(0, max_count * 1.22 if max_count > 0 else 1.0)
-
-            detail_labels = [f"base | {name}" for name in base_names] + [f"实验 | {name}" for name in exp_names]
-            detail_counts = base_counts + exp_counts
-            detail_colors = [colors[0]] * len(base_counts) + [colors[1]] * len(exp_counts)
-            positions = np.arange(len(detail_counts))
-            ax_detail.barh(positions, detail_counts, color=detail_colors, alpha=0.88)
-            ax_detail.set_yticks(positions)
-            ax_detail.set_yticklabels(detail_labels)
-            ax_detail.invert_yaxis()
-            ax_detail.set_title('逐图CNT概览', color=self.MODERN_COLORS['text_primary'])
-            ax_detail.set_xlabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-            ax_detail.grid(True, axis='x', alpha=0.25, linestyle='--')
-            for y_pos, value in zip(positions, detail_counts):
-                ax_detail.text(
-                    value + max(max(detail_counts, default=1.0) * 0.015, 0.6),
-                    y_pos,
-                    f"{value:.0f}",
-                    va='center',
-                    fontsize=8.5,
-                    color=self.MODERN_COLORS['text_primary'],
-                )
-            return
-
-        box = ax_box.boxplot([base_counts, exp_counts], tick_labels=labels, patch_artist=True)
-        for patch, color in zip(box['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.5)
-        ax_box.set_title('组内CNT数量分布', color=self.MODERN_COLORS['text_primary'])
-        ax_box.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_box.grid(True, axis='y', alpha=0.25, linestyle='--')
-
-        rng = np.random.default_rng(42)
-        ax_box.scatter(
-            1 + rng.normal(0, 0.04, len(base_counts)),
-            base_counts,
-            s=24,
-            alpha=0.75,
-            color=colors[0],
-            edgecolors='white',
-            linewidths=0.4,
-            zorder=3,
-        )
-        ax_box.scatter(
-            2 + rng.normal(0, 0.04, len(exp_counts)),
-            exp_counts,
-            s=24,
-            alpha=0.75,
-            color=colors[1],
-            edgecolors='white',
-            linewidths=0.4,
-            zorder=3,
-        )
-        box_top = max(max(base_counts), max(exp_counts)) if base_counts and exp_counts else 1.0
-        ax_box.text(
-            1.5,
-            box_top * 1.05 if box_top > 0 else 0.5,
-            f"分布检验 {self._format_compact_significance(count_tests)}",
-            ha='center',
-            va='bottom',
-            fontsize=8.5,
-            color=self.MODERN_COLORS['text_primary'],
-        )
-        ax_box.set_ylim(0, box_top * 1.18 if box_top > 0 else 1.0)
-
-        base_x = np.arange(1, len(base_counts) + 1)
-        exp_x = np.arange(1, len(exp_counts) + 1)
-        if max(len(base_counts), len(exp_counts)) <= 3:
-            ax_detail.scatter(base_x, base_counts, s=42, color=colors[0], label='base组', zorder=3)
-            ax_detail.scatter(exp_x, exp_counts, s=42, color=colors[1], label='实验组', zorder=3)
-            ax_detail.set_title('组内逐图CNT样本点', color=self.MODERN_COLORS['text_primary'])
-        else:
-            ax_detail.plot(
-                base_x,
-                base_counts,
-                marker='o',
-                linewidth=1.8,
-                color=colors[0],
-                label='base组',
-            )
-            ax_detail.plot(
-                exp_x,
-                exp_counts,
-                marker='o',
-                linewidth=1.8,
-                color=colors[1],
-                label='实验组',
-            )
-            ax_detail.set_title('组内逐图CNT数量', color=self.MODERN_COLORS['text_primary'])
-        ax_detail.set_xlabel('组内图像序号', color=self.MODERN_COLORS['text_secondary'])
-        ax_detail.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_detail.legend(frameon=False)
-        ax_detail.grid(True, alpha=0.25, linestyle='--')
-
-    def _show_group_comparison_window(self,
-                                      base_group: dict,
-                                      exp_group: dict,
-                                      note: Optional[str] = None,
-                                      failures: Optional[List[str]] = None):
-        """将base组与实验组的多图对比结果显示到对比分析面板。"""
-        tests = self._compute_group_comparison_tests(base_group, exp_group)
-        count_tests = tests['count']
-        base_typical = self._select_representative_result(base_group)
-        exp_typical = self._select_representative_result(exp_group)
-        summary_text = self._format_group_comparison_summary(base_group, exp_group, note, failures)
-        base_display_image = self._prepare_comparison_display_image(
-            base_typical.get('visualization'),
-            max_width=1000,
-            max_height=560,
-        )
-        exp_display_image = self._prepare_comparison_display_image(
-            exp_typical.get('visualization'),
-            max_width=1000,
-            max_height=560,
-        )
-        stack_typical_images = self._should_stack_comparison_images(
-            base_display_image,
-            exp_display_image,
-            threshold=1.8,
-        )
-
-        layout = self._build_comparison_layout(
-            base_display_image,
-            exp_display_image,
-            stacked=stack_typical_images,
-            variant='group',
-        )
-        figure_width, figure_height = layout['figsize']
-        compact_width = min(13.8, figure_width)
-        compact_height = min(12.6, figure_height + (1.1 if stack_typical_images else 0.7))
-        figure = Figure(figsize=(compact_width, compact_height), dpi=88)
-        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-
-        if stack_typical_images:
-            base_ratios = layout['height_ratios']
-            grid_spec = figure.add_gridspec(
-                5,
-                6,
-                height_ratios=[
-                    max(1.0, base_ratios[0] + 0.20),
-                    max(0.72, base_ratios[1] * 0.95),
-                    max(0.72, base_ratios[1]),
-                    base_ratios[2],
-                    base_ratios[3],
-                ],
-                hspace=max(layout['hspace'], 0.34),
-                wspace=layout['wspace'],
-            )
-            ax_metric = figure.add_subplot(grid_spec[0, 0:6])
-            ax_mean = figure.add_subplot(grid_spec[1, 0:3])
-            ax_box = figure.add_subplot(grid_spec[1, 3:6])
-            ax_detail = figure.add_subplot(grid_spec[2, 0:6])
-            ax_base_typical = figure.add_subplot(grid_spec[3, 0:6])
-            ax_exp_typical = figure.add_subplot(grid_spec[4, 0:6])
-        else:
-            base_ratios = layout['height_ratios']
-            grid_spec = figure.add_gridspec(
-                4,
-                6,
-                height_ratios=[
-                    max(1.02, base_ratios[0] + 0.18),
-                    max(0.74, base_ratios[1] * 0.95),
-                    max(0.74, base_ratios[1]),
-                    base_ratios[2],
-                ],
-                hspace=max(layout['hspace'], 0.32),
-                wspace=layout['wspace'],
-            )
-            ax_metric = figure.add_subplot(grid_spec[0, 0:6])
-            ax_mean = figure.add_subplot(grid_spec[1, 0:3])
-            ax_box = figure.add_subplot(grid_spec[1, 3:6])
-            ax_detail = figure.add_subplot(grid_spec[2, 0:6])
-            ax_base_typical = figure.add_subplot(grid_spec[3, 0:3])
-            ax_exp_typical = figure.add_subplot(grid_spec[3, 3:6])
-        figure.subplots_adjust(**layout['adjust'])
-
-        base_count = base_group['count_stats']
-        exp_count = exp_group['count_stats']
-        labels = ['base组', '实验组']
-        means = [base_count['mean'], exp_count['mean']]
-        stds = [base_count['std'], exp_count['std']]
-
-        self._plot_group_aggregation_risk_chart(ax_metric, base_group, exp_group, tests)
-
-        mean_bars = ax_mean.bar(
-            labels,
-            means,
-            yerr=stds,
-            capsize=6,
-            color=[self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']],
-            alpha=0.9,
-        )
-        ax_mean.set_title('每图CNT数量均值 ± 标准差', color=self.MODERN_COLORS['text_primary'])
-        ax_mean.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_mean.grid(True, axis='y', alpha=0.25, linestyle='--')
-
-        diff_ratio = ((exp_count['mean'] - base_count['mean']) / base_count['mean'] * 100.0) if base_count['mean'] > 0 else 0.0
-        y_max = max(means[i] + stds[i] for i in range(len(means))) if means else 1.0
-        for bar, mean, std in zip(mean_bars, means, stds):
-            ax_mean.text(
-                bar.get_x() + bar.get_width() / 2,
-                mean + std + max(y_max * 0.03, 1.0),
-                f"{mean:.1f}",
-                ha='center',
-                va='bottom',
-                fontsize=8.5,
-                color=self.MODERN_COLORS['text_primary'],
-            )
-        ax_mean.text(
-            0.5,
-            y_max * 1.09 if y_max > 0 else 0.5,
-            f"实验组相对base组 {diff_ratio:+.1f}%\n"
-            f"p={self._format_pvalue(self._get_preferred_pvalue(count_tests))} ({self._get_significance_marker(self._get_preferred_pvalue(count_tests))})",
-            ha='center',
-            va='bottom',
-            fontsize=9,
-            color=self.MODERN_COLORS['text_primary'],
-        )
-        ax_mean.set_ylim(0, y_max * 1.36 if y_max > 0 else 1.0)
-
-        self._render_group_count_distribution_views(
-            ax_box,
-            ax_detail,
-            base_group,
-            exp_group,
-            count_tests,
-        )
-
-        self._configure_comparison_image_axis(
-            ax_base_typical,
-            base_typical['visualization'],
-            f"base组典型CNT分布\n{base_typical['name']}\nCNT={int(base_typical['stats']['count'])}",
-        )
-
-        self._configure_comparison_image_axis(
-            ax_exp_typical,
-            exp_typical['visualization'],
-            f"实验组典型CNT分布\n{exp_typical['name']}\nCNT={int(exp_typical['stats']['count'])}",
-        )
-
-        self._apply_standard_axes_style([ax_metric, ax_mean, ax_box, ax_detail])
-        for ax in (ax_base_typical, ax_exp_typical):
-            ax.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-            for spine in ax.spines.values():
-                spine.set_color(self.MODERN_COLORS['border'])
-
-        self._render_comparison_figure(summary_text, figure)
-        return
 
     def _format_compact_params(self) -> str:
         """生成精简版识别参数描述。"""
@@ -3723,23 +3204,19 @@ class CNTAnalyzerGUI:
             f"长宽比≥{self.min_slenderness_var.get():.1f}",
             self.detect_profile_var.get(),
         ]
-
         bridge_strength = self.bridge_strength_var.get()
         if bridge_strength:
             parts.append(f"桥接{bridge_strength}")
-
         split_mode = self.split_mode_var.get()
         if split_mode and split_mode != "不拆分":
             parts.append(split_mode)
-
         merge_distance = self.merge_distance_px_var.get()
         if merge_distance:
             parts.append(f"合并{merge_distance}px")
-
         return "识别参数: " + " | ".join(str(part) for part in parts if part)
 
     def _format_compact_significance(self, test_result: Optional[dict]) -> str:
-        """将统计检验压缩成单一 p 值展示。"""
+        """将统计检验压缩成单行 p 值展示。"""
         pvalue = self._get_preferred_pvalue(test_result)
         marker = self._get_significance_marker(pvalue)
         if marker == "n.s.":
@@ -3760,40 +3237,423 @@ class CNTAnalyzerGUI:
                                   right_std: Optional[float] = None,
                                   test_result: Optional[dict] = None) -> str:
         """格式化精简版指标对比行。"""
-        direction_suffix = {
-            'up': '↑',
-            'down': '↓',
-            'cluster': '↑聚集',
-        }.get(direction, '')
-        if qualifier:
-            title = f"{label}({qualifier})"
-        else:
-            title = f"{label}({direction_suffix})" if direction_suffix else label
+        direction_suffix = {'up': '↑', 'down': '↓', 'cluster': '↑聚集'}.get(direction, '')
+        title = f"{label}({qualifier})" if qualifier else (f"{label}({direction_suffix})" if direction_suffix else label)
         value_fmt = f"{{:.{precision}f}}"
-
         if left_std is None or right_std is None:
-            line = (
-                f"{title}: {left_label} {value_fmt.format(left_value)} vs "
-                f"{right_label} {value_fmt.format(right_value)}"
-            )
+            line = f"{title}: {left_label} {value_fmt.format(left_value)} vs {right_label} {value_fmt.format(right_value)}"
         else:
             line = (
                 f"{title}: {left_label} {value_fmt.format(left_value)}±{value_fmt.format(left_std)} vs "
                 f"{right_label} {value_fmt.format(right_value)}±{value_fmt.format(right_std)}"
             )
-
         if test_result is not None:
             line += f" | {self._format_compact_significance(test_result)}"
         return line
+
+    def _summarize_spatial_hotspots_for_caption(self, spatial: Optional[dict]) -> str:
+        """为代表图标题补充热点摘要。"""
+        if not spatial:
+            return ""
+        _, hotspot_info = self._build_spatial_hotspot_grid(spatial)
+        hotspot_regions = int(hotspot_info.get('hotspot_regions', 0) or 0)
+        if hotspot_regions <= 0:
+            return ""
+        metrics = self._get_shadow_aggregation_metrics(spatial)
+        shadow_support_ratio = float(hotspot_info.get('shadow_support_ratio', 0.0) or 0.0)
+        return (
+            f"\n阴影团聚 {metrics['score']:.1f} | "
+            f"均匀度 {metrics['uniformity_score']:.1f} | "
+            f"热点 {hotspot_regions} 处 | "
+            f"阴影支撑 {shadow_support_ratio:.1%}"
+        )
+
+    def _configure_comparison_image_axis(self,
+                                         ax,
+                                         image: np.ndarray,
+                                         title: str,
+                                         spatial: Optional[dict] = None):
+        """以正确比例显示对比中的代表图，并附加热点摘要。"""
+        if image is None or getattr(image, 'size', 0) == 0:
+            ax.text(0.5, 0.5, "暂无图像", ha='center', va='center', transform=ax.transAxes, color=self.MODERN_COLORS['text_secondary'])
+            ax.axis('off')
+            return
+
+        display_image = self._prepare_comparison_display_image(image)
+        ax.imshow(display_image, interpolation='nearest', aspect='equal')
+        ax.set_aspect('equal', adjustable='box')
+        ax.margins(0.0)
+        ax.set_anchor('C')
+        ax.text(
+            0.02,
+            0.98,
+            title + self._summarize_spatial_hotspots_for_caption(spatial),
+            transform=ax.transAxes,
+            ha='left',
+            va='top',
+            fontsize=9,
+            linespacing=1.15,
+            color=self.MODERN_COLORS['text_primary'],
+            bbox={
+                'boxstyle': 'round,pad=0.28',
+                'facecolor': self.MODERN_COLORS['bg_secondary'],
+                'edgecolor': self.MODERN_COLORS['border'],
+                'alpha': 0.84,
+            },
+        )
+        ax.axis('off')
+
+    def _estimate_comparison_summary_height(self, summary_text: str) -> int:
+        """根据摘要文本估算紧凑摘要区高度。"""
+        logical_lines = summary_text.splitlines() or [summary_text]
+        wrapped_lines = sum(max(1, (len(line) + 71) // 72) for line in logical_lines)
+        return min(220, max(128, 34 + wrapped_lines * 14))
+
+    def _fit_comparison_figure_to_frame(self,
+                                        figure: Figure,
+                                        chart_frame: Optional[tk.Widget],
+                                        min_width_px: int = 620,
+                                        padding_px: int = 24,
+                                        max_width_px: int = 1260,
+                                        allow_expand: bool = False) -> None:
+        """按中间栏可用宽度等比缩放对比图。"""
+        if chart_frame is None:
+            return
+        chart_frame.update_idletasks()
+        available_width = max(
+            int(chart_frame.winfo_width()) - padding_px,
+            int(getattr(self, 'center_notebook', chart_frame).winfo_width()) - padding_px,
+            min_width_px,
+        )
+        target_width_px = max(min_width_px, min(max_width_px, available_width))
+        current_width_px = max(1, int(round(figure.get_figwidth() * figure.dpi)))
+        current_height_px = max(1, int(round(figure.get_figheight() * figure.dpi)))
+        if current_width_px <= target_width_px + 8 and (not allow_expand or current_width_px >= target_width_px - 24):
+            return
+        scale = target_width_px / current_width_px
+        resized_width_px = max(min_width_px, int(round(current_width_px * scale)))
+        resized_height_px = max(420, int(round(current_height_px * scale)))
+        figure.set_size_inches(resized_width_px / figure.dpi, resized_height_px / figure.dpi, forward=False)
+
+    def _schedule_comparison_layout_refresh(self, delay_ms: int = 80) -> None:
+        """防抖刷新对比分析页的图表尺寸与滚动区域。"""
+        if getattr(self, '_comparison_layout_job', None) is not None:
+            self.root.after_cancel(self._comparison_layout_job)
+        self._comparison_layout_job = self.root.after(delay_ms, self._refresh_comparison_layout)
+
+    def _refresh_comparison_layout(self) -> None:
+        """在标签页显示或窗口尺寸变化后，重新贴合对比图尺寸。"""
+        self._comparison_layout_job = None
+        if not self.comparison_panel or not hasattr(self, 'center_notebook'):
+            return
+        comparison_tab = self._center_tabs.get('comparison')
+        if comparison_tab is None or str(self.center_notebook.select()) != str(comparison_tab):
+            return
+        chart = self._charts.get('comparison') or {}
+        figure = chart.get('fig')
+        canvas = chart.get('canvas')
+        chart_frame = self.comparison_panel.get_chart_frame('comparison')
+        if figure is None or canvas is None or chart_frame is None:
+            self.comparison_panel.refresh_layout()
+            return
+        old_size = (
+            int(round(figure.get_figwidth() * figure.dpi)),
+            int(round(figure.get_figheight() * figure.dpi)),
+        )
+        self._fit_comparison_figure_to_frame(figure, chart_frame, allow_expand=True)
+        new_height = min(1600, max(720, int(round(figure.get_figheight() * figure.dpi)) + 40))
+        self.comparison_panel.set_section_height('comparison', new_height)
+        new_size = (
+            int(round(figure.get_figwidth() * figure.dpi)),
+            int(round(figure.get_figheight() * figure.dpi)),
+        )
+        if new_size != old_size:
+            canvas.draw()
+        self.comparison_panel.refresh_layout()
+
+    def _render_comparison_figure(self, summary_text: str, figure: Figure):
+        """将对比摘要和图表渲染到对比分析面板。"""
+        if not self.comparison_panel:
+            return
+        self._select_center_tab('comparison')
+        self.comparison_panel.refresh_layout()
+        chart_frame = self.comparison_panel.get_chart_frame('comparison')
+        self._fit_comparison_figure_to_frame(figure, chart_frame, allow_expand=True)
+        summary_height = self._estimate_comparison_summary_height(summary_text)
+        chart_height = min(1600, max(720, int(figure.get_size_inches()[1] * figure.dpi) + 40))
+        self.comparison_panel.set_section_height('comparison_summary', summary_height)
+        self.comparison_panel.set_section_height('comparison', chart_height)
+        self.comparison_panel.set_text_content('comparison_summary', summary_text)
+        if chart_frame is None:
+            return
+        for child in chart_frame.winfo_children():
+            child.destroy()
+        chart = self._charts['comparison']
+        self._dispose_chart('comparison')
+        canvas = FigureCanvasTkAgg(figure, master=chart_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        chart['fig'] = figure
+        chart['ax'] = None
+        chart['canvas'] = canvas
+        chart['draw_count'] = 1
+        self.comparison_panel.refresh_layout()
+        self.comparison_panel.scroll_to_top()
+        self._schedule_comparison_layout_refresh(delay_ms=60)
+        self._schedule_comparison_layout_refresh(delay_ms=180)
+
+    def _ensure_result_visualization(self, result: dict) -> dict:
+        """确保结果中带有检测可视化图像。"""
+        if result.get('visualization') is not None:
+            return result
+        return self._analyze_image_file(result['path'], include_visualization=True)
+
+    def _plot_group_aggregation_risk_chart(self, ax, base_group: dict, exp_group: dict, tests: dict) -> None:
+        """绘制组别阴影团聚与均匀度主图卡。"""
+        metric_names = ["阴影团聚", "均匀度"]
+        base_metric_means = [base_group['spatial_stats']['shadow_aggregation_score']['mean'], base_group['spatial_stats']['uniformity_score']['mean']]
+        exp_metric_means = [exp_group['spatial_stats']['shadow_aggregation_score']['mean'], exp_group['spatial_stats']['uniformity_score']['mean']]
+        metric_tests = [tests['shadow_aggregation_score'], tests['uniformity_score']]
+        x = np.arange(len(metric_names))
+        width = 0.34
+        base_metric_bars = ax.bar(x - width / 2, base_metric_means, width, label='base组', color=self.MODERN_COLORS['accent_rose'], alpha=0.95)
+        exp_metric_bars = ax.bar(x + width / 2, exp_metric_means, width, label='实验组', color=self.MODERN_COLORS['accent_teal'], alpha=0.82)
+        ax.set_xticks(x)
+        ax.set_xticklabels(metric_names)
+        ax.set_ylabel('得分 (0-100)', color=self.MODERN_COLORS['text_secondary'])
+        ax.set_title('阴影团聚 / 均匀度组间对比', color=self.MODERN_COLORS['text_primary'])
+        ax.legend(frameon=False)
+        ax.grid(True, axis='y', alpha=0.25, linestyle='--')
+        self._annotate_bar_values(ax, base_metric_bars, fmt="{:.1f}", offset_ratio=0.01)
+        self._annotate_bar_values(ax, exp_metric_bars, fmt="{:.1f}", offset_ratio=0.01)
+        for idx, test in enumerate(metric_tests):
+            pvalue = self._get_preferred_pvalue(test)
+            marker = self._get_significance_marker(pvalue)
+            annotation_y = min(97.5, max(base_metric_means[idx], exp_metric_means[idx]) + 7.0)
+            ax.text(x[idx], annotation_y, f"p={self._format_pvalue(pvalue)}\n{marker}", ha='center', va='bottom', fontsize=8, color=self.MODERN_COLORS['text_primary'])
+        ax.set_ylim(0, 100)
+
+    def _shorten_distribution_label(self, label: str, max_length: int = 22) -> str:
+        """缩短逐图标签，避免文件名把坐标轴挤坏。"""
+        if len(label) <= max_length:
+            return label
+        return label[:max_length - 3] + "..."
+
+    def _render_group_count_distribution_views(self,
+                                               ax_box,
+                                               ax_detail,
+                                               base_group: dict,
+                                               exp_group: dict,
+                                               count_tests: dict) -> None:
+        """根据样本量自适应显示组内 CNT 数量分布。"""
+        base_counts = self._get_group_detail_series(base_group, 'count')
+        exp_counts = self._get_group_detail_series(exp_group, 'count')
+        base_names = [self._shorten_distribution_label(detail['name']) for detail in base_group.get('file_details', [])]
+        exp_names = [self._shorten_distribution_label(detail['name']) for detail in exp_group.get('file_details', [])]
+        labels = ['base组', '实验组']
+        colors = [self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']]
+        min_samples = min(len(base_counts), len(exp_counts)) if base_counts and exp_counts else 0
+
+        if min_samples <= 1:
+            for x_pos, values, color in zip((1, 2), (base_counts, exp_counts), colors):
+                if not values:
+                    continue
+                ax_box.scatter([x_pos] * len(values), values, s=48, alpha=0.82, color=color, edgecolors='white', linewidths=0.6, zorder=3)
+                mean_value = float(np.mean(values))
+                ax_box.hlines(mean_value, x_pos - 0.18, x_pos + 0.18, colors=color, linewidth=2.0, zorder=2)
+                ax_box.text(x_pos, mean_value + max(mean_value * 0.03, 1.0), f"{mean_value:.1f}", ha='center', va='bottom', fontsize=8.5, color=self.MODERN_COLORS['text_primary'])
+            ax_box.set_xticks([1, 2])
+            ax_box.set_xticklabels(labels)
+            ax_box.set_title('组内CNT样本点（样本量较少）', color=self.MODERN_COLORS['text_primary'])
+            ax_box.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
+            ax_box.grid(True, axis='y', alpha=0.25, linestyle='--')
+            max_count = max(base_counts + exp_counts) if (base_counts or exp_counts) else 1.0
+            ax_box.text(1.5, max_count * 1.08 if max_count > 0 else 0.5, f"每组仅 {min_samples} 张图，已切换为单点概览 | {self._format_compact_significance(count_tests)}", ha='center', va='bottom', fontsize=8.5, color=self.MODERN_COLORS['text_primary'])
+            ax_box.set_ylim(0, max_count * 1.22 if max_count > 0 else 1.0)
+
+            detail_labels = [f"base | {name}" for name in base_names] + [f"实验 | {name}" for name in exp_names]
+            detail_counts = base_counts + exp_counts
+            detail_colors = [colors[0]] * len(base_counts) + [colors[1]] * len(exp_counts)
+            positions = np.arange(len(detail_counts))
+            ax_detail.barh(positions, detail_counts, color=detail_colors, alpha=0.88)
+            ax_detail.set_yticks(positions)
+            ax_detail.set_yticklabels(detail_labels)
+            ax_detail.invert_yaxis()
+            ax_detail.set_title('逐图CNT概览', color=self.MODERN_COLORS['text_primary'])
+            ax_detail.set_xlabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
+            ax_detail.grid(True, axis='x', alpha=0.25, linestyle='--')
+            for y_pos, value in zip(positions, detail_counts):
+                ax_detail.text(value + max(max(detail_counts, default=1.0) * 0.015, 0.6), y_pos, f"{value:.0f}", va='center', fontsize=8.5, color=self.MODERN_COLORS['text_primary'])
+            return
+
+        box = ax_box.boxplot([base_counts, exp_counts], tick_labels=labels, patch_artist=True)
+        for patch, color in zip(box['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.5)
+        ax_box.set_title('组内CNT数量分布', color=self.MODERN_COLORS['text_primary'])
+        ax_box.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
+        ax_box.grid(True, axis='y', alpha=0.25, linestyle='--')
+        rng = np.random.default_rng(42)
+        ax_box.scatter(1 + rng.normal(0, 0.04, len(base_counts)), base_counts, s=24, alpha=0.75, color=colors[0], edgecolors='white', linewidths=0.4, zorder=3)
+        ax_box.scatter(2 + rng.normal(0, 0.04, len(exp_counts)), exp_counts, s=24, alpha=0.75, color=colors[1], edgecolors='white', linewidths=0.4, zorder=3)
+        box_top = max(max(base_counts), max(exp_counts)) if base_counts and exp_counts else 1.0
+        ax_box.text(1.5, box_top * 1.05 if box_top > 0 else 0.5, f"分布检验 {self._format_compact_significance(count_tests)}", ha='center', va='bottom', fontsize=8.5, color=self.MODERN_COLORS['text_primary'])
+        ax_box.set_ylim(0, box_top * 1.18 if box_top > 0 else 1.0)
+        base_x = np.arange(1, len(base_counts) + 1)
+        exp_x = np.arange(1, len(exp_counts) + 1)
+        if max(len(base_counts), len(exp_counts)) <= 3:
+            ax_detail.scatter(base_x, base_counts, s=42, color=colors[0], label='base组', zorder=3)
+            ax_detail.scatter(exp_x, exp_counts, s=42, color=colors[1], label='实验组', zorder=3)
+            ax_detail.set_title('组内逐图CNT样本点', color=self.MODERN_COLORS['text_primary'])
+        else:
+            ax_detail.plot(base_x, base_counts, marker='o', linewidth=1.8, color=colors[0], label='base组')
+            ax_detail.plot(exp_x, exp_counts, marker='o', linewidth=1.8, color=colors[1], label='实验组')
+            ax_detail.set_title('组内逐图CNT趋势', color=self.MODERN_COLORS['text_primary'])
+        ax_detail.set_xlabel('组内图像序号', color=self.MODERN_COLORS['text_secondary'])
+        ax_detail.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
+        ax_detail.legend(frameon=False)
+        ax_detail.grid(True, alpha=0.25, linestyle='--')
+
+    def _show_comparison_window(self,
+                                left_result: dict,
+                                right_result: dict,
+                                left_label: str,
+                                right_label: str,
+                                note: Optional[str] = None):
+        """将双图对比结果显示到对比分析面板。"""
+        left_result = self._ensure_result_visualization(left_result)
+        right_result = self._ensure_result_visualization(right_result)
+        left_spatial = left_result['stats'].get('spatial_distribution') or {}
+        right_spatial = right_result['stats'].get('spatial_distribution') or {}
+        summary_text = self._format_comparison_summary(left_result, right_result, left_label, right_label, note)
+        left_display_image = self._prepare_comparison_display_image(left_result.get('visualization'), max_width=1000, max_height=560)
+        right_display_image = self._prepare_comparison_display_image(right_result.get('visualization'), max_width=1000, max_height=560)
+        stack_images = self._should_stack_comparison_images(left_display_image, right_display_image, threshold=1.7)
+        layout = self._build_comparison_layout(left_display_image, right_display_image, stacked=stack_images, variant='pair')
+        pair_width, pair_height = layout['figsize']
+        figure = Figure(figsize=(min(13.2, pair_width), min(10.8, pair_height)), dpi=90)
+        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
+        if stack_images:
+            grid_spec = figure.add_gridspec(3, 2, height_ratios=layout['height_ratios'], hspace=layout['hspace'], wspace=layout['wspace'])
+            ax_count = figure.add_subplot(grid_spec[0, 0])
+            ax_metric = figure.add_subplot(grid_spec[0, 1])
+            ax_left = figure.add_subplot(grid_spec[1, :])
+            ax_right = figure.add_subplot(grid_spec[2, :])
+        else:
+            grid_spec = figure.add_gridspec(2, 2, height_ratios=layout['height_ratios'], hspace=layout['hspace'], wspace=layout['wspace'])
+            ax_count = figure.add_subplot(grid_spec[0, 0])
+            ax_metric = figure.add_subplot(grid_spec[0, 1])
+            ax_left = figure.add_subplot(grid_spec[1, 0])
+            ax_right = figure.add_subplot(grid_spec[1, 1])
+        figure.subplots_adjust(**layout['adjust'])
+
+        counts = [left_result['stats']['count'], right_result['stats']['count']]
+        bars = ax_count.bar([left_label, right_label], counts, color=[self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']], alpha=0.9)
+        ax_count.set_title('CNT数量对比', color=self.MODERN_COLORS['text_primary'])
+        ax_count.set_ylabel('数量', color=self.MODERN_COLORS['text_secondary'])
+        ax_count.grid(True, axis='y', alpha=0.25, linestyle='--')
+        count_top = max(counts) if counts else 1.0
+        ax_count.set_ylim(0, count_top * 1.28 if count_top > 0 else 1.0)
+        self._annotate_bar_values(ax_count, bars, fmt="{:.0f}", offset_ratio=0.03)
+
+        left_metrics = self._get_shadow_aggregation_metrics(left_spatial)
+        right_metrics = self._get_shadow_aggregation_metrics(right_spatial)
+        x = np.arange(2)
+        width = 0.35
+        left_bars = ax_metric.bar(x - width / 2, [left_metrics['score'], left_metrics['uniformity_score']], width, label=left_label, color=self.MODERN_COLORS['accent_teal'])
+        right_bars = ax_metric.bar(x + width / 2, [right_metrics['score'], right_metrics['uniformity_score']], width, label=right_label, color=self.MODERN_COLORS['accent_rose'])
+        ax_metric.set_xticks(x)
+        ax_metric.set_xticklabels(['阴影团聚', '均匀度'])
+        ax_metric.set_ylabel('得分 (0-100)', color=self.MODERN_COLORS['text_secondary'])
+        ax_metric.set_title('核心指标对比', color=self.MODERN_COLORS['text_primary'])
+        ax_metric.legend(frameon=False)
+        ax_metric.grid(True, axis='y', alpha=0.25, linestyle='--')
+        self._annotate_bar_values(ax_metric, left_bars, fmt="{:.1f}", offset_ratio=0.012)
+        self._annotate_bar_values(ax_metric, right_bars, fmt="{:.1f}", offset_ratio=0.012)
+        ax_metric.set_ylim(0, 100)
+
+        self._configure_comparison_image_axis(ax_left, left_display_image, f"{left_label}典型分布\n{left_result['name']}\nCNT={int(left_result['stats']['count'])}", spatial=left_spatial)
+        self._configure_comparison_image_axis(ax_right, right_display_image, f"{right_label}典型分布\n{right_result['name']}\nCNT={int(right_result['stats']['count'])}", spatial=right_spatial)
+        self._render_comparison_figure(summary_text, figure)
+
+    def _show_group_comparison_window(self,
+                                      base_group: dict,
+                                      exp_group: dict,
+                                      note: Optional[str] = None,
+                                      failures: Optional[List[str]] = None):
+        """将 base 组与实验组的多图对比结果显示到对比分析面板。"""
+        tests = self._compute_group_comparison_tests(base_group, exp_group)
+        base_typical = self._select_representative_result(base_group)
+        exp_typical = self._select_representative_result(exp_group)
+        summary_text = self._format_group_comparison_summary(base_group, exp_group, note, failures)
+        base_display_image = self._prepare_comparison_display_image(base_typical.get('visualization'), max_width=1000, max_height=560)
+        exp_display_image = self._prepare_comparison_display_image(exp_typical.get('visualization'), max_width=1000, max_height=560)
+        stack_typical_images = self._should_stack_comparison_images(base_display_image, exp_display_image, threshold=1.8)
+        layout = self._build_comparison_layout(base_display_image, exp_display_image, stacked=stack_typical_images, variant='group')
+        figure_width, figure_height = layout['figsize']
+        figure = Figure(figsize=(min(13.8, figure_width), min(12.6, figure_height + (1.1 if stack_typical_images else 0.7))), dpi=88)
+        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
+
+        if stack_typical_images:
+            base_ratios = layout['height_ratios']
+            grid_spec = figure.add_gridspec(5, 6, height_ratios=[max(1.0, base_ratios[0] + 0.20), max(0.72, base_ratios[1] * 0.95), max(0.72, base_ratios[1]), base_ratios[2], base_ratios[3]], hspace=max(layout['hspace'], 0.34), wspace=layout['wspace'])
+            ax_metric = figure.add_subplot(grid_spec[0, 0:6])
+            ax_mean = figure.add_subplot(grid_spec[1, 0:3])
+            ax_box = figure.add_subplot(grid_spec[1, 3:6])
+            ax_detail = figure.add_subplot(grid_spec[2, 0:6])
+            ax_base_typical = figure.add_subplot(grid_spec[3, 0:6])
+            ax_exp_typical = figure.add_subplot(grid_spec[4, 0:6])
+        else:
+            base_ratios = layout['height_ratios']
+            grid_spec = figure.add_gridspec(4, 6, height_ratios=[max(1.02, base_ratios[0] + 0.18), max(0.74, base_ratios[1] * 0.95), max(0.74, base_ratios[1]), base_ratios[2]], hspace=max(layout['hspace'], 0.32), wspace=layout['wspace'])
+            ax_metric = figure.add_subplot(grid_spec[0, 0:6])
+            ax_mean = figure.add_subplot(grid_spec[1, 0:3])
+            ax_box = figure.add_subplot(grid_spec[1, 3:6])
+            ax_detail = figure.add_subplot(grid_spec[2, 0:6])
+            ax_base_typical = figure.add_subplot(grid_spec[3, 0:3])
+            ax_exp_typical = figure.add_subplot(grid_spec[3, 3:6])
+        figure.subplots_adjust(**layout['adjust'])
+
+        base_count = base_group['count_stats']
+        exp_count = exp_group['count_stats']
+        mean_bars = ax_mean.bar(['base组', '实验组'], [base_count['mean'], exp_count['mean']], yerr=[base_count['std'], exp_count['std']], capsize=6, color=[self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']], alpha=0.9)
+        ax_mean.set_title('每图CNT数量均值 ± 标准差', color=self.MODERN_COLORS['text_primary'])
+        ax_mean.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
+        ax_mean.grid(True, axis='y', alpha=0.25, linestyle='--')
+        self._annotate_bar_values(ax_mean, mean_bars, fmt="{:.1f}", offset_ratio=0.03)
+
+        self._plot_group_aggregation_risk_chart(ax_metric, base_group, exp_group, tests)
+        self._render_group_count_distribution_views(ax_box, ax_detail, base_group, exp_group, tests['count'])
+        self._configure_comparison_image_axis(ax_base_typical, base_display_image, f"base组典型分布\n{base_typical['name']}\nCNT={int(base_typical['stats']['count'])}", spatial=base_typical['stats'].get('spatial_distribution'))
+        self._configure_comparison_image_axis(ax_exp_typical, exp_display_image, f"实验组典型分布\n{exp_typical['name']}\nCNT={int(exp_typical['stats']['count'])}", spatial=exp_typical['stats'].get('spatial_distribution'))
+        self._render_comparison_figure(summary_text, figure)
+
+    def _format_dispersion_summary_lines(self,
+                                         label: str,
+                                         total_count: float,
+                                         dispersed_count: float,
+                                         agglomerated_count: float,
+                                         dispersed_ratio: float,
+                                         dispersed_length_mean: float,
+                                         uniformity_score: float,
+                                         length_std: Optional[float] = None) -> List[str]:
+        """格式化对比分散/团聚统计摘要。"""
+        length_text = f"{dispersed_length_mean:.1f}"
+        if length_std is not None:
+            length_text = f"{length_text}±{length_std:.1f}"
+        return [
+            f"{label}: 分散CNT数量 {int(round(dispersed_count))} | 总CNT数量 {int(round(total_count))} | 团聚区域CNT数量 {int(round(agglomerated_count))}",
+            f"{label}: 分散比例 {dispersed_ratio:.1%} | 分散CNT长度统计 {length_text} μm | 空间分布均匀性 {uniformity_score:.1f}",
+        ]
 
     def _format_group_detail_lines(self, group_summary: dict) -> List[str]:
         """生成精简版逐图明细。"""
         lines = [f"{group_summary['label']}逐图明细:"]
         for detail in group_summary.get('file_details', []):
             lines.append(
-                f"  - {detail['name']}: CNT={detail['count']:.0f} | 风险={detail.get('aggregation_score', 0.0):.1f} | "
-                f"均匀={detail.get('uniformity_score', 0.0):.1f} | Moran={detail.get('morans_i', 0.0):.3f} | "
-                f"NNCV={detail.get('nearest_neighbor_cv', 0.0):.3f} | GridCV={detail.get('grid_density_cv', 0.0):.3f}"
+                f"  - {detail['name']}: 分散CNT={detail.get('dispersed_count', 0.0):.0f} | 总CNT={detail.get('count', 0.0):.0f} | "
+                f"团聚CNT={detail.get('agglomerated_count', 0.0):.0f} | 分散比例={detail.get('dispersed_ratio', 0.0):.1%} | "
+                f"分散长度={detail.get('dispersed_length_mean', 0.0):.1f}μm | 均匀性={detail.get('uniformity_score', 0.0):.1f}"
             )
         return lines
 
@@ -3805,51 +3665,43 @@ class CNTAnalyzerGUI:
         """生成精简版组别对比摘要。"""
         base_count = base_group['count_stats']
         exp_count = exp_group['count_stats']
+        base_dispersed = base_group.get('dispersed_count_stats', self._summarize_numeric_series([]))
+        exp_dispersed = exp_group.get('dispersed_count_stats', self._summarize_numeric_series([]))
+        base_agglomerated = base_group.get('agglomerated_count_stats', self._summarize_numeric_series([]))
+        exp_agglomerated = exp_group.get('agglomerated_count_stats', self._summarize_numeric_series([]))
+        base_ratio = base_group.get('dispersed_ratio_stats', self._summarize_numeric_series([]))
+        exp_ratio = exp_group.get('dispersed_ratio_stats', self._summarize_numeric_series([]))
+        base_dispersed_length = base_group.get('dispersed_length_mean_stats', self._summarize_numeric_series([]))
+        exp_dispersed_length = exp_group.get('dispersed_length_mean_stats', self._summarize_numeric_series([]))
         base_spatial = base_group['spatial_stats']
         exp_spatial = exp_group['spatial_stats']
         tests = self._compute_group_comparison_tests(base_group, exp_group)
 
         count_tests = tests['count']
-        aggregation_tests = tests['aggregation_score']
+        shadow_tests = tests['shadow_aggregation_score']
         uniformity_tests = tests['uniformity_score']
-        nn_tests = tests['nearest_neighbor_cv']
-        grid_tests = tests['grid_density_cv']
-
-        count_ratio = ((exp_count['mean'] - base_count['mean']) / base_count['mean'] * 100.0) if base_count['mean'] > 0 else 0.0
-        aggregation_diff = base_spatial['aggregation_score']['mean'] - exp_spatial['aggregation_score']['mean']
+        shadow_diff = base_spatial['shadow_aggregation_score']['mean'] - exp_spatial['shadow_aggregation_score']['mean']
         uniformity_diff = exp_spatial['uniformity_score']['mean'] - base_spatial['uniformity_score']['mean']
         evidence_significant = (
-            self._is_test_significant(aggregation_tests) or
+            self._is_test_significant(shadow_tests) or
             self._is_test_significant(uniformity_tests)
         )
 
-        strong_exp_advantage = aggregation_diff >= 5.0 and uniformity_diff >= 5.0 and evidence_significant
-        trend_exp_advantage = aggregation_diff > 0 and uniformity_diff > 0
-        strong_base_advantage = aggregation_diff <= -5.0 and uniformity_diff <= -5.0 and evidence_significant
-        trend_base_advantage = aggregation_diff < 0 and uniformity_diff < 0
+        strong_exp_advantage = shadow_diff >= 4.0 and uniformity_diff >= 4.0 and evidence_significant
+        trend_exp_advantage = shadow_diff > 0 and uniformity_diff > 0
+        strong_base_advantage = shadow_diff <= -4.0 and uniformity_diff <= -4.0 and evidence_significant
+        trend_base_advantage = shadow_diff < 0 and uniformity_diff < 0
 
         if strong_exp_advantage:
-            conclusion = (
-                f"结论: 实验组显著优于base组（数量{count_ratio:+.1f}%，均匀性+{uniformity_diff:.1f}分，"
-                f"团聚风险-{aggregation_diff:.1f}分）。"
-            )
+            conclusion = f"结论: 实验组更优，阴影团聚低 {shadow_diff:.1f} 分，均匀度高 {uniformity_diff:.1f} 分。"
         elif trend_exp_advantage:
-            conclusion = (
-                f"结论: 实验组趋势更优（数量{count_ratio:+.1f}%，均匀性+{uniformity_diff:.1f}分，"
-                f"团聚风险-{aggregation_diff:.1f}分），但统计证据有限。"
-            )
+            conclusion = "结论: 实验组趋势更优，阴影团聚更轻且均匀度更高，但统计证据仍偏弱。"
         elif strong_base_advantage:
-            conclusion = (
-                f"结论: base组显著优于实验组（数量{count_ratio:+.1f}%，均匀性{uniformity_diff:.1f}分，"
-                f"团聚风险{aggregation_diff:+.1f}分）。"
-            )
+            conclusion = f"结论: base组更优，阴影团聚低 {abs(shadow_diff):.1f} 分，均匀度高 {abs(uniformity_diff):.1f} 分。"
         elif trend_base_advantage:
-            conclusion = (
-                f"结论: base组趋势更优（数量{count_ratio:+.1f}%，均匀性{uniformity_diff:.1f}分，"
-                f"团聚风险{aggregation_diff:+.1f}分），但统计证据有限。"
-            )
+            conclusion = "结论: base组趋势更优，阴影团聚更轻且均匀度更高，但统计证据仍偏弱。"
         else:
-            conclusion = "结论: 两组在数量与分布上未形成同向优势，当前更适合解读为趋势对比而非明确胜负。"
+            conclusion = "结论: 两组在阴影团聚与均匀度上接近，当前更适合解读为趋势对比。"
 
         lines: List[str] = []
         if note:
@@ -3858,80 +3710,68 @@ class CNTAnalyzerGUI:
         lines.extend([
             self._format_compact_params(),
             "",
-            "数量统计",
+            "CNT数量",
             (
-                f"base组(n={base_group['image_count']}): 总计{int(round(base_count['total']))}根，"
-                f"均值{base_count['mean']:.1f}±{base_count['std']:.1f}，范围{base_count['min']:.0f}~{base_count['max']:.0f}"
+                f"base: 均值{base_count['mean']:.1f}±{base_count['std']:.1f} | "
+                f"总计{int(round(base_count['total']))} | n={base_group['image_count']}"
             ),
             (
-                f"实验组(n={exp_group['image_count']}): 总计{int(round(exp_count['total']))}根，"
-                f"均值{exp_count['mean']:.1f}±{exp_count['std']:.1f}，范围{exp_count['min']:.0f}~{exp_count['max']:.0f}"
+                f"实验: 均值{exp_count['mean']:.1f}±{exp_count['std']:.1f} | "
+                f"总计{int(round(exp_count['total']))} | n={exp_group['image_count']} | "
+                f"{self._format_compact_significance(count_tests)}"
             ),
-            f"差异: 实验组 {count_ratio:+.1f}% | {self._format_compact_significance(count_tests)}",
             "",
-            "均匀性对比",
+            "分散 / 团聚统计",
+        ])
+        lines.extend(self._format_dispersion_summary_lines(
+            'base',
+            base_count['mean'],
+            base_dispersed['mean'],
+            base_agglomerated['mean'],
+            base_ratio['mean'],
+            base_dispersed_length['mean'],
+            base_spatial['uniformity_score']['mean'],
+            length_std=base_dispersed_length['std'],
+        ))
+        lines.extend(self._format_dispersion_summary_lines(
+            '实验',
+            exp_count['mean'],
+            exp_dispersed['mean'],
+            exp_agglomerated['mean'],
+            exp_ratio['mean'],
+            exp_dispersed_length['mean'],
+            exp_spatial['uniformity_score']['mean'],
+            length_std=exp_dispersed_length['std'],
+        ))
+        lines.extend([
+            "",
+            "核心指标",
             self._format_metric_comparison(
-                "团聚风险总分",
-                "base",
-                base_spatial['aggregation_score']['mean'],
-                "实验",
-                exp_spatial['aggregation_score']['mean'],
+                '阴影团聚',
+                'base',
+                base_spatial['shadow_aggregation_score']['mean'],
+                '实验',
+                exp_spatial['shadow_aggregation_score']['mean'],
                 direction='down',
-                qualifier='0-100↓',
+                qualifier='0-100，越低越好',
                 precision=1,
-                left_std=base_spatial['aggregation_score']['std'],
-                right_std=exp_spatial['aggregation_score']['std'],
-                test_result=aggregation_tests,
+                left_std=base_spatial['shadow_aggregation_score']['std'],
+                right_std=exp_spatial['shadow_aggregation_score']['std'],
+                test_result=shadow_tests,
             ),
             self._format_metric_comparison(
-                "综合均匀性",
-                "base",
+                '均匀度',
+                'base',
                 base_spatial['uniformity_score']['mean'],
-                "实验",
+                '实验',
                 exp_spatial['uniformity_score']['mean'],
                 direction='up',
-                qualifier='0-100↑',
+                qualifier='0-100，越高越好',
                 precision=1,
                 left_std=base_spatial['uniformity_score']['std'],
                 right_std=exp_spatial['uniformity_score']['std'],
                 test_result=uniformity_tests,
             ),
-            self._format_metric_comparison(
-                "最近邻CV",
-                "base",
-                base_spatial['nearest_neighbor_cv']['mean'],
-                "实验",
-                exp_spatial['nearest_neighbor_cv']['mean'],
-                direction='down',
-                precision=3,
-                left_std=base_spatial['nearest_neighbor_cv']['std'],
-                right_std=exp_spatial['nearest_neighbor_cv']['std'],
-                test_result=nn_tests,
-            ),
-            self._format_metric_comparison(
-                "网格CV",
-                "base",
-                base_spatial['grid_density_cv']['mean'],
-                "实验",
-                exp_spatial['grid_density_cv']['mean'],
-                direction='down',
-                precision=3,
-                left_std=base_spatial['grid_density_cv']['std'],
-                right_std=exp_spatial['grid_density_cv']['std'],
-                test_result=grid_tests,
-            ),
-            self._format_metric_comparison(
-                "Moran's I",
-                "base",
-                base_spatial['morans_i']['mean'],
-                "实验",
-                exp_spatial['morans_i']['mean'],
-                direction='cluster',
-                precision=3,
-                left_std=base_spatial['morans_i']['std'],
-                right_std=exp_spatial['morans_i']['std'],
-            ),
-            "注: ↑越大越好，↓越小越好，↑聚集表示越大越团聚，* p<0.05",
             "",
             conclusion,
             "",
@@ -3956,40 +3796,35 @@ class CNTAnalyzerGUI:
         """生成精简版双图对比摘要。"""
         left_spatial = left_result['stats'].get('spatial_distribution') or {}
         right_spatial = right_result['stats'].get('spatial_distribution') or {}
-        left_uniformity = left_spatial.get('uniformity_scores') or {}
-        right_uniformity = right_spatial.get('uniformity_scores') or {}
-
-        left_count = int(left_result['stats']['count'])
-        right_count = int(right_result['stats']['count'])
+        left_metrics = self._get_shadow_aggregation_metrics(left_spatial)
+        right_metrics = self._get_shadow_aggregation_metrics(right_spatial)
+        left_count = int(left_result['stats'].get('count', 0))
+        right_count = int(right_result['stats'].get('count', 0))
+        left_dispersed = left_result.get('dispersed_stats') or {}
+        right_dispersed = right_result.get('dispersed_stats') or {}
         count_diff = left_count - right_count
         count_ratio = (count_diff / right_count * 100.0) if right_count > 0 else 0.0
-
-        left_uniformity_score = float(left_uniformity.get('overall', 0.0))
-        right_uniformity_score = float(right_uniformity.get('overall', 0.0))
+        left_uniformity_score = left_metrics['uniformity_score']
+        right_uniformity_score = right_metrics['uniformity_score']
         uniformity_diff = left_uniformity_score - right_uniformity_score
-        left_aggregation_score = 100.0 - left_uniformity_score
-        right_aggregation_score = 100.0 - right_uniformity_score
-        aggregation_diff = left_aggregation_score - right_aggregation_score
+        shadow_diff = right_metrics['score'] - left_metrics['score']
 
-        left_better = aggregation_diff < 0 and uniformity_diff > 0
-        right_better = aggregation_diff > 0 and uniformity_diff < 0
+        left_better = shadow_diff > 0 and uniformity_diff > 0
+        right_better = shadow_diff < 0 and uniformity_diff < 0
 
-        if left_better and count_diff >= 0:
-            conclusion = (
-                f"结论: {left_label}整体更优（CNT{count_ratio:+.1f}%，均匀性+{uniformity_diff:.1f}分），"
-                f"{right_label}团聚更明显。"
-            )
-        elif right_better and count_diff <= 0:
-            conclusion = (
-                f"结论: {right_label}整体更优（CNT{abs(count_ratio):+.1f}%，均匀性+{abs(uniformity_diff):.1f}分），"
-                f"{left_label}团聚更明显。"
-            )
+        if left_better and shadow_diff >= 4.0 and uniformity_diff >= 4.0:
+            conclusion = f"结论: {left_label}更优，阴影团聚低 {shadow_diff:.1f} 分，均匀度高 {uniformity_diff:.1f} 分。"
+        elif right_better and abs(shadow_diff) >= 4.0 and abs(uniformity_diff) >= 4.0:
+            conclusion = f"结论: {right_label}更优，阴影团聚低 {abs(shadow_diff):.1f} 分，均匀度高 {abs(uniformity_diff):.1f} 分。"
         elif left_better:
-            conclusion = f"结论: {left_label}分布更均匀，但数量优势未与均匀性完全同向。"
+            conclusion = f"结论: {left_label}趋势更优，阴影团聚更轻且均匀度更高。"
         elif right_better:
-            conclusion = f"结论: {right_label}分布更均匀，但数量优势未与均匀性完全同向。"
+            conclusion = f"结论: {right_label}趋势更优，阴影团聚更轻且均匀度更高。"
         else:
-            conclusion = "结论: 两图在数量与分布上各有优劣，尚未形成明确的单边优势。"
+            conclusion = "结论: 两张图在阴影团聚与均匀度上接近，当前更适合看作趋势对比。"
+
+        left_dispersed_length = (left_dispersed.get('dispersed_length_stats') or {}).get('length_mean', left_result['stats'].get('length_mean', 0.0))
+        right_dispersed_length = (right_dispersed.get('dispersed_length_stats') or {}).get('length_mean', right_result['stats'].get('length_mean', 0.0))
 
         lines: List[str] = []
         if note:
@@ -3998,59 +3833,54 @@ class CNTAnalyzerGUI:
         lines.extend([
             self._format_compact_params(),
             "",
+            "CNT数量",
             f"{left_label}: {left_result['name']} | CNT={left_count}",
             f"{right_label}: {right_result['name']} | CNT={right_count}",
-            f"数量差异: {left_label if count_diff >= 0 else right_label} {abs(count_ratio):+.1f}%",
+            f"差异: {left_label if count_diff >= 0 else right_label} {abs(count_ratio):.1f}%",
             "",
-            "分布对比",
+            "分散 / 团聚统计",
+        ])
+        lines.extend(self._format_dispersion_summary_lines(
+            left_label,
+            left_count,
+            float(left_dispersed.get('dispersed_count', left_count)),
+            float(left_dispersed.get('agglomerated_count', 0.0)),
+            float(left_dispersed.get('dispersed_ratio', 1.0 if left_count > 0 else 0.0)),
+            float(left_dispersed_length),
+            left_uniformity_score,
+        ))
+        lines.extend(self._format_dispersion_summary_lines(
+            right_label,
+            right_count,
+            float(right_dispersed.get('dispersed_count', right_count)),
+            float(right_dispersed.get('agglomerated_count', 0.0)),
+            float(right_dispersed.get('dispersed_ratio', 1.0 if right_count > 0 else 0.0)),
+            float(right_dispersed_length),
+            right_uniformity_score,
+        ))
+        lines.extend([
+            "",
+            "核心指标",
             self._format_metric_comparison(
-                "团聚风险总分",
+                '阴影团聚',
                 left_label,
-                left_aggregation_score,
+                left_metrics['score'],
                 right_label,
-                right_aggregation_score,
+                right_metrics['score'],
                 direction='down',
-                qualifier='0-100↓',
+                qualifier='0-100，越低越好',
                 precision=1,
             ),
             self._format_metric_comparison(
-                "综合均匀性",
+                '均匀度',
                 left_label,
                 left_uniformity_score,
                 right_label,
                 right_uniformity_score,
                 direction='up',
-                qualifier='0-100↑',
+                qualifier='0-100，越高越好',
                 precision=1,
             ),
-            self._format_metric_comparison(
-                "最近邻CV",
-                left_label,
-                float(left_spatial.get('nearest_neighbor_cv', 0.0)),
-                right_label,
-                float(right_spatial.get('nearest_neighbor_cv', 0.0)),
-                direction='down',
-                precision=3,
-            ),
-            self._format_metric_comparison(
-                "网格CV",
-                left_label,
-                float(left_spatial.get('grid_density_cv', 0.0)),
-                right_label,
-                float(right_spatial.get('grid_density_cv', 0.0)),
-                direction='down',
-                precision=3,
-            ),
-            self._format_metric_comparison(
-                "Moran's I",
-                left_label,
-                float(left_spatial.get('morans_i', 0.0)),
-                right_label,
-                float(right_spatial.get('morans_i', 0.0)),
-                direction='cluster',
-                precision=3,
-            ),
-            "注: ↑越大越好，↓越小越好，↑聚集表示越大越团聚",
             "",
             conclusion,
         ])
@@ -4112,13 +3942,13 @@ class CNTAnalyzerGUI:
         modes = [
             (
                 "任意两图对比",
-                "手动选择两张图，在相同识别条件下比较 CNT 数量、均匀性指标和典型CNT分布。",
+                "手动选择两张图，在相同识别条件下比较 CNT 数量、阴影团聚、均匀度和典型分布。",
                 "选择两张图",
                 self._compare_two_images,
             ),
             (
                 "组别统计对比",
-                "分别选择 base 组和实验组的多张图，输出组均值、波动范围、显著性检验和典型CNT分布。",
+                "分别选择 base 组和实验组的多张图，输出 CNT 数量、核心指标均值、显著性检验和典型分布。",
                 "选择两组图",
                 self._compare_image_groups,
             ),
@@ -4248,10 +4078,10 @@ class CNTAnalyzerGUI:
     # ===== 保存和导出 =====
     def _save_results(self):
         """保存分析结果"""
-        measurements = self.current_roi.measurements if self.current_roi else self.analyzer.measurements
+        measurements = self._get_active_measurements()
 
         if not measurements:
-            messagebox.showwarning("警告", "没有可保存的结果！")
+            self.image_panel.show_status("当前上下文没有可保存的检测结果")
             return
 
         file_path = filedialog.asksaveasfilename(
@@ -4326,10 +4156,10 @@ class CNTAnalyzerGUI:
 
     def _export_report(self):
         """导出分析报告"""
-        measurements = self.current_roi.measurements if self.current_roi else self.analyzer.measurements
+        measurements = self._get_active_measurements()
 
         if not measurements:
-            messagebox.showwarning("警告", "没有可导出的结果！")
+            self.image_panel.show_status("当前上下文没有可导出的检测结果")
             return
 
         file_path = filedialog.asksaveasfilename(
