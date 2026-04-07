@@ -7,9 +7,11 @@ import csv
 import inspect
 import os
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from itertools import repeat
 from pathlib import Path
+from multiprocessing import cpu_count
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Callable, Optional, List, Tuple
@@ -2872,7 +2874,7 @@ class CNTAnalyzerGUI:
                                   include_visualization: bool = False,
                                   preview_visualization: bool = False,
                                   progress_callback: Optional[Callable[[int, int, str], None]] = None) -> List[Tuple[int, Optional[dict], Optional[str]]]:
-        """并行执行一批组图分析任务；若线程池异常则自动回退到串行。"""
+        """并行执行一批组图分析任务；优先使用进程池，失败时回退到线程池，最后回退到串行。"""
         if not tasks:
             return []
 
@@ -2891,6 +2893,35 @@ class CNTAnalyzerGUI:
                     progress_callback(idx + 1, len(tasks), Path(task[1]).name)
             return results
 
+        # 尝试使用 ProcessPoolExecutor 进行 CPU 密集型并行处理
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [
+                    executor.submit(
+                        self._run_group_analysis_task,
+                        task,
+                        context,
+                        include_visualization,
+                        preview_visualization,
+                    )
+                    for task in tasks
+                ]
+                results = []
+                for idx, future in enumerate(futures):
+                    result = future.result()
+                    results.append(result)
+                    if progress_callback:
+                        task_name = Path(tasks[idx][1]).name if idx < len(tasks) else "未知"
+                        progress_callback(idx + 1, len(tasks), task_name)
+                return results
+        except (BrokenProcessPool, RuntimeError) as exc:
+            logger.warning("进程池并行分析失败，回退到线程池: %s", exc)
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
+            logger.warning("进程池并行分析失败，回退到线程池: %s", exc)
+        except Exception as exc:
+            logger.exception("进程池并行分析时发生未预期的错误，回退到线程池")
+
+        # 回退到 ThreadPoolExecutor
         try:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="cnt-group") as executor:
                 futures = [
@@ -2912,33 +2943,23 @@ class CNTAnalyzerGUI:
                         progress_callback(idx + 1, len(tasks), task_name)
                 return results
         except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
-            logger.warning("组图并行分析失败，已回退到串行模式: %s", exc)
-            results = []
-            for idx, task in enumerate(tasks):
-                result = self._run_group_analysis_task(
-                    task,
-                    context,
-                    include_visualization=include_visualization,
-                    preview_visualization=preview_visualization,
-                )
-                results.append(result)
-                if progress_callback:
-                    progress_callback(idx + 1, len(tasks), Path(task[1]).name)
-            return results
+            logger.warning("线程池并行分析失败，已回退到串行模式: %s", exc)
         except Exception as exc:
-            logger.exception("组图并行分析时发生未预期的错误，已回退到串行模式")
-            results = []
-            for idx, task in enumerate(tasks):
-                result = self._run_group_analysis_task(
-                    task,
-                    context,
-                    include_visualization=include_visualization,
-                    preview_visualization=preview_visualization,
-                )
-                results.append(result)
-                if progress_callback:
-                    progress_callback(idx + 1, len(tasks), Path(task[1]).name)
-            return results
+            logger.exception("线程池并行分析时发生未预期的错误，已回退到串行模式")
+
+        # 最终回退到串行处理
+        results = []
+        for idx, task in enumerate(tasks):
+            result = self._run_group_analysis_task(
+                task,
+                context,
+                include_visualization=include_visualization,
+                preview_visualization=preview_visualization,
+            )
+            results.append(result)
+            if progress_callback:
+                progress_callback(idx + 1, len(tasks), Path(task[1]).name)
+        return results
 
     def _analyze_image_with_context(self,
                                     image_path: str,

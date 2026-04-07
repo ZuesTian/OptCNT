@@ -9,6 +9,17 @@ import cv2
 import numpy as np
 from skimage.morphology import skeletonize
 
+try:
+    from numba import jit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # 如果 numba 不可用，创建一个空装饰器
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 from models import ROIRegion, CNTMeasurement
 from utils import (
     SCALE_BAR_BLUE_THRESHOLD, SCALE_BAR_BLUE_SCORE_MIN, SCALE_BAR_MIN_SPAN_PX,
@@ -1040,6 +1051,12 @@ class CNTAnalyzer:
         if len(path) < 2:
             return 0.0
 
+        # 使用优化版本（如果可用）
+        if NUMBA_AVAILABLE:
+            path_array = np.array(path, dtype=np.float64)
+            return _calculate_path_length_fast(path_array)
+        
+        # 回退到原始实现
         length = 0.0
         for index in range(1, len(path)):
             prev_y, prev_x = path[index - 1]
@@ -1895,10 +1912,16 @@ class CNTAnalyzer:
                                    height: int,
                                    grid_size: int) -> np.ndarray:
         """按中心点数量构建网格。"""
-        grid = np.zeros((grid_size, grid_size), dtype=float)
         if not centroids or width <= 0 or height <= 0:
-            return grid
+            return np.zeros((grid_size, grid_size), dtype=float)
 
+        # 使用优化版本（如果可用）
+        if NUMBA_AVAILABLE:
+            centroids_array = np.array(centroids, dtype=np.float64)
+            return _build_centroid_count_grid_vectorized(centroids_array, width, height, grid_size)
+
+        # 回退到原始实现
+        grid = np.zeros((grid_size, grid_size), dtype=float)
         width_scale = float(max(width, 1))
         height_scale = float(max(height, 1))
         for cx, cy in centroids:
@@ -2567,3 +2590,73 @@ class CNTAnalyzer:
             **length_stats,
             'spatial_distribution': spatial_distribution,
         }
+
+
+# ===== Numba 优化函数 =====
+@jit(nopython=True, cache=True)
+def _calculate_path_length_fast(path_array: np.ndarray) -> float:
+    """使用 Numba JIT 加速的路径长度计算
+    
+    Args:
+        path_array: shape (N, 2) 的路径点数组，dtype=float64
+        
+    Returns:
+        float: 路径总长度
+    """
+    if len(path_array) < 2:
+        return 0.0
+    
+    length = 0.0
+    for i in range(1, len(path_array)):
+        dy = path_array[i, 0] - path_array[i-1, 0]
+        dx = path_array[i, 1] - path_array[i-1, 1]
+        length += np.sqrt(dy * dy + dx * dx)
+    
+    return length
+
+
+@jit(nopython=True, cache=True)
+def _build_centroid_count_grid_vectorized(centroids: np.ndarray,
+                                          width: int,
+                                          height: int,
+                                          grid_size: int) -> np.ndarray:
+    """使用 Numba JIT 加速的网格构建
+    
+    Args:
+        centroids: shape (N, 2) 的中心点数组
+        width: 图像宽度
+        height: 图像高度
+        grid_size: 网格大小
+        
+    Returns:
+        np.ndarray: shape (grid_size, grid_size) 的网格计数
+    """
+    grid = np.zeros((grid_size, grid_size), dtype=np.float64)
+    
+    if len(centroids) == 0 or width <= 0 or height <= 0:
+        return grid
+    
+    width_scale = float(max(width, 1))
+    height_scale = float(max(height, 1))
+    
+    for i in range(len(centroids)):
+        cx = centroids[i, 0]
+        cy = centroids[i, 1]
+        
+        col = int(cx / width_scale * grid_size)
+        row = int(cy / height_scale * grid_size)
+        
+        # 边界检查
+        if col < 0:
+            col = 0
+        elif col >= grid_size:
+            col = grid_size - 1
+            
+        if row < 0:
+            row = 0
+        elif row >= grid_size:
+            row = grid_size - 1
+        
+        grid[row, col] += 1.0
+    
+    return grid

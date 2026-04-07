@@ -1,118 +1,224 @@
 """
-最小体积打包脚本
-使用 PyInstaller 的优化选项减少最终可执行文件体积
+Lean Windows packaging script for OptCNT.
+
+Key goals:
+- build a single-file GUI executable
+- shrink size with UPX when available
+- avoid excluding modules that the app really uses at runtime
+- drop optional heavyweight dependencies that already have safe fallbacks
 """
-import PyInstaller.__main__
+from __future__ import annotations
+
+import json
 import os
 import shutil
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Iterable, Optional
 
-def clean_build_dirs():
-    """清理构建目录"""
-    dirs_to_remove = ['build', 'dist', '__pycache__']
-    for dir_name in dirs_to_remove:
-        if os.path.exists(dir_name):
-            shutil.rmtree(dir_name)
-            print(f"已清理: {dir_name}")
+import PyInstaller.__main__
 
-def build_minimal():
-    """使用最小体积配置打包"""
-    
-    # 清理旧的构建文件
+
+ROOT_DIR = Path(__file__).resolve().parent
+TOOLS_DIR = ROOT_DIR / ".tools"
+UPX_DIR = TOOLS_DIR / "upx"
+
+EXCLUDE_MODULES = [
+    "Cython",
+    "IPython",
+    "PyQt5",
+    "PyQt6",
+    "PySide2",
+    "PySide6",
+    "cython",
+    "idlelib",
+    "jupyter",
+    "lib2to3",
+    "llvmlite",
+    "matplotlib.tests",
+    "notebook",
+    "numba",
+    "numpy.random._examples",
+    "pandas",
+    "pip",
+    "pytest",
+    "sklearn",
+    "sphinx",
+    "test",
+    "threadpoolctl",
+    "tkinter.test",
+    "tkinter.tix",
+    "tkinter.ttk.test",
+    "turtle",
+    "turtledemo",
+    "unittest",
+    "venv",
+    "wheel",
+]
+
+HIDDEN_IMPORTS = [
+    "cv2",
+    "matplotlib",
+    "matplotlib.backends.backend_tkagg",
+    "matplotlib.pyplot",
+    "numpy",
+    "PIL",
+    "PIL._imagingtk",
+    "PIL._tkinter_finder",
+    "scipy.stats",
+    "skimage",
+    "skimage.filters",
+    "skimage.morphology",
+]
+
+
+def _print(message: str) -> None:
+    print(message)
+
+
+def clean_build_dirs() -> None:
+    """Remove old packaging output."""
+    for name in ("build", "dist", "__pycache__"):
+        path = ROOT_DIR / name
+        if path.exists():
+            shutil.rmtree(path)
+            _print(f"Removed {path}")
+
+
+def _iter_upx_candidates() -> Iterable[Path]:
+    env_upx_dir = os.environ.get("UPX_DIR")
+    if env_upx_dir:
+        yield Path(env_upx_dir) / "upx.exe"
+        yield Path(env_upx_dir) / "upx"
+
+    path_upx = shutil.which("upx")
+    if path_upx:
+        yield Path(path_upx)
+
+    if UPX_DIR.exists():
+        yield from UPX_DIR.rglob("upx.exe")
+        yield from UPX_DIR.rglob("upx")
+
+
+def find_upx_executable() -> Optional[Path]:
+    """Find an existing UPX executable."""
+    for candidate in _iter_upx_candidates():
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _download_bytes(url: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "OptCNT-build-script",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def download_upx() -> Path:
+    """Download the latest UPX Windows x64 release into .tools/upx."""
+    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    UPX_DIR.mkdir(parents=True, exist_ok=True)
+
+    api_url = "https://api.github.com/repos/upx/upx/releases/latest"
+    release = json.loads(_download_bytes(api_url).decode("utf-8"))
+    assets = release.get("assets", [])
+
+    selected_asset = None
+    for asset in assets:
+        name = str(asset.get("name", "")).lower()
+        if name.endswith("win64.zip"):
+            selected_asset = asset
+            break
+
+    if not selected_asset:
+        raise RuntimeError("Could not find a Windows x64 UPX asset in the latest release.")
+
+    asset_url = selected_asset.get("browser_download_url")
+    asset_name = selected_asset.get("name", "upx-win64.zip")
+    if not asset_url:
+        raise RuntimeError("UPX release asset is missing a download URL.")
+
+    archive_path = UPX_DIR / asset_name
+    extract_root = UPX_DIR / "extracted"
+
+    _print(f"Downloading UPX from {asset_url}")
+    archive_path.write_bytes(_download_bytes(asset_url))
+
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(extract_root)
+
+    upx_exe = find_upx_executable()
+    if upx_exe is None:
+        raise RuntimeError("UPX download completed, but upx.exe was not found after extraction.")
+
+    _print(f"UPX ready at {upx_exe}")
+    return upx_exe
+
+
+def ensure_upx() -> Path:
+    """Return a usable UPX executable, downloading it if needed."""
+    upx_exe = find_upx_executable()
+    if upx_exe is not None:
+        _print(f"Using existing UPX: {upx_exe}")
+        return upx_exe
+    return download_upx()
+
+
+def build_minimal() -> Path:
+    """Build the smallest practical OptCNT GUI executable."""
     clean_build_dirs()
-    
-    # PyInstaller 参数 - 优化体积
-    args = [
-        'main.py',                          # 入口文件
-        '--name=OptCNT',                    # 应用名称
-        '--onefile',                        # 打包成单个文件
-        '--windowed',                       # Windows GUI 应用（无控制台）
-        
-        # 体积优化选项
-        '--strip',                          # 去除符号表
-        '--noupx',                          # 不使用 UPX
-        
-        # 排除不必要的模块（不移除 distutils 和 setuptools，避免冲突）
-        '--exclude-module=matplotlib.tests',
-        '--exclude-module=numpy.random._examples',
-        '--exclude-module=scipy',
-        '--exclude-module=pandas',
-        '--exclude-module=PyQt5',
-        '--exclude-module=PyQt6',
-        '--exclude-module=PySide2',
-        '--exclude-module=PySide6',
-        '--exclude-module=tkinter.test',
-        '--exclude-module=unittest',
-        '--exclude-module=pytest',
-        '--exclude-module=IPython',
-        '--exclude-module=jupyter',
-        '--exclude-module=notebook',
-        '--exclude-module=sphinx',
-        '--exclude-module=pydoc',
-        '--exclude-module=email',
-        '--exclude-module=http.server',
-        '--exclude-module=xmlrpc',
-        '--exclude-module=multiprocessing',
-        '--exclude-module=concurrent.futures',
-        '--exclude-module=ctypes.test',
-        '--exclude-module=pip',
-        '--exclude-module=wheel',
-        '--exclude-module=Cython',
-        '--exclude-module=cython',
-        '--exclude-module=tkinter.tix',
-        '--exclude-module=tkinter.ttk.test',
-        '--exclude-module=idlelib',
-        '--exclude-module=test',
-        '--exclude-module=lib2to3',
-        '--exclude-module=ensurepip',
-        '--exclude-module=venv',
-        '--exclude-module=turtledemo',
-        '--exclude-module=turtle',
-        
-        # 隐藏导入（需要的模块）
-        '--hidden-import=cv2',
-        '--hidden-import=numpy',
-        '--hidden-import=PIL',
-        '--hidden-import=PIL._imagingtk',
-        '--hidden-import=PIL._tkinter_finder',
-        '--hidden-import=skimage',
-        '--hidden-import=skimage.filters',
-        '--hidden-import=skimage.morphology',
-        '--hidden-import=matplotlib',
-        '--hidden-import=matplotlib.backends.backend_tkagg',
-        '--hidden-import=matplotlib.pyplot',
-        
-        # 收集数据文件
-        '--collect-data=skimage',
-        '--collect-data=matplotlib',
-        
-        # 优化级别
-        '--optimize=2',
-        
-        # 清理临时文件
-        '--clean',
-        
-        # 日志级别
-        '--log-level=WARN',
-    ]
-    
-    print("开始打包...")
-    print(f"参数: {' '.join(args)}")
-    
-    PyInstaller.__main__.run(args)
-    
-    print("\n打包完成!")
-    
-    # 显示输出文件信息
-    exe_path = os.path.join('dist', 'OptCNT.exe')
-    if os.path.exists(exe_path):
-        size_mb = os.path.getsize(exe_path) / (1024 * 1024)
-        print(f"输出文件: {exe_path}")
-        print(f"文件大小: {size_mb:.2f} MB")
-    
-    # 清理构建目录（保留dist）
-    if os.path.exists('build'):
-        shutil.rmtree('build')
-        print("已清理 build 目录")
+    upx_exe = ensure_upx()
 
-if __name__ == '__main__':
+    args = [
+        "main.py",
+        "--name=OptCNT",
+        "--onefile",
+        "--windowed",
+        "--strip",
+        f"--upx-dir={upx_exe.parent}",
+        "--optimize=2",
+        "--clean",
+        "--log-level=WARN",
+        "--collect-data=matplotlib",
+        "--collect-data=skimage",
+    ]
+
+    for module_name in EXCLUDE_MODULES:
+        args.append(f"--exclude-module={module_name}")
+
+    for module_name in HIDDEN_IMPORTS:
+        args.append(f"--hidden-import={module_name}")
+
+    _print("Starting PyInstaller build...")
+    _print(" ".join(args))
+    PyInstaller.__main__.run(args)
+
+    exe_path = ROOT_DIR / "dist" / "OptCNT.exe"
+    if not exe_path.exists():
+        raise FileNotFoundError(f"Build finished without producing {exe_path}")
+
+    size_mb = exe_path.stat().st_size / (1024 * 1024)
+    _print(f"Build completed: {exe_path}")
+    _print(f"Executable size: {size_mb:.2f} MB")
+
+    build_dir = ROOT_DIR / "build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+        _print(f"Removed {build_dir}")
+
+    return exe_path
+
+
+if __name__ == "__main__":
     build_minimal()
