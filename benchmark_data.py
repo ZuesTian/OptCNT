@@ -130,6 +130,19 @@ def summarize_counts(records: List[dict]) -> dict:
     }
 
 
+def summarize_metric(records: List[dict], key: str) -> dict:
+    values = [float(item.get(key, 0.0)) for item in records]
+    if not values:
+        return {"n": 0, "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "n": len(values),
+        "mean": round(mean(values), 4),
+        "std": round(pstdev(values), 4),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+    }
+
+
 def collect_candidate_metrics(analyzer: CNTAnalyzer) -> List[dict]:
     metrics: List[dict] = []
     binary = analyzer.binary_image
@@ -157,35 +170,24 @@ def collect_candidate_metrics(analyzer: CNTAnalyzer) -> List[dict]:
         cv2.drawContours(mask, [relative_contour], 0, 255, -1)
         cnt_binary = cnt_region & mask
 
-        sub_contours, _ = cv2.findContours(cnt_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not sub_contours:
-            continue
-        sub_contour = max(sub_contours, key=cv2.contourArea)
-        area = float(cv2.contourArea(sub_contour))
-        if area < 1:
-            continue
-
-        skeleton = analyzer._skeletonize(cnt_binary)
-        neighbors = analyzer._build_skeleton_neighbors(skeleton)
-        if len(neighbors) < 2:
-            continue
-        skeleton = analyzer._extract_primary_path(skeleton, neighbors)
-        neighbors = analyzer._build_skeleton_neighbors(skeleton)
-        if len(neighbors) < 2:
+        candidate = analyzer._build_cnt_candidate(
+            cnt_binary,
+            x_offset=x_min,
+            y_offset=y_min,
+            profile="balanced",
+            bypass_endpoint_filter=True,
+        )
+        if candidate is None:
             continue
 
-        endpoint_count = analyzer._count_endpoints(skeleton, neighbors)
-        length_px = analyzer._calculate_skeleton_length(skeleton, neighbors)
-        width_stats = analyzer._measure_width(skeleton, cnt_binary)
-        width_median_px = float(width_stats.get("median", 0.0))
-
+        area = float(candidate.get("area", 0.0))
         bbox_area = float(max(1, cnt_binary.shape[0] * cnt_binary.shape[1]))
         fill_ratio = area / bbox_area
-        slenderness = (length_px / width_median_px) if width_median_px > 0 else 999.0
+        slenderness = float(candidate.get("slenderness") or 999.0)
 
         metrics.append(
             {
-                "endpoint_count": int(endpoint_count),
+                "endpoint_count": int(candidate.get("endpoint_count", 0)),
                 "fill_ratio": float(fill_ratio),
                 "slenderness": float(slenderness),
             }
@@ -201,6 +203,9 @@ def run_current_pipeline(image_path: Path, params: dict) -> dict:
     analyzer.preprocess(**params)
     analyzer.detect_cnts_hybrid(**FILTERS)
     stats = analyzer.get_statistics()
+    dispersed_stats = analyzer.get_dispersed_statistics()
+    spatial = stats.get("spatial_distribution") or {}
+    aggregation_scores = spatial.get("aggregation_scores") or {}
 
     valid_mask = analyzer._get_valid_analysis_mask()
     fg_ratio = 0.0
@@ -228,6 +233,9 @@ def run_current_pipeline(image_path: Path, params: dict) -> dict:
         "fg_ratio": round(fg_ratio, 5),
         "candidate_metrics": candidate_metrics,
         "shifted_count": int(len(shifted.measurements)),
+        "dispersed_ratio": round(float(dispersed_stats.get("dispersed_ratio", 0.0)), 5),
+        "agglomerated_count": int(dispersed_stats.get("agglomerated_count", 0)),
+        "shadow_aggregation_score": round(float(aggregation_scores.get("overall", 0.0)), 3),
     }
 
 
@@ -311,6 +319,9 @@ def build_dataset_report(current_records: List[dict], legacy_records: List[dict]
             "scale_status": current["scale_status"],
             "scale_pixels": current["scale_pixels"],
             "length_mean": current["length_mean"],
+            "dispersed_ratio": current["dispersed_ratio"],
+            "agglomerated_count": current["agglomerated_count"],
+            "shadow_aggregation_score": current["shadow_aggregation_score"],
             "params": best_params,
         }
         merged.append(merged_item)
@@ -324,7 +335,13 @@ def build_dataset_report(current_records: List[dict], legacy_records: List[dict]
 
     by_group = {}
     for group_name in sorted({item["group"] for item in merged}):
-        by_group[group_name] = summarize_counts([item for item in merged if item["group"] == group_name])
+        group_records = [item for item in merged if item["group"] == group_name]
+        by_group[group_name] = {
+            "count_summary": summarize_counts(group_records),
+            "dispersed_ratio_summary": summarize_metric(group_records, "dispersed_ratio"),
+            "agglomerated_count_summary": summarize_metric(group_records, "agglomerated_count"),
+            "shadow_aggregation_score_summary": summarize_metric(group_records, "shadow_aggregation_score"),
+        }
 
     return {
         "best_params": best_params,

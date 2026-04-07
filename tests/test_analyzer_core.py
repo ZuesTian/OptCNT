@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import analyzer_core as analyzer_core_module
 from analyzer_core import CNTAnalyzer
 from models import CNTMeasurement
 
@@ -131,6 +132,28 @@ def test_recognize_characters_stops_after_high_confidence_template_match(monkeyp
     assert calls["count"] == 1
 
 
+def test_suggest_preprocess_params_uses_configurable_noise_thresholds(monkeypatch):
+    analyzer = CNTAnalyzer()
+    gray = np.full((8, 8), 128, dtype=np.uint8)
+    valid_mask = np.ones((8, 8), dtype=bool)
+
+    monkeypatch.setattr(analyzer, "_get_analysis_region", lambda roi=None: (0, 8, 0, 8))
+    monkeypatch.setattr(analyzer, "_get_analysis_gray_image", lambda: gray)
+    monkeypatch.setattr(analyzer, "_get_valid_analysis_mask", lambda roi=None: valid_mask)
+    monkeypatch.setattr(
+        analyzer,
+        "_suggest_adaptive_binary",
+        lambda gray, blur_kernel, adaptive_block, adaptive_c: np.zeros_like(gray),
+    )
+
+    baseline = analyzer.suggest_preprocess_params()
+    assert baseline["blur_kernel"] == 7
+
+    monkeypatch.setattr(analyzer_core_module, "PREPROCESS_NOISE_LOW_THRESHOLD", -1.0)
+    customized = analyzer.suggest_preprocess_params()
+    assert customized["blur_kernel"] == 9
+
+
 def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
     analyzer = CNTAnalyzer()
     measurements = [_make_measurement(0, 10.0), _make_measurement(1, 12.0)]
@@ -232,3 +255,68 @@ def test_get_dispersed_statistics_filters_hotspots_and_supports_strictness(monke
     assert severe_only["dispersed_count"] == 2
     assert severe_only["agglomerated_count"] == 1
     assert [m.id for m in severe_only["agglomerated_measurements"]] == [0]
+
+
+def test_get_dispersed_statistics_marks_contour_overlap_as_agglomerated(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurement = CNTMeasurement(
+        id=0,
+        length_pixels=12.0,
+        length_um=12.0,
+        contour=np.array(
+            [[[40, 10]], [[52, 10]], [[52, 22]], [[40, 22]]],
+            dtype=np.int32,
+        ),
+    )
+    analyzer.measurements = [measurement]
+
+    monkeypatch.setattr(analyzer, "analyze_spatial_distribution", lambda roi=None: {"grid_size": 2})
+    monkeypatch.setattr(
+        analyzer,
+        "_build_spatial_hotspot_masks",
+        lambda spatial_distribution: {
+            "hotspot_mask": np.array([[False, True], [False, False]], dtype=bool),
+            "severe_mask": np.array([[False, True], [False, False]], dtype=bool),
+        },
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: ([measurement], 0, 0, 100, 100),
+    )
+
+    stats = analyzer.get_dispersed_statistics()
+
+    assert stats["dispersed_count"] == 0
+    assert stats["agglomerated_count"] == 1
+    assert [m.id for m in stats["agglomerated_measurements"]] == [0]
+
+
+def test_get_dispersed_statistics_returns_all_dispersed_when_masks_have_no_hotspots(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurements = [
+        _make_square_measurement(0, 10.0, 20, 20),
+        _make_square_measurement(1, 15.0, 80, 80),
+    ]
+    analyzer.measurements = measurements
+
+    monkeypatch.setattr(analyzer, "analyze_spatial_distribution", lambda roi=None: {"grid_size": 2})
+    monkeypatch.setattr(
+        analyzer,
+        "_build_spatial_hotspot_masks",
+        lambda spatial_distribution: {
+            "hotspot_mask": np.zeros((2, 2), dtype=bool),
+            "severe_mask": np.zeros((2, 2), dtype=bool),
+        },
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 100, 100),
+    )
+
+    stats = analyzer.get_dispersed_statistics()
+
+    assert stats["dispersed_count"] == 2
+    assert stats["agglomerated_count"] == 0
+    assert [m.id for m in stats["dispersed_measurements"]] == [0, 1]

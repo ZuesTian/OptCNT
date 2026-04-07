@@ -4,6 +4,7 @@ GUI主控制器模块 - 负责协调各个面板和核心分析功能
 import json
 import logging
 import csv
+import inspect
 import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,7 @@ from itertools import repeat
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional, List, Tuple
+from typing import Callable, Optional, List, Tuple
 from datetime import datetime
 
 import cv2
@@ -30,12 +31,39 @@ from utils import (
     SCALE_BAR_DEFAULT_UM,
     CNT_BRIDGE_STRENGTH_DEFAULT,
     CNT_MERGE_DISTANCE_DEFAULT_PX,
+    CALIBRATED_BLUR_KERNEL,
+    CALIBRATED_ADAPTIVE_BLOCK,
+    CALIBRATED_ADAPTIVE_C,
     get_length_histogram_bins,
 )
 from widgets import SortableTreeview
 from panels import ControlPanel, ImagePanel, ResultPanel, AdvancedAnalysisPanel, ComparisonAnalysisPanel
 
 logger = logging.getLogger(__name__)
+
+GUI_EXPECTED_ANALYSIS_EXCEPTIONS = (
+    OSError,
+    ValueError,
+    TypeError,
+    RuntimeError,
+    tk.TclError,
+    cv2.error,
+)
+GUI_EXPECTED_RENDER_EXCEPTIONS = (
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    RuntimeError,
+    tk.TclError,
+)
+GUI_EXPECTED_DATA_EXCEPTIONS = (
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    cv2.error,
+)
 
 
 class CNTAnalyzerGUI:
@@ -78,6 +106,7 @@ class CNTAnalyzerGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("CNT图像分析系统 - 现代化骨架预览版")
+        self._configure_opencv_runtime()
 
         # 应用Modern样式
         self._apply_modern_style()
@@ -102,6 +131,10 @@ class CNTAnalyzerGUI:
         self._last_auto_suggest_result = None
         self._last_root_size: Optional[Tuple[int, int]] = None
         self._pending_scale_selection = None
+        self._single_detect_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cnt-single")
+        self._single_detect_future = None
+        self._single_detect_snapshot = None
+        self._single_detect_token = 0
         self.open_image_button: Optional[ttk.Button] = None
         self.paste_image_button: Optional[ttk.Button] = None
         self.save_results_button: Optional[ttk.Button] = None
@@ -135,6 +168,22 @@ class CNTAnalyzerGUI:
         # 快捷键：从剪贴板粘贴图像
         self.root.bind_all("<Control-v>", self._paste_image_from_clipboard)
         self.root.bind_all("<Control-V>", self._paste_image_from_clipboard)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    @staticmethod
+    def _configure_opencv_runtime() -> None:
+        """Cap OpenCV's internal threading to avoid oversubscription during batch comparison."""
+        try:
+            cpu_count = os.cpu_count() or 1
+            current_threads = int(cv2.getNumThreads())
+            target_threads = 1 if cpu_count >= 8 else max(1, min(2, cpu_count))
+            if current_threads <= 0 or current_threads > max(8, cpu_count):
+                cv2.setNumThreads(target_threads)
+            elif current_threads > target_threads:
+                cv2.setNumThreads(target_threads)
+            cv2.ocl.setUseOpenCL(False)
+        except (AttributeError, TypeError, ValueError, cv2.error):
+            logger.debug("Unable to adjust OpenCV runtime threading; using library defaults.")
 
     def _init_variables(self):
         """初始化Tkinter变量"""
@@ -616,6 +665,19 @@ class CNTAnalyzerGUI:
             return list(self.current_roi.measurements)
         return list(self.analyzer.measurements)
 
+    def _is_single_detection_running(self) -> bool:
+        """Whether a background single-image detection job is still running."""
+        future = getattr(self, '_single_detect_future', None)
+        return future is not None and not future.done()
+
+    def _set_single_detection_busy_state(self, busy: bool) -> None:
+        """Toggle the single-detection button and related entry points while keeping the UI responsive."""
+        if getattr(self, 'control_panel', None) is not None:
+            self._set_ttk_widget_enabled(getattr(self.control_panel, 'detect_button', None), not busy)
+        self._set_ttk_widget_enabled(self.compare_analysis_button, not busy)
+        if not busy:
+            self._refresh_interaction_state()
+
     def _refresh_interaction_state(self) -> None:
         """根据当前上下文启用或禁用关键交互入口。"""
         has_image = self.analyzer.image is not None
@@ -630,6 +692,8 @@ class CNTAnalyzerGUI:
         self._set_ttk_widget_enabled(self.save_results_button, has_measurements)
         self._set_ttk_widget_enabled(self.export_report_button, has_measurements)
         self._set_ttk_widget_enabled(self.compare_analysis_button, True)
+        if self._is_single_detection_running():
+            self._set_single_detection_busy_state(True)
 
     def _sync_views(self,
                     *,
@@ -879,6 +943,14 @@ class CNTAnalyzerGUI:
             return f"上次推荐 {suggested[0]}/{suggested[1]}/{suggested[2]}；当前参数已手动调整。"
         return str(info.get('reason_summary', '')).strip()
 
+    def _on_close(self) -> None:
+        """Release background resources before closing the main window."""
+        executor = getattr(self, '_single_detect_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._single_detect_executor = None
+        self.root.destroy()
+
     # ===== 文件操作 =====
     def _load_image_common(self):
         """加载图像后的通用流程"""
@@ -1096,7 +1168,7 @@ class CNTAnalyzerGUI:
             
             messagebox.showinfo("成功", "比例尺已应用，测量结果已更新！")
 
-        except (ValueError, tk.TclError) as e:
+        except (TypeError, ValueError, OverflowError, tk.TclError, cv2.error) as e:
             logger.exception("应用比例尺失败")
             messagebox.showerror("错误", f"应用比例尺失败: {e}")
         except Exception as e:
@@ -1211,9 +1283,13 @@ class CNTAnalyzerGUI:
             self._last_preprocess_signature = None
             self._refresh_analysis_status_ui()
             return params
-        except Exception as e:
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
             self._last_auto_suggest_result = None
             logger.debug(f"自适应参数推荐失败，使用默认值: {e}")
+            return None
+        except Exception as e:
+            self._last_auto_suggest_result = None
+            logger.exception("自动推荐参数时发生未预期的错误")
             return None
 
     def _on_reapply_auto_suggest(self):
@@ -1337,7 +1413,7 @@ class CNTAnalyzerGUI:
             )
             self._last_preprocess_signature = signature
             self._update_display()
-        except (ValueError, cv2.error) as e:
+        except (TypeError, ValueError, tk.TclError, cv2.error) as e:
             logger.exception(f"预处理错误: {e}")
         except Exception as e:
             logger.exception(f"预处理时发生未预期的错误: {e}")
@@ -1400,8 +1476,136 @@ class CNTAnalyzerGUI:
         self._refresh_analysis_status_ui()
 
     # ===== CNT检测 =====
+    @staticmethod
+    def _roi_signature(roi: Optional[ROIRegion]) -> Optional[tuple]:
+        """Build a stable identity tuple for the active ROI."""
+        if roi is None:
+            return None
+        return (str(roi.name), int(roi.x), int(roi.y), int(roi.width), int(roi.height))
+
+    @staticmethod
+    def _clone_roi_region(roi: ROIRegion) -> ROIRegion:
+        """Create a measurement-free ROI copy for background analysis."""
+        return ROIRegion(
+            name=str(roi.name),
+            x=int(roi.x),
+            y=int(roi.y),
+            width=int(roi.width),
+            height=int(roi.height),
+            color=tuple(roi.color),
+            measurements=[],
+        )
+
+    def _clone_analyzer_for_detection(self) -> Tuple[CNTAnalyzer, Optional[ROIRegion]]:
+        """Snapshot the current analyzer state for background single-image detection."""
+        snapshot = CNTAnalyzer()
+        for attr in (
+            'original_image',
+            'analysis_image',
+            'analysis_gray_image',
+            'image',
+            'processed_image',
+            'binary_image',
+            'skeleton_image',
+            'skeleton_overlay',
+            'scale_exclusion_mask',
+        ):
+            value = getattr(self.analyzer, attr, None)
+            setattr(snapshot, attr, value.copy() if isinstance(value, np.ndarray) else value)
+
+        snapshot.scale_um_per_pixel = float(self.analyzer.scale_um_per_pixel)
+        snapshot.scale_bar_info = dict(self.analyzer.scale_bar_info) if self.analyzer.scale_bar_info else None
+        snapshot.scale_exclusion_rect = tuple(self.analyzer.scale_exclusion_rect) if self.analyzer.scale_exclusion_rect else None
+        snapshot.scale_status = dict(self.analyzer.scale_status)
+        snapshot.auto_enhance_enabled = bool(self.analyzer.auto_enhance_enabled)
+        snapshot.rois = [self._clone_roi_region(roi) for roi in self.analyzer.rois]
+        roi_snapshot = self._clone_roi_region(self.current_roi) if self.current_roi is not None else None
+        return snapshot, roi_snapshot
+
+    @staticmethod
+    def _run_single_detection_task(analyzer_snapshot: CNTAnalyzer,
+                                   detect_settings: dict,
+                                   roi_snapshot: Optional[ROIRegion]) -> List[CNTMeasurement]:
+        """Run CNT detection off the UI thread using a frozen analyzer snapshot."""
+        return list(analyzer_snapshot.detect_cnts_hybrid(roi=roi_snapshot, **detect_settings))
+
+    def _handle_single_detection_result(self,
+                                        task_token: int,
+                                        snapshot: dict,
+                                        future) -> None:
+        """Apply a finished single-image detection back onto the live analyzer."""
+        if getattr(self, '_single_detect_future', None) is future:
+            self._single_detect_future = None
+
+        try:
+            measurements = future.result()
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
+            logger.exception("CNT检测失败")
+            self._set_single_detection_busy_state(False)
+            self.control_panel.update_analysis_status(
+                f"检测进度: 失败，{exc}",
+                color=self.MODERN_COLORS['error'],
+            )
+            self.image_panel.show_status("CNT检测失败")
+            messagebox.showerror("错误", f"CNT检测失败: {exc}")
+            return
+        except Exception as exc:
+            logger.exception("CNT检测时发生未预期的错误")
+            self._set_single_detection_busy_state(False)
+            self.control_panel.update_analysis_status(
+                f"检测进度: 失败，{exc}",
+                color=self.MODERN_COLORS['error'],
+            )
+            self.image_panel.show_status("CNT检测失败")
+            messagebox.showerror("错误", f"发生未预期的错误: {exc}")
+            return
+
+        if (
+            task_token != getattr(self, '_single_detect_token', -1) or
+            self.analyzer.image is None or
+            id(self.analyzer.image) != snapshot.get('image_id') or
+            self._last_preprocess_signature != snapshot.get('preprocess_signature') or
+            self._roi_signature(self.current_roi) != snapshot.get('roi_signature')
+        ):
+            self._set_single_detection_busy_state(False)
+            self.image_panel.show_status("检测结果已过期，未覆盖当前图像")
+            self._refresh_analysis_status_ui()
+            return
+
+        self.control_panel.update_analysis_status(
+            "检测进度: 统计中，正在回填结果...",
+            color=self.MODERN_COLORS['info'],
+        )
+
+        if self.current_roi is not None:
+            self.current_roi.measurements = list(measurements)
+        else:
+            self.analyzer.measurements = list(measurements)
+
+        self._sync_views()
+        self._set_single_detection_busy_state(False)
+        self._refresh_analysis_status_ui()
+
+        target_text = f"ROI {self.current_roi.name}" if self.current_roi is not None else "全图"
+        count = len(measurements)
+        self.image_panel.show_status(f"检测完成: {target_text} 共 {count} 个CNT")
+        messagebox.showinfo("检测完成", f"在{target_text}中检测到 {count} 个CNT")
+
+    def _poll_single_detection_result(self, task_token: int, snapshot: dict) -> None:
+        """Poll a background detection future from the Tk main thread."""
+        future = getattr(self, '_single_detect_future', None)
+        if future is None or task_token != getattr(self, '_single_detect_token', -1):
+            return
+        if not future.done():
+            try:
+                self.root.after(60, self._poll_single_detection_result, task_token, snapshot)
+            except tk.TclError:
+                logger.debug("检测轮询在窗口关闭后被取消")
+            return
+        self._handle_single_detection_result(task_token, snapshot, future)
+
     def _detect_cnt(self):
-        """检测CNT"""
+        """异步检测 CNT，避免主界面在识别期间卡住。"""
         if self.analyzer.image is None:
             self.control_panel.update_analysis_status(
                 "检测输入状态: 请先加载图像后再开始检测",
@@ -1410,42 +1614,75 @@ class CNTAnalyzerGUI:
             self.image_panel.show_status("请先加载图像后再开始检测")
             return
 
-        try:
-            min_length = self.min_length_um_var.get()
-            max_length = self.max_length_um_var.get()
-            min_slenderness = self.min_slenderness_var.get()
-            merge_distance_px = self.merge_distance_px_var.get()
+        if self._is_single_detection_running():
+            self.control_panel.update_analysis_status(
+                "检测进度: 已有任务在运行，请等待当前检测完成",
+                color=self.MODERN_COLORS['info'],
+            )
+            self.image_panel.show_status("已有CNT检测正在运行")
+            return
 
-            # 修复1: 强制校验并重算预处理，确保二值图与当前ROI一致
+        try:
+            min_length = float(self.min_length_um_var.get())
+            max_length = float(self.max_length_um_var.get())
+            min_slenderness = float(self.min_slenderness_var.get())
+            merge_distance_px = float(self.merge_distance_px_var.get())
+
             current_signature = self._get_preprocess_signature()
             if self.analyzer.binary_image is None or current_signature != self._last_preprocess_signature:
                 self._apply_preprocessing(force=True)
+            current_signature = self._last_preprocess_signature
 
-            measurements = self.analyzer.detect_cnts_hybrid(
-                min_length_um=min_length,
-                max_length_um=max_length,
-                min_slenderness=min_slenderness,
-                detection_profile=self._get_detection_profile_key(),
-                split_mode={
+            detect_settings = {
+                'min_length_um': min_length,
+                'max_length_um': max_length,
+                'min_slenderness': min_slenderness,
+                'detection_profile': self._get_detection_profile_key(),
+                'split_mode': {
                     "不拆分": "off",
                     "标准拆分": "conservative",
                     "强力拆分": "aggressive",
                 }.get(self.split_mode_var.get(), self.split_mode_var.get()),
-                merge_distance_px=float(merge_distance_px),
-                roi=self.current_roi
+                'merge_distance_px': merge_distance_px,
+            }
+
+            analyzer_snapshot, roi_snapshot = self._clone_analyzer_for_detection()
+            self._single_detect_token += 1
+            task_token = self._single_detect_token
+            snapshot = {
+                'image_id': id(self.analyzer.image),
+                'preprocess_signature': current_signature,
+                'roi_signature': self._roi_signature(self.current_roi),
+            }
+            self._single_detect_snapshot = snapshot
+
+            self.control_panel.update_analysis_status(
+                "检测进度: 开始分析，已完成预处理，后台正在检测...",
+                color=self.MODERN_COLORS['info'],
             )
+            self.image_panel.show_status("CNT检测中...")
+            self._set_single_detection_busy_state(True)
 
-            self._sync_views()
-
-            roi_text = f" ({self.current_roi.name})" if self.current_roi else ""
-            messagebox.showinfo("检测完成",
-                                f"在{roi_text if self.current_roi else '全图'}中检测到 {len(measurements)} 个CNT")
+            future = self._single_detect_executor.submit(
+                self._run_single_detection_task,
+                analyzer_snapshot,
+                detect_settings,
+                roi_snapshot,
+            )
+            self._single_detect_future = future
+            self.control_panel.update_analysis_status(
+                "检测进度: 检测中，界面可继续响应",
+                color=self.MODERN_COLORS['info'],
+            )
+            self.root.after(60, self._poll_single_detection_result, task_token, snapshot)
 
         except (ValueError, cv2.error, tk.TclError) as e:
             logger.exception("CNT检测失败")
+            self._set_single_detection_busy_state(False)
             messagebox.showerror("错误", f"CNT检测失败: {e}")
         except Exception as e:
             logger.exception("CNT检测时发生未预期的错误")
+            self._set_single_detection_busy_state(False)
             messagebox.showerror("错误", f"发生未预期的错误: {e}")
 
     # ===== 显示更新 =====
@@ -1648,8 +1885,10 @@ class CNTAnalyzerGUI:
                 primary_count = int(dispersed_stats.get('dispersed_count', primary_count))
                 length_stats = dispersed_stats.get('dispersed_length_stats') or stats
                 display_measurements = dispersed_stats.get('dispersed_measurements') or []
-        except Exception as e:
+        except GUI_EXPECTED_DATA_EXCEPTIONS as e:
             logger.debug(f"获取分散统计失败: {e}")
+        except Exception as e:
+            logger.exception("获取分散统计时发生未预期的错误")
 
         if dispersed_stats:
             text_widget.insert(tk.END, "分散CNT数量: ", 'header')
@@ -1878,6 +2117,8 @@ class CNTAnalyzerGUI:
             chart['fig'].tight_layout()
             canvas.draw()
 
+        except GUI_EXPECTED_RENDER_EXCEPTIONS as e:
+            logger.exception(f"绘制双指标概览错误: {e}")
         except Exception as e:
             logger.exception(f"绘制双指标概览错误: {e}")
 
@@ -1929,6 +2170,8 @@ class CNTAnalyzerGUI:
             chart['fig'].tight_layout()
             canvas.draw()
 
+        except GUI_EXPECTED_RENDER_EXCEPTIONS as e:
+            logger.exception(f"绘制直方图错误: {e}")
         except Exception as e:
             logger.exception(f"绘制直方图错误: {e}")
 
@@ -2003,6 +2246,8 @@ class CNTAnalyzerGUI:
             chart['fig'].tight_layout()
             canvas.draw()
 
+        except GUI_EXPECTED_RENDER_EXCEPTIONS as e:
+            logger.exception(f"绘制饼状图错误: {e}")
         except Exception as e:
             logger.exception(f"绘制饼状图错误: {e}")
 
@@ -2087,6 +2332,8 @@ class CNTAnalyzerGUI:
             chart['fig'].tight_layout()
             canvas.draw()
 
+        except GUI_EXPECTED_RENDER_EXCEPTIONS as e:
+            logger.exception(f"绘制聚类图错误: {e}")
         except Exception as e:
             logger.exception(f"绘制聚类图错误: {e}")
 
@@ -2376,6 +2623,8 @@ class CNTAnalyzerGUI:
             chart['fig'].tight_layout()
             canvas.draw()
 
+        except GUI_EXPECTED_RENDER_EXCEPTIONS as e:
+            logger.exception(f"绘制空间热图错误: {e}")
         except Exception as e:
             logger.exception(f"绘制空间热图错误: {e}")
 
@@ -2399,13 +2648,42 @@ class CNTAnalyzerGUI:
                 "标准拆分": "conservative",
                 "强力拆分": "aggressive",
             }.get(self.split_mode_var.get(), self.split_mode_var.get()),
-            'roi': None,
         }
         return preprocess_settings, detect_settings
 
     def _build_analysis_context(self) -> dict:
         """快照当前分析参数，避免重复读取界面变量"""
         preprocess_settings, detect_settings = self._get_current_analysis_settings()
+        return self._compose_analysis_context(preprocess_settings, detect_settings)
+
+    def _build_compare_analysis_context(self) -> dict:
+        """Build a comparison-only context with fixed 9/11/3 preprocess parameters."""
+        preprocess_settings, detect_settings = self._get_current_analysis_settings()
+        preprocess_settings = {
+            **preprocess_settings,
+            'blur_kernel': int(CALIBRATED_BLUR_KERNEL),
+            'adaptive_block': int(CALIBRATED_ADAPTIVE_BLOCK),
+            'adaptive_c': int(CALIBRATED_ADAPTIVE_C),
+        }
+        return self._compose_analysis_context(
+            preprocess_settings,
+            detect_settings,
+            analysis_roi={
+                'mode': 'center_fraction',
+                'fraction': 0.75,
+                'label': '中部75%区域',
+            },
+            scale_detection={
+                'recognize_text': False,
+            },
+        )
+
+    def _compose_analysis_context(self,
+                                  preprocess_settings: dict,
+                                  detect_settings: dict,
+                                  analysis_roi: Optional[dict] = None,
+                                  scale_detection: Optional[dict] = None) -> dict:
+        """Compose a cacheable analysis context from prepared preprocess/detect settings."""
         scale_um = float(self.scale_um_var.get()) if self.scale_um_var.get() > 0 else float(SCALE_BAR_DEFAULT_UM)
         manual_scale_pixels = float(self.scale_pixels_var.get()) if self.scale_pixels_var.get() > 0 else 0.0
         return {
@@ -2413,6 +2691,8 @@ class CNTAnalyzerGUI:
             'detect_settings': detect_settings,
             'scale_um': scale_um,
             'manual_scale_pixels': manual_scale_pixels,
+            'analysis_roi': analysis_roi,
+            'scale_detection': scale_detection,
         }
 
     @staticmethod
@@ -2433,6 +2713,55 @@ class CNTAnalyzerGUI:
             include_visualization,
             self._freeze_cache_value(context),
         )
+
+    @staticmethod
+    def _build_center_fraction_roi(width: int,
+                                   height: int,
+                                   fraction: float,
+                                   name: str = "compare_center_focus") -> Optional[ROIRegion]:
+        """Build a centered ROI that keeps only the middle fraction of the image."""
+        if width <= 0 or height <= 0:
+            return None
+
+        clamped_fraction = max(0.1, min(1.0, float(fraction)))
+        roi_width = max(1, int(round(width * clamped_fraction)))
+        roi_height = max(1, int(round(height * clamped_fraction)))
+        x = max(0, (int(width) - roi_width) // 2)
+        y = max(0, (int(height) - roi_height) // 2)
+        return ROIRegion(name=name, x=x, y=y, width=roi_width, height=roi_height)
+
+    def _resolve_batch_analysis_roi(self, analyzer: CNTAnalyzer, context: dict) -> Optional[ROIRegion]:
+        """Resolve a batch-analysis ROI from the frozen context."""
+        analysis_roi = context.get('analysis_roi') or {}
+        if not analysis_roi:
+            return None
+
+        image = getattr(analyzer, 'image', None)
+        if image is None or getattr(image, 'size', 0) == 0:
+            return None
+
+        mode = str(analysis_roi.get('mode', '')).lower()
+        if mode != 'center_fraction':
+            return None
+
+        fraction = float(analysis_roi.get('fraction', 1.0))
+        label = str(analysis_roi.get('label', 'compare_center_focus'))
+        height, width = image.shape[:2]
+        return self._build_center_fraction_roi(width, height, fraction, name=label)
+
+    @staticmethod
+    def _crop_visualization_to_roi(image: np.ndarray, roi: Optional[ROIRegion]) -> np.ndarray:
+        """Crop a rendered visualization down to the analysis ROI when needed."""
+        if image is None or getattr(image, 'size', 0) == 0 or roi is None:
+            return image
+
+        y1 = max(0, int(roi.y))
+        y2 = min(image.shape[0], int(roi.y + roi.height))
+        x1 = max(0, int(roi.x))
+        x2 = min(image.shape[1], int(roi.x + roi.width))
+        if y2 <= y1 or x2 <= x1:
+            return image
+        return image[y1:y2, x1:x2].copy()
 
     def _get_cached_analysis_result(self, cache_key: tuple) -> Optional[dict]:
         """读取缓存结果，并刷新其 LRU 顺序"""
@@ -2461,19 +2790,29 @@ class CNTAnalyzerGUI:
 
         scale_um = float(context['scale_um'])
         manual_scale_pixels = float(context['manual_scale_pixels'])
-        scale_result = analyzer.apply_detected_scale(default_micrometers=scale_um)
+        scale_detection = context.get('scale_detection') or {}
+        scale_result = analyzer.apply_detected_scale(
+            default_micrometers=scale_um,
+            recognize_text=bool(scale_detection.get('recognize_text', True)),
+        )
         scale_info = scale_result.get('scale_info')
         if not scale_result.get('applied') and manual_scale_pixels > 0 and scale_um > 0:
             analyzer.record_manual_scale(manual_scale_pixels, scale_um, source='batch_manual', confidence='low')
 
-        analyzer.preprocess(**context['preprocess_settings'])
-        analyzer.detect_cnts_hybrid(**context['detect_settings'])
-        stats = analyzer.get_statistics()
-        dispersed_stats = analyzer.get_dispersed_statistics()
+        analysis_roi = self._resolve_batch_analysis_roi(analyzer, context)
+        detect_settings = dict(context['detect_settings'])
+        detect_settings.pop('roi', None)
+
+        analyzer.preprocess(**context['preprocess_settings'], roi=analysis_roi)
+        analyzer.detect_cnts_hybrid(**detect_settings, roi=analysis_roi)
+        stats = analyzer.get_statistics(analysis_roi)
+        dispersed_stats = analyzer.get_dispersed_statistics(analysis_roi)
 
         visualization = None
         if include_visualization:
-            visualization = cv2.cvtColor(analyzer.get_visualization(), cv2.COLOR_BGR2RGB)
+            vis_bgr = analyzer.get_visualization(analysis_roi)
+            vis_bgr = self._crop_visualization_to_roi(vis_bgr, analysis_roi)
+            visualization = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
             if preview_visualization:
                 visualization = self._prepare_comparison_display_image(
                     visualization,
@@ -2489,6 +2828,14 @@ class CNTAnalyzerGUI:
             'scale_info': scale_info,
             'scale_status': analyzer.get_scale_status(),
             'visualization': visualization,
+            'analysis_context': context,
+            'analysis_roi': None if analysis_roi is None else {
+                'name': analysis_roi.name,
+                'x': int(analysis_roi.x),
+                'y': int(analysis_roi.y),
+                'width': int(analysis_roi.width),
+                'height': int(analysis_roi.height),
+            },
         }
 
     def _get_group_analysis_worker_count(self, image_count: int) -> int:
@@ -2497,7 +2844,7 @@ class CNTAnalyzerGUI:
             return 1
 
         cpu_count = os.cpu_count() or 1
-        return max(1, min(image_count, max(1, cpu_count - 1), 4))
+        return max(1, min(image_count, max(1, cpu_count // 4), 8))
 
     def _run_group_analysis_task(self,
                                  task: Tuple[int, str],
@@ -2513,56 +2860,95 @@ class CNTAnalyzerGUI:
                 include_visualization=include_visualization,
                 preview_visualization=preview_visualization,
             ), None
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
+            return index, None, f"{Path(image_path).name}: {exc}"
         except Exception as exc:
+            logger.exception("单图分析任务发生未预期的错误")
             return index, None, f"{Path(image_path).name}: {exc}"
 
     def _run_group_analysis_tasks(self,
                                   tasks: List[Tuple[int, str]],
                                   context: dict,
                                   include_visualization: bool = False,
-                                  preview_visualization: bool = False) -> List[Tuple[int, Optional[dict], Optional[str]]]:
+                                  preview_visualization: bool = False,
+                                  progress_callback: Optional[Callable[[int, int, str], None]] = None) -> List[Tuple[int, Optional[dict], Optional[str]]]:
         """并行执行一批组图分析任务；若线程池异常则自动回退到串行。"""
         if not tasks:
             return []
 
         worker_count = self._get_group_analysis_worker_count(len(tasks))
         if worker_count <= 1:
-            return [
-                self._run_group_analysis_task(
+            results = []
+            for idx, task in enumerate(tasks):
+                result = self._run_group_analysis_task(
                     task,
                     context,
                     include_visualization=include_visualization,
                     preview_visualization=preview_visualization,
                 )
-                for task in tasks
-            ]
+                results.append(result)
+                if progress_callback:
+                    progress_callback(idx + 1, len(tasks), Path(task[1]).name)
+            return results
 
         try:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="cnt-group") as executor:
-                return list(
-                    executor.map(
+                futures = [
+                    executor.submit(
                         self._run_group_analysis_task,
-                        tasks,
-                        repeat(context),
-                        repeat(include_visualization),
-                        repeat(preview_visualization),
+                        task,
+                        context,
+                        include_visualization,
+                        preview_visualization,
                     )
-                )
-        except Exception as exc:
+                    for task in tasks
+                ]
+                results = []
+                for idx, future in enumerate(futures):
+                    result = future.result()
+                    results.append(result)
+                    if progress_callback:
+                        task_name = Path(tasks[idx][1]).name if idx < len(tasks) else "未知"
+                        progress_callback(idx + 1, len(tasks), task_name)
+                return results
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
             logger.warning("组图并行分析失败，已回退到串行模式: %s", exc)
-            return [
-                self._run_group_analysis_task(
+            results = []
+            for idx, task in enumerate(tasks):
+                result = self._run_group_analysis_task(
                     task,
                     context,
                     include_visualization=include_visualization,
                     preview_visualization=preview_visualization,
                 )
-                for task in tasks
-            ]
+                results.append(result)
+                if progress_callback:
+                    progress_callback(idx + 1, len(tasks), Path(task[1]).name)
+            return results
+        except Exception as exc:
+            logger.exception("组图并行分析时发生未预期的错误，已回退到串行模式")
+            results = []
+            for idx, task in enumerate(tasks):
+                result = self._run_group_analysis_task(
+                    task,
+                    context,
+                    include_visualization=include_visualization,
+                    preview_visualization=preview_visualization,
+                )
+                results.append(result)
+                if progress_callback:
+                    progress_callback(idx + 1, len(tasks), Path(task[1]).name)
+            return results
 
-    def _analyze_image_file(self, image_path: str, include_visualization: bool = False) -> dict:
-        """在不影响当前主界面的前提下分析单张图像"""
-        context = self._build_analysis_context()
+    def _analyze_image_with_context(self,
+                                    image_path: str,
+                                    context: dict,
+                                    include_visualization: bool = False,
+                                    preview_visualization: Optional[bool] = None) -> dict:
+        """Analyze a single image under an explicit frozen context with cache reuse."""
+        if preview_visualization is None:
+            preview_visualization = include_visualization
+
         base_cache_key = self._make_analysis_cache_key(image_path, context, False)
         visual_cache_key = self._make_analysis_cache_key(image_path, context, True)
         cache_key = visual_cache_key if include_visualization else base_cache_key
@@ -2581,15 +2967,30 @@ class CNTAnalyzerGUI:
             if cached_base is not None and cached_base.get('visualization') is not None:
                 return cached_base
 
-        result = self._run_image_analysis(image_path, context, include_visualization=include_visualization)
+        result = self._run_image_analysis(
+            image_path,
+            context,
+            include_visualization=include_visualization,
+            preview_visualization=preview_visualization,
+        )
         stored = self._store_analysis_result(cache_key, result)
         if include_visualization:
             self._store_analysis_result(base_cache_key, stored)
         return stored
 
-    def _analyze_image_files(self, image_paths: List[str], group_label: str) -> Tuple[List[dict], List[str]]:
-        """批量分析一组图像，优先复用缓存并并行处理未命中的图片。"""
+    def _analyze_image_file(self, image_path: str, include_visualization: bool = False) -> dict:
+        """在不影响当前主界面的前提下分析单张图像"""
         context = self._build_analysis_context()
+        return self._analyze_image_with_context(image_path, context, include_visualization=include_visualization)
+
+    def _analyze_image_files(self,
+                             image_paths: List[str],
+                             group_label: str,
+                             context: Optional[dict] = None,
+                             include_visualization: bool = True,
+                             preview_visualization: bool = True) -> Tuple[List[dict], List[str]]:
+        """批量分析一组图像，优先复用缓存并并行处理未命中的图片。"""
+        context = context or self._build_analysis_context()
         ordered_results: List[Optional[dict]] = [None] * len(image_paths)
         failures: List[str] = []
         pending_tasks: List[Tuple[int, str]] = []
@@ -2609,11 +3010,30 @@ class CNTAnalyzerGUI:
             pending_tasks.append((index, image_path))
             pending_cache_keys[index] = base_cache_key
 
-        for index, result, error in self._run_group_analysis_tasks(
+        comparison_panel = getattr(self, 'comparison_panel', None)
+
+        # 显示进度条
+        if comparison_panel and pending_tasks:
+            comparison_panel.show_progress()
+            comparison_panel.update_progress(0, len(pending_tasks), "准备开始...")
+
+        def progress_callback(current: int, total: int, message: str):
+            """进度回调函数"""
+            if comparison_panel:
+                comparison_panel.update_progress(current, total, message)
+
+        run_group_analysis_tasks = self._run_group_analysis_tasks
+        task_kwargs = {
+            'include_visualization': include_visualization,
+            'preview_visualization': preview_visualization,
+        }
+        if pending_tasks and 'progress_callback' in inspect.signature(run_group_analysis_tasks).parameters:
+            task_kwargs['progress_callback'] = progress_callback
+
+        for index, result, error in run_group_analysis_tasks(
             pending_tasks,
             context,
-            include_visualization=True,
-            preview_visualization=True,
+            **task_kwargs,
         ):
             if result is not None:
                 stored = self._store_analysis_result(pending_cache_keys[index], result)
@@ -2624,10 +3044,15 @@ class CNTAnalyzerGUI:
             elif error:
                 failures.append(error)
 
+        # 隐藏进度条
+        if comparison_panel:
+            comparison_panel.hide_progress()
+
         results = [result for result in ordered_results if result is not None]
 
         if not results:
-            raise ValueError(f"{group_label}未成功分析任何图像")
+            failure_summary = "；".join(failures[:3]) if failures else "未返回具体失败原因"
+            raise ValueError(f"{group_label}未成功分析任何图像: {failure_summary}")
 
         return results, failures
 
@@ -2872,6 +3297,14 @@ class CNTAnalyzerGUI:
                 self._get_group_detail_series(base_group, 'count'),
                 self._get_group_detail_series(exp_group, 'count'),
             ),
+            'dispersed_count': self._compute_two_group_tests(
+                self._get_group_detail_series(base_group, 'dispersed_count'),
+                self._get_group_detail_series(exp_group, 'dispersed_count'),
+            ),
+            'dispersed_ratio': self._compute_two_group_tests(
+                self._get_group_detail_series(base_group, 'dispersed_ratio'),
+                self._get_group_detail_series(exp_group, 'dispersed_ratio'),
+            ),
             'nearest_neighbor_cv': self._compute_two_group_tests(
                 self._get_group_detail_series(base_group, 'nearest_neighbor_cv'),
                 self._get_group_detail_series(exp_group, 'nearest_neighbor_cv'),
@@ -2953,7 +3386,13 @@ class CNTAnalyzerGUI:
         )
         if representative_result.get('visualization') is not None:
             return representative_result
-        return self._analyze_image_file(representative_result['path'], include_visualization=True)
+        context = representative_result.get('analysis_context') or self._build_compare_analysis_context()
+        return self._analyze_image_with_context(
+            representative_result['path'],
+            context,
+            include_visualization=True,
+            preview_visualization=True,
+        )
 
     def _annotate_heatmap_cells(self, ax, grid: np.ndarray):
         """在热图格子上标注数值"""
@@ -3096,63 +3535,38 @@ class CNTAnalyzerGUI:
                                  *images: Optional[np.ndarray],
                                  stacked: bool,
                                  variant: str) -> dict:
-        """根据图像宽高比动态分配对比页布局。"""
-        aspects = [
-            self._get_comparison_image_aspect(image)
-            for image in images
-            if image is not None and getattr(image, 'size', 0) > 0
-        ]
-        avg_aspect = (sum(aspects) / len(aspects)) if aspects else 1.0
-        max_aspect = max(aspects) if aspects else 1.0
-
+        """返回稳定的预设对比布局，减少不同图像宽高比带来的抖动。"""
         if variant == 'pair':
             if stacked:
-                wide_boost = max(0.0, max(max_aspect, avg_aspect) - 1.3)
-                image_ratio = min(1.75, 1.20 + wide_boost * 0.55)
-                top_ratio = max(0.60, 0.78 - wide_boost * 0.18)
-                figure_height = 11.8 + wide_boost * 3.2
                 return {
-                    'figsize': (13.4, figure_height),
-                    'height_ratios': [top_ratio, image_ratio, image_ratio],
-                    'hspace': 0.36,
-                    'wspace': 0.22,
-                    'adjust': {'left': 0.05, 'right': 0.98, 'top': 0.968, 'bottom': 0.04},
+                    'figsize': (13.4, 11.5),
+                    'height_ratios': [0.75, 1.6, 1.6],
+                    'hspace': 0.40,
+                    'wspace': 0.25,
+                    'adjust': {'left': 0.06, 'right': 0.97, 'top': 0.96, 'bottom': 0.05},
                 }
-
-            tall_boost = max(0.0, 1.05 - avg_aspect)
-            image_ratio = min(1.55, 1.30 + tall_boost * 0.35)
-            figure_height = 9.7 + tall_boost * 1.6
             return {
-                'figsize': (13.2, figure_height),
-                'height_ratios': [0.80, image_ratio],
-                'hspace': 0.30,
-                'wspace': 0.22,
-                'adjust': {'left': 0.055, 'right': 0.98, 'top': 0.962, 'bottom': 0.05},
+                'figsize': (13.2, 9.5),
+                'height_ratios': [0.85, 1.4],
+                'hspace': 0.32,
+                'wspace': 0.25,
+                'adjust': {'left': 0.06, 'right': 0.97, 'top': 0.96, 'bottom': 0.06},
             }
 
         if stacked:
-            wide_boost = max(0.0, max(max_aspect, avg_aspect) - 1.25)
-            top_ratio = max(0.68, 0.84 - wide_boost * 0.16)
-            detail_ratio = max(0.60, 0.72 - wide_boost * 0.10)
-            image_ratio = min(1.85, 1.22 + wide_boost * 0.55)
-            figure_height = 14.6 + wide_boost * 3.8
             return {
-                'figsize': (15.0, figure_height),
-                'height_ratios': [top_ratio, detail_ratio, image_ratio, image_ratio],
-                'hspace': 0.38,
-                'wspace': 0.30,
-                'adjust': {'left': 0.05, 'right': 0.98, 'top': 0.972, 'bottom': 0.035},
+                'figsize': (14.5, 14.2),
+                'height_ratios': [0.80, 0.70, 0.75, 1.5, 1.5],
+                'hspace': 0.44,
+                'wspace': 0.32,
+                'adjust': {'left': 0.055, 'right': 0.97, 'top': 0.97, 'bottom': 0.04},
             }
-
-        tall_boost = max(0.0, 1.05 - avg_aspect)
-        image_ratio = min(1.60, 1.45 + tall_boost * 0.30)
-        figure_height = 12.0 + tall_boost * 1.8
         return {
-            'figsize': (14.8, figure_height),
-            'height_ratios': [0.92, 0.82, image_ratio],
-            'hspace': 0.34,
-            'wspace': 0.32,
-            'adjust': {'left': 0.05, 'right': 0.98, 'top': 0.966, 'bottom': 0.04},
+            'figsize': (14.5, 11.8),
+            'height_ratios': [0.90, 0.80, 1.5],
+            'hspace': 0.36,
+            'wspace': 0.35,
+            'adjust': {'left': 0.055, 'right': 0.97, 'top': 0.96, 'bottom': 0.045},
         }
 
     def _annotate_bar_values(self,
@@ -3181,16 +3595,18 @@ class CNTAnalyzerGUI:
 
     def _prepare_comparison_display_image(self,
                                           image: Optional[np.ndarray],
-                                          max_width: int = 1200,
-                                          max_height: int = 700) -> Optional[np.ndarray]:
+                                          max_width: int = 1100,
+                                          max_height: int = 650) -> Optional[np.ndarray]:
         """为对比页预缩放大图，降低渲染压力。"""
         if image is None or getattr(image, 'size', 0) == 0:
             return image
         height, width = image.shape[:2]
         if width <= 0 or height <= 0:
             return image
-        scale = min(max_width / width, max_height / height, 1.0)
-        if scale >= 0.999:
+        scale_w = max_width / width
+        scale_h = max_height / height
+        scale = min(scale_w, scale_h, 1.0)
+        if scale >= 0.95:
             return image
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))
@@ -3214,6 +3630,26 @@ class CNTAnalyzerGUI:
         if merge_distance:
             parts.append(f"合并{merge_distance}px")
         return "识别参数: " + " | ".join(str(part) for part in parts if part)
+
+    def _format_compare_fixed_params(self) -> str:
+        """Describe the fixed preprocess parameters used only by comparison analysis."""
+        parts = [
+            f"对比固定预处理: 模糊{int(CALIBRATED_BLUR_KERNEL)}/块{int(CALIBRATED_ADAPTIVE_BLOCK)}/C{int(CALIBRATED_ADAPTIVE_C)}",
+            "分析区域=中部75%",
+            f"长度≥{self.min_length_um_var.get():.1f}μm",
+            f"长宽比≥{self.min_slenderness_var.get():.1f}",
+            self.detect_profile_var.get(),
+        ]
+        bridge_strength = self.bridge_strength_var.get()
+        if bridge_strength:
+            parts.append(f"桥接{bridge_strength}")
+        split_mode = self.split_mode_var.get()
+        if split_mode and split_mode != "不拆分":
+            parts.append(split_mode)
+        merge_distance = self.merge_distance_px_var.get()
+        if merge_distance:
+            parts.append(f"合并{merge_distance}px")
+        return " | ".join(str(part) for part in parts if part)
 
     def _format_compact_significance(self, test_result: Optional[dict]) -> str:
         """将统计检验压缩成单行 p 值展示。"""
@@ -3280,7 +3716,7 @@ class CNTAnalyzerGUI:
             return
 
         display_image = self._prepare_comparison_display_image(image)
-        ax.imshow(display_image, interpolation='nearest', aspect='equal')
+        ax.imshow(display_image, interpolation='bilinear', aspect='equal')
         ax.set_aspect('equal', adjustable='box')
         ax.margins(0.0)
         ax.set_anchor('C')
@@ -3291,14 +3727,15 @@ class CNTAnalyzerGUI:
             transform=ax.transAxes,
             ha='left',
             va='top',
-            fontsize=9,
-            linespacing=1.15,
+            fontsize=9.5,
+            linespacing=1.2,
             color=self.MODERN_COLORS['text_primary'],
             bbox={
-                'boxstyle': 'round,pad=0.28',
+                'boxstyle': 'round,pad=0.35',
                 'facecolor': self.MODERN_COLORS['bg_secondary'],
                 'edgecolor': self.MODERN_COLORS['border'],
-                'alpha': 0.84,
+                'alpha': 0.90,
+                'linewidth': 1.5,
             },
         )
         ax.axis('off')
@@ -3312,9 +3749,9 @@ class CNTAnalyzerGUI:
     def _fit_comparison_figure_to_frame(self,
                                         figure: Figure,
                                         chart_frame: Optional[tk.Widget],
-                                        min_width_px: int = 620,
-                                        padding_px: int = 24,
-                                        max_width_px: int = 1260,
+                                        min_width_px: int = 680,
+                                        padding_px: int = 30,
+                                        max_width_px: int = 1400,
                                         allow_expand: bool = False) -> None:
         """按中间栏可用宽度等比缩放对比图。"""
         if chart_frame is None:
@@ -3328,11 +3765,15 @@ class CNTAnalyzerGUI:
         target_width_px = max(min_width_px, min(max_width_px, available_width))
         current_width_px = max(1, int(round(figure.get_figwidth() * figure.dpi)))
         current_height_px = max(1, int(round(figure.get_figheight() * figure.dpi)))
-        if current_width_px <= target_width_px + 8 and (not allow_expand or current_width_px >= target_width_px - 24):
+        tolerance = 12
+        if abs(current_width_px - target_width_px) <= tolerance:
+            return
+        if current_width_px <= target_width_px and not allow_expand:
             return
         scale = target_width_px / current_width_px
+        scale = max(0.5, min(1.5, scale))
         resized_width_px = max(min_width_px, int(round(current_width_px * scale)))
-        resized_height_px = max(420, int(round(current_height_px * scale)))
+        resized_height_px = max(480, int(round(current_height_px * scale)))
         figure.set_size_inches(resized_width_px / figure.dpi, resized_height_px / figure.dpi, forward=False)
 
     def _schedule_comparison_layout_refresh(self, delay_ms: int = 80) -> None:
@@ -3360,14 +3801,14 @@ class CNTAnalyzerGUI:
             int(round(figure.get_figwidth() * figure.dpi)),
             int(round(figure.get_figheight() * figure.dpi)),
         )
-        self._fit_comparison_figure_to_frame(figure, chart_frame, allow_expand=True)
-        new_height = min(1600, max(720, int(round(figure.get_figheight() * figure.dpi)) + 40))
+        self._fit_comparison_figure_to_frame(figure, chart_frame, allow_expand=False)
+        new_height = min(1800, max(800, int(round(figure.get_figheight() * figure.dpi)) + 50))
         self.comparison_panel.set_section_height('comparison', new_height)
         new_size = (
             int(round(figure.get_figwidth() * figure.dpi)),
             int(round(figure.get_figheight() * figure.dpi)),
         )
-        if new_size != old_size:
+        if abs(new_size[0] - old_size[0]) > 5 or abs(new_size[1] - old_size[1]) > 5:
             canvas.draw()
         self.comparison_panel.refresh_layout()
 
@@ -3406,7 +3847,13 @@ class CNTAnalyzerGUI:
         """确保结果中带有检测可视化图像。"""
         if result.get('visualization') is not None:
             return result
-        return self._analyze_image_file(result['path'], include_visualization=True)
+        context = result.get('analysis_context') or self._build_analysis_context()
+        return self._analyze_image_with_context(
+            result['path'],
+            context,
+            include_visualization=True,
+            preview_visualization=True,
+        )
 
     def _plot_group_aggregation_risk_chart(self, ax, base_group: dict, exp_group: dict, tests: dict) -> None:
         """绘制组别阴影团聚与均匀度主图卡。"""
@@ -3514,6 +3961,168 @@ class CNTAnalyzerGUI:
         ax_detail.legend(frameon=False)
         ax_detail.grid(True, alpha=0.25, linestyle='--')
 
+    def _get_comparison_palette(self, left_label: str, right_label: str) -> Tuple[str, str]:
+        """根据对比对象标签返回更符合语义的配色。"""
+        left_key = (left_label or "").lower()
+        right_key = (right_label or "").lower()
+        if "base" in left_key or "实验" in right_label or "exp" in right_key:
+            return self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']
+        return self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']
+
+    def _plot_dispersion_bar_chart(self,
+                                   ax,
+                                   left_group: dict,
+                                   right_group: dict,
+                                   stats_key: str,
+                                   title: str,
+                                   y_label: str,
+                                   value_fmt: str,
+                                   scale: float = 1.0,
+                                   test_result: Optional[dict] = None) -> None:
+        """绘制双对象分散指标柱状图。"""
+        left_label = left_group.get('label', '对象A')
+        right_label = right_group.get('label', '对象B')
+        left_stats = left_group.get(stats_key, self._summarize_numeric_series([]))
+        right_stats = right_group.get(stats_key, self._summarize_numeric_series([]))
+        left_color, right_color = self._get_comparison_palette(left_label, right_label)
+
+        values = [float(left_stats.get('mean', 0.0)) * scale, float(right_stats.get('mean', 0.0)) * scale]
+        errors = [float(left_stats.get('std', 0.0)) * scale, float(right_stats.get('std', 0.0)) * scale]
+        use_errorbar = any(error > 0 for error in errors)
+        bars = ax.bar(
+            [left_label, right_label],
+            values,
+            yerr=errors if use_errorbar else None,
+            capsize=6 if use_errorbar else 0,
+            color=[left_color, right_color],
+            alpha=0.9,
+        )
+        ax.set_title(title, color=self.MODERN_COLORS['text_primary'])
+        ax.set_ylabel(y_label, color=self.MODERN_COLORS['text_secondary'])
+        ax.grid(True, axis='y', alpha=0.25, linestyle='--')
+
+        max_value = max(values) if values else 0.0
+        top_padding = max(max_value * 0.18, 1.0 if scale == 1.0 else 3.0)
+        upper_bound = max_value + top_padding
+
+        if test_result is not None:
+            pvalue = self._get_preferred_pvalue(test_result)
+            if pvalue is not None:
+                marker = self._get_significance_marker(pvalue)
+                ax.text(
+                    0.5,
+                    max_value + top_padding * 0.25,
+                    f"p={self._format_pvalue(pvalue)} | {marker}",
+                    transform=ax.get_yaxis_transform(),
+                    ha='center',
+                    va='bottom',
+                    fontsize=8.5,
+                    color=self.MODERN_COLORS['text_primary'],
+                )
+                upper_bound += top_padding * 0.35
+
+        ax.set_ylim(0, upper_bound if upper_bound > 0 else (1.0 if scale == 1.0 else 10.0))
+        self._annotate_bar_values(ax, bars, fmt=value_fmt, offset_ratio=0.03)
+
+    def _format_representative_caption(self, group_summary: dict, representative_result: dict) -> str:
+        """生成代表图标题，聚焦分散数量与分散比例。"""
+        dispersed_stats = representative_result.get('dispersed_stats') or {}
+        total_count = int(round(float(representative_result.get('stats', {}).get('count', 0.0))))
+        dispersed_count = int(round(float(dispersed_stats.get('dispersed_count', total_count))))
+        dispersed_ratio = float(
+            dispersed_stats.get(
+                'dispersed_ratio',
+                1.0 if total_count > 0 and dispersed_count == total_count else 0.0,
+            )
+        )
+        return (
+            f"{group_summary.get('label', '对象')}典型分布\n"
+            f"{representative_result.get('name', '未命名图像')}\n"
+            f"分散CNT={dispersed_count} | 分散比例={dispersed_ratio:.1%}"
+        )
+
+    def _render_dispersion_comparison_dashboard(self,
+                                                left_group: dict,
+                                                right_group: dict,
+                                                summary_text: str,
+                                                tests: Optional[dict] = None) -> None:
+        """统一渲染双图/组别的分散对比面板。"""
+        left_typical = self._select_representative_result(left_group)
+        right_typical = self._select_representative_result(right_group)
+
+        left_display_image = self._prepare_comparison_display_image(left_typical.get('visualization'), max_width=1100, max_height=650)
+        right_display_image = self._prepare_comparison_display_image(right_typical.get('visualization'), max_width=1100, max_height=650)
+        stack_images = self._should_stack_comparison_images(left_display_image, right_display_image, threshold=1.65)
+        layout = self._build_comparison_layout(left_display_image, right_display_image, stacked=stack_images, variant='pair')
+        figure_width, figure_height = layout['figsize']
+        figure = Figure(figsize=(min(13.4, figure_width), min(11.2, figure_height)), dpi=92)
+        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
+
+        if stack_images:
+            grid_spec = figure.add_gridspec(
+                3,
+                2,
+                height_ratios=layout['height_ratios'],
+                hspace=layout['hspace'],
+                wspace=layout['wspace'],
+            )
+            ax_dispersed_count = figure.add_subplot(grid_spec[0, 0])
+            ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 1])
+            ax_left = figure.add_subplot(grid_spec[1, :])
+            ax_right = figure.add_subplot(grid_spec[2, :])
+        else:
+            grid_spec = figure.add_gridspec(
+                2,
+                2,
+                height_ratios=layout['height_ratios'],
+                hspace=layout['hspace'],
+                wspace=layout['wspace'],
+            )
+            ax_dispersed_count = figure.add_subplot(grid_spec[0, 0])
+            ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 1])
+            ax_left = figure.add_subplot(grid_spec[1, 0])
+            ax_right = figure.add_subplot(grid_spec[1, 1])
+        figure.subplots_adjust(**layout['adjust'])
+
+        dispersed_count_test = tests.get('dispersed_count') if tests else None
+        dispersed_ratio_test = tests.get('dispersed_ratio') if tests else None
+
+        self._plot_dispersion_bar_chart(
+            ax_dispersed_count,
+            left_group,
+            right_group,
+            'dispersed_count_stats',
+            '分散CNT数量对比',
+            '数量',
+            "{:.1f}",
+            test_result=dispersed_count_test,
+        )
+        self._plot_dispersion_bar_chart(
+            ax_dispersed_ratio,
+            left_group,
+            right_group,
+            'dispersed_ratio_stats',
+            '分散比例对比',
+            '比例 (%)',
+            "{:.1f}%",
+            scale=100.0,
+            test_result=dispersed_ratio_test,
+        )
+
+        self._configure_comparison_image_axis(
+            ax_left,
+            left_display_image,
+            self._format_representative_caption(left_group, left_typical),
+            spatial=left_typical.get('stats', {}).get('spatial_distribution'),
+        )
+        self._configure_comparison_image_axis(
+            ax_right,
+            right_display_image,
+            self._format_representative_caption(right_group, right_typical),
+            spatial=right_typical.get('stats', {}).get('spatial_distribution'),
+        )
+        self._render_comparison_figure(summary_text, figure)
+
     def _show_comparison_window(self,
                                 left_result: dict,
                                 right_result: dict,
@@ -3523,58 +4132,11 @@ class CNTAnalyzerGUI:
         """将双图对比结果显示到对比分析面板。"""
         left_result = self._ensure_result_visualization(left_result)
         right_result = self._ensure_result_visualization(right_result)
-        left_spatial = left_result['stats'].get('spatial_distribution') or {}
-        right_spatial = right_result['stats'].get('spatial_distribution') or {}
         summary_text = self._format_comparison_summary(left_result, right_result, left_label, right_label, note)
-        left_display_image = self._prepare_comparison_display_image(left_result.get('visualization'), max_width=1000, max_height=560)
-        right_display_image = self._prepare_comparison_display_image(right_result.get('visualization'), max_width=1000, max_height=560)
-        stack_images = self._should_stack_comparison_images(left_display_image, right_display_image, threshold=1.7)
-        layout = self._build_comparison_layout(left_display_image, right_display_image, stacked=stack_images, variant='pair')
-        pair_width, pair_height = layout['figsize']
-        figure = Figure(figsize=(min(13.2, pair_width), min(10.8, pair_height)), dpi=90)
-        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-        if stack_images:
-            grid_spec = figure.add_gridspec(3, 2, height_ratios=layout['height_ratios'], hspace=layout['hspace'], wspace=layout['wspace'])
-            ax_count = figure.add_subplot(grid_spec[0, 0])
-            ax_metric = figure.add_subplot(grid_spec[0, 1])
-            ax_left = figure.add_subplot(grid_spec[1, :])
-            ax_right = figure.add_subplot(grid_spec[2, :])
-        else:
-            grid_spec = figure.add_gridspec(2, 2, height_ratios=layout['height_ratios'], hspace=layout['hspace'], wspace=layout['wspace'])
-            ax_count = figure.add_subplot(grid_spec[0, 0])
-            ax_metric = figure.add_subplot(grid_spec[0, 1])
-            ax_left = figure.add_subplot(grid_spec[1, 0])
-            ax_right = figure.add_subplot(grid_spec[1, 1])
-        figure.subplots_adjust(**layout['adjust'])
-
-        counts = [left_result['stats']['count'], right_result['stats']['count']]
-        bars = ax_count.bar([left_label, right_label], counts, color=[self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']], alpha=0.9)
-        ax_count.set_title('CNT数量对比', color=self.MODERN_COLORS['text_primary'])
-        ax_count.set_ylabel('数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_count.grid(True, axis='y', alpha=0.25, linestyle='--')
-        count_top = max(counts) if counts else 1.0
-        ax_count.set_ylim(0, count_top * 1.28 if count_top > 0 else 1.0)
-        self._annotate_bar_values(ax_count, bars, fmt="{:.0f}", offset_ratio=0.03)
-
-        left_metrics = self._get_shadow_aggregation_metrics(left_spatial)
-        right_metrics = self._get_shadow_aggregation_metrics(right_spatial)
-        x = np.arange(2)
-        width = 0.35
-        left_bars = ax_metric.bar(x - width / 2, [left_metrics['score'], left_metrics['uniformity_score']], width, label=left_label, color=self.MODERN_COLORS['accent_teal'])
-        right_bars = ax_metric.bar(x + width / 2, [right_metrics['score'], right_metrics['uniformity_score']], width, label=right_label, color=self.MODERN_COLORS['accent_rose'])
-        ax_metric.set_xticks(x)
-        ax_metric.set_xticklabels(['阴影团聚', '均匀度'])
-        ax_metric.set_ylabel('得分 (0-100)', color=self.MODERN_COLORS['text_secondary'])
-        ax_metric.set_title('核心指标对比', color=self.MODERN_COLORS['text_primary'])
-        ax_metric.legend(frameon=False)
-        ax_metric.grid(True, axis='y', alpha=0.25, linestyle='--')
-        self._annotate_bar_values(ax_metric, left_bars, fmt="{:.1f}", offset_ratio=0.012)
-        self._annotate_bar_values(ax_metric, right_bars, fmt="{:.1f}", offset_ratio=0.012)
-        ax_metric.set_ylim(0, 100)
-
-        self._configure_comparison_image_axis(ax_left, left_display_image, f"{left_label}典型分布\n{left_result['name']}\nCNT={int(left_result['stats']['count'])}", spatial=left_spatial)
-        self._configure_comparison_image_axis(ax_right, right_display_image, f"{right_label}典型分布\n{right_result['name']}\nCNT={int(right_result['stats']['count'])}", spatial=right_spatial)
-        self._render_comparison_figure(summary_text, figure)
+        left_group = self._summarize_group_results(left_label, [left_result])
+        right_group = self._summarize_group_results(right_label, [right_result])
+        tests = self._compute_group_comparison_tests(left_group, right_group)
+        self._render_dispersion_comparison_dashboard(left_group, right_group, summary_text, tests)
 
     def _show_group_comparison_window(self,
                                       base_group: dict,
@@ -3583,50 +4145,8 @@ class CNTAnalyzerGUI:
                                       failures: Optional[List[str]] = None):
         """将 base 组与实验组的多图对比结果显示到对比分析面板。"""
         tests = self._compute_group_comparison_tests(base_group, exp_group)
-        base_typical = self._select_representative_result(base_group)
-        exp_typical = self._select_representative_result(exp_group)
         summary_text = self._format_group_comparison_summary(base_group, exp_group, note, failures)
-        base_display_image = self._prepare_comparison_display_image(base_typical.get('visualization'), max_width=1000, max_height=560)
-        exp_display_image = self._prepare_comparison_display_image(exp_typical.get('visualization'), max_width=1000, max_height=560)
-        stack_typical_images = self._should_stack_comparison_images(base_display_image, exp_display_image, threshold=1.8)
-        layout = self._build_comparison_layout(base_display_image, exp_display_image, stacked=stack_typical_images, variant='group')
-        figure_width, figure_height = layout['figsize']
-        figure = Figure(figsize=(min(13.8, figure_width), min(12.6, figure_height + (1.1 if stack_typical_images else 0.7))), dpi=88)
-        figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
-
-        if stack_typical_images:
-            base_ratios = layout['height_ratios']
-            grid_spec = figure.add_gridspec(5, 6, height_ratios=[max(1.0, base_ratios[0] + 0.20), max(0.72, base_ratios[1] * 0.95), max(0.72, base_ratios[1]), base_ratios[2], base_ratios[3]], hspace=max(layout['hspace'], 0.34), wspace=layout['wspace'])
-            ax_metric = figure.add_subplot(grid_spec[0, 0:6])
-            ax_mean = figure.add_subplot(grid_spec[1, 0:3])
-            ax_box = figure.add_subplot(grid_spec[1, 3:6])
-            ax_detail = figure.add_subplot(grid_spec[2, 0:6])
-            ax_base_typical = figure.add_subplot(grid_spec[3, 0:6])
-            ax_exp_typical = figure.add_subplot(grid_spec[4, 0:6])
-        else:
-            base_ratios = layout['height_ratios']
-            grid_spec = figure.add_gridspec(4, 6, height_ratios=[max(1.02, base_ratios[0] + 0.18), max(0.74, base_ratios[1] * 0.95), max(0.74, base_ratios[1]), base_ratios[2]], hspace=max(layout['hspace'], 0.32), wspace=layout['wspace'])
-            ax_metric = figure.add_subplot(grid_spec[0, 0:6])
-            ax_mean = figure.add_subplot(grid_spec[1, 0:3])
-            ax_box = figure.add_subplot(grid_spec[1, 3:6])
-            ax_detail = figure.add_subplot(grid_spec[2, 0:6])
-            ax_base_typical = figure.add_subplot(grid_spec[3, 0:3])
-            ax_exp_typical = figure.add_subplot(grid_spec[3, 3:6])
-        figure.subplots_adjust(**layout['adjust'])
-
-        base_count = base_group['count_stats']
-        exp_count = exp_group['count_stats']
-        mean_bars = ax_mean.bar(['base组', '实验组'], [base_count['mean'], exp_count['mean']], yerr=[base_count['std'], exp_count['std']], capsize=6, color=[self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']], alpha=0.9)
-        ax_mean.set_title('每图CNT数量均值 ± 标准差', color=self.MODERN_COLORS['text_primary'])
-        ax_mean.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
-        ax_mean.grid(True, axis='y', alpha=0.25, linestyle='--')
-        self._annotate_bar_values(ax_mean, mean_bars, fmt="{:.1f}", offset_ratio=0.03)
-
-        self._plot_group_aggregation_risk_chart(ax_metric, base_group, exp_group, tests)
-        self._render_group_count_distribution_views(ax_box, ax_detail, base_group, exp_group, tests['count'])
-        self._configure_comparison_image_axis(ax_base_typical, base_display_image, f"base组典型分布\n{base_typical['name']}\nCNT={int(base_typical['stats']['count'])}", spatial=base_typical['stats'].get('spatial_distribution'))
-        self._configure_comparison_image_axis(ax_exp_typical, exp_display_image, f"实验组典型分布\n{exp_typical['name']}\nCNT={int(exp_typical['stats']['count'])}", spatial=exp_typical['stats'].get('spatial_distribution'))
-        self._render_comparison_figure(summary_text, figure)
+        self._render_dispersion_comparison_dashboard(base_group, exp_group, summary_text, tests)
 
     def _format_dispersion_summary_lines(self,
                                          label: str,
@@ -3708,7 +4228,7 @@ class CNTAnalyzerGUI:
             lines.extend([note, ""])
 
         lines.extend([
-            self._format_compact_params(),
+            self._format_compare_fixed_params(),
             "",
             "CNT数量",
             (
@@ -3831,7 +4351,7 @@ class CNTAnalyzerGUI:
             lines.extend([note, ""])
 
         lines.extend([
-            self._format_compact_params(),
+            self._format_compare_fixed_params(),
             "",
             "CNT数量",
             f"{left_label}: {left_result['name']} | CNT={left_count}",
@@ -3924,7 +4444,7 @@ class CNTAnalyzerGUI:
         ).pack(anchor='w')
         tk.Label(
             header,
-            text="所有模式都会严格使用当前界面上的同一组识别参数；区别只在于选图方式和统计粒度。",
+            text="对比分析会固定使用 9/11/3 预处理参数，并仅分析中部 75% 区域；长度、长宽比、策略、拆分与合并条件仍沿用当前界面设置。",
             font=('Segoe UI', 9),
             bg=self.MODERN_COLORS['bg_secondary'],
             fg=self.MODERN_COLORS['text_secondary'],
@@ -3942,13 +4462,13 @@ class CNTAnalyzerGUI:
         modes = [
             (
                 "任意两图对比",
-                "手动选择两张图，在相同识别条件下比较 CNT 数量、阴影团聚、均匀度和典型分布。",
+                "手动选择两张图，在相同识别条件下比较分散CNT数量、分散比例和典型分布。",
                 "选择两张图",
                 self._compare_two_images,
             ),
             (
                 "组别统计对比",
-                "分别选择 base 组和实验组的多张图，输出 CNT 数量、核心指标均值、显著性检验和典型分布。",
+                "分别选择 base 组和实验组的多张图，输出分散CNT数量、分散比例、显著性检验和典型分布。",
                 "选择两组图",
                 self._compare_image_groups,
             ),
@@ -3995,6 +4515,23 @@ class CNTAnalyzerGUI:
         footer.pack(fill=tk.X, padx=16, pady=(0, 14))
         ttk.Button(footer, text="关闭", command=window.destroy).pack(side=tk.RIGHT)
 
+    def _invoke_compare_batch_analysis(self,
+                                       image_paths: List[str],
+                                       group_label: str,
+                                       include_visualization: bool = True) -> Tuple[List[dict], List[str]]:
+        """Analyze compare inputs under the fixed comparison context while remaining compatible with test doubles."""
+        analyze_image_files = self._analyze_image_files
+        compare_context = self._build_compare_analysis_context()
+        signature = inspect.signature(analyze_image_files).parameters
+        kwargs = {}
+        if 'context' in signature:
+            kwargs['context'] = compare_context
+        if 'include_visualization' in signature:
+            kwargs['include_visualization'] = include_visualization
+        if 'preview_visualization' in signature:
+            kwargs['preview_visualization'] = include_visualization
+        return analyze_image_files(image_paths, group_label, **kwargs)
+
     def _compare_image_groups(self):
         """按组批量选择图像并进行组别对比"""
         initial_dir = self._get_compare_initial_dir()
@@ -4026,15 +4563,22 @@ class CNTAnalyzerGUI:
             return
 
         try:
-            base_results, base_failures = self._analyze_image_files(base_paths, "base组")
-            exp_results, exp_failures = self._analyze_image_files(exp_paths, "实验组")
+            base_results, base_failures = self._invoke_compare_batch_analysis(base_paths, "base组", include_visualization=False)
+            exp_results, exp_failures = self._invoke_compare_batch_analysis(exp_paths, "实验组", include_visualization=False)
 
             failures = base_failures + exp_failures
             base_group = self._summarize_group_results("base组", base_results)
             exp_group = self._summarize_group_results("实验组", exp_results)
 
-            note = "本次组别对比严格使用当前界面上的同一组识别条件；第一组按 base组 统计，第二组按 实验组 统计。"
+            note = (
+                f"本次组别对比固定使用预处理 {int(CALIBRATED_BLUR_KERNEL)}/{int(CALIBRATED_ADAPTIVE_BLOCK)}/{int(CALIBRATED_ADAPTIVE_C)}，"
+                "并仅分析中部 75% 区域以避开比例尺区域干扰；"
+                "其余识别条件沿用当前界面设置，第一组按 base组 统计，第二组按 实验组 统计。"
+            )
             self._show_group_comparison_window(base_group, exp_group, note, failures)
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
+            logger.exception("组别对比失败")
+            messagebox.showerror("错误", f"组别对比失败: {e}")
         except Exception as e:
             logger.exception("组别对比失败")
             messagebox.showerror("错误", f"组别对比失败: {e}")
@@ -4067,10 +4611,22 @@ class CNTAnalyzerGUI:
             return
 
         try:
-            left_result = self._analyze_image_file(left_path, include_visualization=True)
-            right_result = self._analyze_image_file(right_path, include_visualization=True)
-            note = "本次双图对比严格使用当前界面上的同一组识别条件。"
+            results, failures = self._invoke_compare_batch_analysis([left_path, right_path], "双图对比", include_visualization=True)
+            result_by_path = {str(Path(result['path']).resolve()): result for result in results}
+            left_result = result_by_path.get(str(Path(left_path).resolve()))
+            right_result = result_by_path.get(str(Path(right_path).resolve()))
+            if left_result is None or right_result is None:
+                failure_text = "；".join(failures) if failures else "两张图像中至少有一张未成功完成分析"
+                raise ValueError(f"双图对比需要两张图都分析成功: {failure_text}")
+            note = (
+                f"本次双图对比固定使用预处理 {int(CALIBRATED_BLUR_KERNEL)}/{int(CALIBRATED_ADAPTIVE_BLOCK)}/{int(CALIBRATED_ADAPTIVE_C)}，"
+                "并仅分析中部 75% 区域以避开比例尺区域干扰；"
+                "其余识别条件沿用当前界面设置。"
+            )
             self._show_comparison_window(left_result, right_result, "图像A", "图像B", note)
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
+            logger.exception("双图对比失败")
+            messagebox.showerror("错误", f"双图对比失败: {e}")
         except Exception as e:
             logger.exception("双图对比失败")
             messagebox.showerror("错误", f"双图对比失败: {e}")

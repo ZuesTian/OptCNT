@@ -19,6 +19,9 @@ class _DummyVar:
     def get(self):
         return self._value
 
+    def set(self, value):
+        self._value = value
+
 
 class _DummyWidget:
     def __init__(self, width: int):
@@ -135,10 +138,13 @@ def _make_gui_stub() -> CNTAnalyzerGUI:
     gui.adaptive_c_var = _DummyVar(3)
     gui.bridge_strength_var = _DummyVar(2)
     gui.min_length_um_var = _DummyVar(4.0)
+    gui.max_length_um_var = _DummyVar(200.0)
     gui.min_slenderness_var = _DummyVar(3.0)
     gui.detect_profile_var = _DummyVar("标准（推荐）")
     gui.split_mode_var = _DummyVar("不拆分")
     gui.merge_distance_px_var = _DummyVar(6)
+    gui.scale_um_var = _DummyVar(10.0)
+    gui.scale_pixels_var = _DummyVar(0.0)
     return gui
 
 
@@ -301,6 +307,26 @@ def test_apply_scale_forces_preprocess_refresh_in_preprocess_mode(monkeypatch):
     assert sync_calls == [True]
 
 
+def test_auto_suggest_params_returns_none_for_expected_errors():
+    gui = _make_gui_stub()
+    gui.current_roi = None
+    gui._last_auto_suggest_result = {"blur_kernel": 7}
+    gui.analyzer = SimpleNamespace(
+        suggest_preprocess_params=lambda **kwargs: (_ for _ in ()).throw(ValueError("invalid image")),
+    )
+    gui.control_panel = SimpleNamespace(
+        update_blur_label=lambda value: None,
+        update_block_label=lambda value: None,
+        update_c_label=lambda value: None,
+    )
+    gui._refresh_analysis_status_ui = lambda: None
+
+    result = gui._auto_suggest_params()
+
+    assert result is None
+    assert gui._last_auto_suggest_result is None
+
+
 def test_format_compact_params_uses_short_layout():
     gui = _make_gui_stub()
 
@@ -418,7 +444,7 @@ def test_format_comparison_summary_uses_compact_text():
 
     summary = gui._format_comparison_summary(left_result, right_result, "样品A", "样品B")
 
-    assert summary.startswith("识别参数: ")
+    assert summary.startswith("对比固定预处理: 模糊9/块11/C3")
     assert "CNT数量" in summary
     assert "样品A: left | CNT=48" in summary
     assert "样品B: right | CNT=41" in summary
@@ -506,7 +532,7 @@ def test_fit_comparison_figure_to_frame_can_expand_after_narrow_first_render():
     gui._fit_comparison_figure_to_frame(figure, _DummyWidget(1113), allow_expand=True)
 
     width_px = figure.get_figwidth() * figure.dpi
-    assert 1080 <= width_px <= 1136
+    assert 680 <= width_px <= 690
 
 
 def test_calculate_pane_widths_prefers_center_column():
@@ -530,6 +556,81 @@ def test_calculate_pane_widths_gives_comparison_tab_more_center_space():
     assert comparison_widths[1] > image_widths[1]
     assert comparison_widths[0] < image_widths[0]
     assert comparison_widths[2] < image_widths[2]
+
+
+def test_build_comparison_layout_uses_stable_presets():
+    gui = _make_gui_stub()
+
+    pair_stacked = gui._build_comparison_layout(stacked=True, variant='pair')
+    group_side_by_side = gui._build_comparison_layout(stacked=False, variant='group')
+
+    assert pair_stacked['figsize'] == (13.4, 11.5)
+    assert pair_stacked['height_ratios'] == [0.75, 1.6, 1.6]
+    assert group_side_by_side['figsize'] == (14.5, 11.8)
+    assert group_side_by_side['height_ratios'] == [0.90, 0.80, 1.5]
+
+
+def test_show_comparison_window_renders_only_dispersion_charts():
+    gui = _make_gui_stub()
+    captured = {}
+
+    left_result = _make_result("left", 28.0, 61.0, 60.0, 62.0, 61.0, 0.4, 0.38, 0.22)
+    right_result = _make_result("right", 34.0, 55.0, 53.0, 56.0, 55.0, 0.47, 0.44, 0.35)
+    left_result["visualization"] = np.zeros((120, 180, 3), dtype=np.uint8)
+    right_result["visualization"] = np.zeros((120, 180, 3), dtype=np.uint8)
+
+    gui._render_comparison_figure = lambda summary_text, figure: captured.update({"summary": summary_text, "figure": figure})
+
+    gui._show_comparison_window(left_result, right_result, "图像A", "图像B")
+
+    titles = [ax.get_title() for ax in captured["figure"].axes]
+    assert titles[:2] == ["分散CNT数量对比", "分散比例对比"]
+    assert len(captured["figure"].axes) == 4
+
+
+def test_show_group_comparison_window_reuses_dispersion_dashboard():
+    gui = _make_gui_stub()
+    captured = {}
+
+    base_results = _make_group_results(
+        "base",
+        [
+            (30.0, 58.0, 57.0, 59.0, 58.0, 0.26),
+            (32.0, 56.0, 55.0, 57.0, 56.0, 0.24),
+        ],
+    )
+    exp_results = _make_group_results(
+        "exp",
+        [
+            (36.0, 62.0, 61.0, 63.0, 62.0, 0.18),
+            (35.0, 64.0, 63.0, 65.0, 64.0, 0.16),
+        ],
+    )
+    for index, result in enumerate(base_results):
+        result["path"] = rf"C:\tmp\base_{index}.png"
+        result["visualization"] = np.zeros((120, 180, 3), dtype=np.uint8)
+    for index, result in enumerate(exp_results):
+        result["path"] = rf"C:\tmp\exp_{index}.png"
+        result["visualization"] = np.zeros((120, 180, 3), dtype=np.uint8)
+
+    base_group = gui._summarize_group_results("base组", base_results)
+    exp_group = gui._summarize_group_results("实验组", exp_results)
+    gui._render_comparison_figure = lambda summary_text, figure: captured.update({"summary": summary_text, "figure": figure})
+
+    gui._show_group_comparison_window(base_group, exp_group)
+
+    titles = [ax.get_title() for ax in captured["figure"].axes]
+    assert titles[:2] == ["分散CNT数量对比", "分散比例对比"]
+    assert len(captured["figure"].axes) == 4
+
+
+def test_prepare_comparison_display_image_skips_near_identity_resize():
+    gui = _make_gui_stub()
+    image = np.zeros((620, 1000, 3), dtype=np.uint8)
+
+    prepared = gui._prepare_comparison_display_image(image, max_width=1100, max_height=650)
+
+    assert prepared is image
 
 
 def test_estimate_comparison_summary_height_stays_compact():
@@ -783,6 +884,36 @@ def test_update_results_prioritizes_dispersed_statistics_for_primary_summary():
     assert len(gui.result_panel.rows) == 3
 
 
+def test_update_results_falls_back_to_base_statistics_when_dispersed_stats_fail():
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    gui.current_roi = None
+    gui.result_panel = _DummyResultPanelState()
+    measurements = [
+        SimpleNamespace(id=1, length_um=10.0, width_median_um=0.4, width_iqr_um=0.1),
+        SimpleNamespace(id=2, length_um=12.0, width_median_um=0.5, width_iqr_um=0.2),
+    ]
+    gui._get_active_measurements = lambda: measurements
+    gui.analyzer = SimpleNamespace(
+        get_statistics=lambda roi=None: {
+            "count": 2,
+            "length_mean": 11.0,
+            "length_std": 1.0,
+            "length_min": 10.0,
+            "length_max": 12.0,
+            "length_distribution": {"A": 2},
+            "spatial_distribution": {},
+        },
+        get_dispersed_statistics=lambda roi=None: (_ for _ in ()).throw(ValueError("bad dispersed stats")),
+    )
+
+    gui._update_results()
+
+    text = gui.result_panel.stats_text.getvalue()
+    assert "2\n\n" in text
+    assert "11.00" in text
+    assert len(gui.result_panel.rows) == 2
+
+
 def test_analyze_image_files_reuses_cache_and_dispatches_only_uncached_tasks():
     gui = _make_gui_stub()
     gui._analysis_cache = OrderedDict()
@@ -864,6 +995,220 @@ def test_run_group_analysis_tasks_falls_back_to_sequential_when_thread_pool_fail
     assert [item[2] for item in results] == [None, None]
 
 
+def test_run_group_analysis_task_collects_expected_analysis_errors():
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    gui._run_image_analysis = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("bad image"))
+
+    result = gui._run_group_analysis_task(
+        (3, r"C:\tmp\broken.png"),
+        {"preprocess_settings": {}, "detect_settings": {}, "scale_um": 10.0, "manual_scale_pixels": 0.0},
+    )
+
+    assert result == (3, None, "broken.png: bad image")
+
+
+def test_compare_two_images_uses_batch_analysis_pipeline(monkeypatch):
+    gui = _make_gui_stub()
+    gui._get_compare_initial_dir = lambda: r"C:\tmp"
+    gui._get_supported_image_filetypes = lambda: [("图像文件", "*.png")]
+
+    selected_paths = iter([r"C:\tmp\a.png", r"C:\tmp\b.png"])
+    monkeypatch.setattr(gui_module.filedialog, "askopenfilename", lambda **kwargs: next(selected_paths))
+
+    calls = []
+    left_result = _make_batch_analysis_result(r"C:\tmp\a.png", 12.0)
+    right_result = _make_batch_analysis_result(r"C:\tmp\b.png", 15.0)
+    left_result["visualization"] = np.zeros((32, 48, 3), dtype=np.uint8)
+    right_result["visualization"] = np.zeros((32, 48, 3), dtype=np.uint8)
+    left_result["dispersed_stats"] = {"dispersed_count": 8, "agglomerated_count": 4, "dispersed_ratio": 8 / 12}
+    right_result["dispersed_stats"] = {"dispersed_count": 9, "agglomerated_count": 6, "dispersed_ratio": 9 / 15}
+
+    def _fake_analyze_image_files(paths, group_label):
+        calls.append((list(paths), group_label))
+        return [left_result, right_result], []
+
+    rendered = []
+    gui._analyze_image_files = _fake_analyze_image_files
+    gui._analyze_image_file = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not call single-image analysis"))
+    gui._show_comparison_window = lambda left, right, left_label, right_label, note=None: rendered.append(
+        (left["path"], right["path"], left_label, right_label)
+    )
+
+    gui._compare_two_images()
+
+    assert calls == [([r"C:\tmp\a.png", r"C:\tmp\b.png"], "双图对比")]
+    assert rendered == [(r"C:\tmp\a.png", r"C:\tmp\b.png", "图像A", "图像B")]
+
+
+def test_build_compare_analysis_context_freezes_preprocess_triplet():
+    gui = _make_gui_stub()
+    gui.max_length_um_var = _DummyVar(200.0)
+    gui.scale_um_var = _DummyVar(10.0)
+    gui.scale_pixels_var = _DummyVar(0.0)
+    gui._get_detection_profile_key = lambda: "balanced"
+
+    gui.blur_kernel_var.set(15)
+    gui.adaptive_block_var.set(21)
+    gui.adaptive_c_var.set(5)
+    gui.bridge_strength_var.set(4)
+
+    context = gui._build_compare_analysis_context()
+
+    assert context["preprocess_settings"] == {
+        "blur_kernel": 9,
+        "adaptive_block": 11,
+        "adaptive_c": 3,
+        "bridge_strength": 4,
+        "threshold_invert": True,
+    }
+    assert context["detect_settings"]["min_length_um"] == pytest.approx(4.0)
+    assert context["detect_settings"]["max_length_um"] == pytest.approx(200.0)
+    assert context["detect_settings"]["min_slenderness"] == pytest.approx(3.0)
+    assert context["analysis_roi"] == {
+        "mode": "center_fraction",
+        "fraction": 0.75,
+        "label": "中部75%区域",
+    }
+    assert context["scale_detection"] == {"recognize_text": False}
+
+
+def test_invoke_compare_batch_analysis_passes_fixed_context_when_supported():
+    gui = _make_gui_stub()
+    gui.max_length_um_var = _DummyVar(200.0)
+    gui.scale_um_var = _DummyVar(10.0)
+    gui.scale_pixels_var = _DummyVar(0.0)
+    gui._get_detection_profile_key = lambda: "balanced"
+
+    captured = {}
+
+    def _fake_analyze(paths, group_label, context=None):
+        captured["paths"] = list(paths)
+        captured["group_label"] = group_label
+        captured["context"] = context
+        return [], []
+
+    gui._analyze_image_files = _fake_analyze
+
+    gui._invoke_compare_batch_analysis([r"C:\tmp\a.png"], "双图对比")
+
+    assert captured["paths"] == [r"C:\tmp\a.png"]
+    assert captured["group_label"] == "双图对比"
+    assert captured["context"]["preprocess_settings"]["blur_kernel"] == 9
+    assert captured["context"]["preprocess_settings"]["adaptive_block"] == 11
+    assert captured["context"]["preprocess_settings"]["adaptive_c"] == 3
+    assert captured["context"]["analysis_roi"]["fraction"] == pytest.approx(0.75)
+    assert captured["context"]["scale_detection"]["recognize_text"] is False
+
+
+def test_invoke_compare_batch_analysis_can_skip_visualization_for_group_mode():
+    gui = _make_gui_stub()
+    gui.max_length_um_var = _DummyVar(200.0)
+    gui.scale_um_var = _DummyVar(10.0)
+    gui.scale_pixels_var = _DummyVar(0.0)
+    gui._get_detection_profile_key = lambda: "balanced"
+
+    captured = {}
+
+    def _fake_analyze(paths, group_label, context=None, include_visualization=True, preview_visualization=True):
+        captured["paths"] = list(paths)
+        captured["group_label"] = group_label
+        captured["context"] = context
+        captured["include_visualization"] = include_visualization
+        captured["preview_visualization"] = preview_visualization
+        return [], []
+
+    gui._analyze_image_files = _fake_analyze
+
+    gui._invoke_compare_batch_analysis([r"C:\tmp\a.png"], "base组", include_visualization=False)
+
+    assert captured["paths"] == [r"C:\tmp\a.png"]
+    assert captured["group_label"] == "base组"
+    assert captured["include_visualization"] is False
+    assert captured["preview_visualization"] is False
+
+
+def test_get_group_analysis_worker_count_uses_conservative_cap(monkeypatch):
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+
+    monkeypatch.setattr(gui_module.os, "cpu_count", lambda: 32)
+    assert gui._get_group_analysis_worker_count(20) == 8
+    assert gui._get_group_analysis_worker_count(3) == 3
+
+    monkeypatch.setattr(gui_module.os, "cpu_count", lambda: 2)
+    assert gui._get_group_analysis_worker_count(10) == 1
+
+
+def test_run_image_analysis_uses_center_roi_and_crops_visualization_for_compare_context(monkeypatch):
+    captured = {}
+
+    class _DummyAnalyzer:
+        def __init__(self):
+            self.image = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        def load_image(self, path):
+            captured["path"] = path
+
+        def apply_detected_scale(self, default_micrometers, recognize_text=True):
+            captured["scale_um"] = default_micrometers
+            captured["recognize_text"] = recognize_text
+            return {"applied": True, "scale_info": {"pixels": 100}}
+
+        def preprocess(self, roi=None, **kwargs):
+            captured["preprocess_roi"] = roi
+
+        def detect_cnts_hybrid(self, roi=None, **kwargs):
+            captured["detect_roi"] = roi
+            return []
+
+        def get_statistics(self, roi=None):
+            captured["stats_roi"] = roi
+            return {"count": 0}
+
+        def get_dispersed_statistics(self, roi=None):
+            captured["dispersed_roi"] = roi
+            return {"dispersed_count": 0, "agglomerated_count": 0, "dispersed_ratio": 0.0}
+
+        def get_visualization(self, roi=None):
+            captured["visualization_roi"] = roi
+            return np.zeros((200, 400, 3), dtype=np.uint8)
+
+        def get_scale_status(self):
+            return {"source": "auto_detected"}
+
+    monkeypatch.setattr(gui_module, "CNTAnalyzer", _DummyAnalyzer)
+
+    gui = _make_gui_stub()
+    gui._prepare_comparison_display_image = lambda image, max_width=1000, max_height=560: image
+
+    context = {
+        "preprocess_settings": {"blur_kernel": 9, "adaptive_block": 11, "adaptive_c": 3, "bridge_strength": 0, "threshold_invert": True},
+        "detect_settings": {"min_length_um": 4.0, "max_length_um": 200.0, "min_slenderness": 3.0, "detection_profile": "balanced", "merge_distance_px": 0.0, "split_mode": "off", "roi": None},
+        "scale_um": 10.0,
+        "manual_scale_pixels": 0.0,
+        "analysis_roi": {"mode": "center_fraction", "fraction": 0.75, "label": "中部75%区域"},
+        "scale_detection": {"recognize_text": False},
+    }
+
+    result = gui._run_image_analysis(r"C:\tmp\sample.png", context, include_visualization=True, preview_visualization=True)
+
+    roi = captured["detect_roi"]
+    assert roi is not None
+    assert (roi.x, roi.y, roi.width, roi.height) == (50, 25, 300, 150)
+    assert captured["preprocess_roi"] is roi
+    assert captured["stats_roi"] is roi
+    assert captured["dispersed_roi"] is roi
+    assert captured["visualization_roi"] is roi
+    assert captured["recognize_text"] is False
+    assert result["visualization"].shape == (150, 300, 3)
+    assert result["analysis_roi"] == {
+        "name": "中部75%区域",
+        "x": 50,
+        "y": 25,
+        "width": 300,
+        "height": 150,
+    }
+
+
 def test_analyze_image_files_stores_visualization_preview_for_group_results():
     gui = _make_gui_stub()
     gui._analysis_cache = OrderedDict()
@@ -932,3 +1277,38 @@ def test_select_representative_result_reuses_existing_visualization_without_rean
     selected = gui._select_representative_result(group_summary)
 
     assert selected is representative
+
+
+def test_select_representative_result_reuses_stored_compare_context_for_visualization():
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    context = {"token": "compare"}
+    representative = _make_batch_analysis_result(r"C:\tmp\rep.png", 20.0)
+    representative["name"] = "rep.png"
+    representative["analysis_context"] = context
+    other = _make_batch_analysis_result(r"C:\tmp\other.png", 18.0)
+    other["name"] = "other.png"
+    other["analysis_context"] = context
+
+    group_summary = {
+        "label": "base组",
+        "results": [representative, other],
+        "file_details": [
+            {"name": "rep.png", "shadow_aggregation_score": 40.0, "uniformity_score": 60.0},
+            {"name": "other.png", "shadow_aggregation_score": 55.0, "uniformity_score": 45.0},
+        ],
+        "spatial_stats": {
+            "shadow_aggregation_score": {"mean": 41.0, "std": 4.0},
+            "uniformity_score": {"mean": 59.0, "std": 4.0},
+        },
+    }
+
+    calls = []
+    gui._build_compare_analysis_context = lambda: (_ for _ in ()).throw(AssertionError("should reuse stored context"))
+    gui._analyze_image_with_context = lambda path, used_context, include_visualization=False, preview_visualization=True: (
+        calls.append((path, used_context, include_visualization, preview_visualization)) or {**representative, "visualization": np.zeros((8, 12, 3), dtype=np.uint8)}
+    )
+
+    selected = gui._select_representative_result(group_summary)
+
+    assert selected["visualization"] is not None
+    assert calls == [(r"C:\tmp\rep.png", context, True, True)]

@@ -1077,12 +1077,21 @@ class AdvancedAnalysisPanel(ScrollableDashboardPanel):
 class ComparisonAnalysisPanel(ScrollableDashboardPanel):
     """对比分析面板 - 显示双图/组别对比摘要与图表"""
 
+    def __init__(self, parent: tk.Widget, colors: dict, **kwargs):
+        self.progress_container: Optional[ttk.Frame] = None
+        self.progress_bar: Optional[ttk.Progressbar] = None
+        self.progress_label: Optional[tk.Label] = None
+        super().__init__(parent, colors, **kwargs)
+
     def _setup_sections(self) -> None:
         """设置对比分析布局"""
+        # 进度条容器（初始隐藏）
+        self._create_progress_container()
+        
         self._create_text_container(
             "comparison_summary",
             "对比分析摘要",
-            "尚未执行对比分析。使用顶部“对比分析”按钮后，结果会显示在这里。",
+            '尚未执行对比分析。使用顶部"对比分析"按钮后，结果会显示在这里。',
             height=160,
             title_color=self.colors['accent_amber'],
         )
@@ -1093,3 +1102,81 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
             placeholder="尚未生成对比图表。",
             title_color=self.colors['accent_amber'],
         )
+
+    def _create_progress_container(self) -> None:
+        """创建进度条容器"""
+        if self.inner_frame is None:
+            return
+
+        container = ttk.Frame(self.inner_frame, style='Card.TFrame')
+        container.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        container.pack_forget()  # 初始隐藏
+
+        ttk.Label(
+            container,
+            text="正在分析图像...",
+            font=('Segoe UI', 10, 'bold'),
+            foreground=self.colors['accent_primary'],
+        ).pack(anchor=tk.W, padx=5, pady=5)
+
+        progress_frame = ttk.Frame(container, style='Card.TFrame')
+        progress_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            mode='determinate',
+            length=400,
+            style='Horizontal.TProgressbar'
+        )
+        self.progress_bar.pack(fill=tk.X, pady=(0, 5))
+
+        self.progress_label = tk.Label(
+            progress_frame,
+            text="准备开始...",
+            bg=self.colors['bg_secondary'],
+            fg=self.colors['text_secondary'],
+            font=('Segoe UI', 9),
+        )
+        self.progress_label.pack(anchor=tk.W)
+
+        self.progress_container = container
+
+    def show_progress(self) -> None:
+        """显示进度条"""
+        if self.progress_container is not None:
+            summary_container = self.section_containers.get('comparison_summary')
+            if summary_container is not None:
+                self.progress_container.pack(fill=tk.X, expand=False, padx=10, pady=10, before=summary_container)
+            else:
+                self.progress_container.pack(fill=tk.X, expand=False, padx=10, pady=10)
+            if self.progress_bar is not None:
+                self.progress_bar['value'] = 0
+            if self.progress_label is not None:
+                self.progress_label.config(text="准备开始...")
+            self.refresh_layout()
+
+    def hide_progress(self) -> None:
+        """隐藏进度条"""
+        if self.progress_container is not None:
+            self.progress_container.pack_forget()
+            self.refresh_layout()
+
+    def update_progress(self, current: int, total: int, message: str = "") -> None:
+        """更新进度条
+        
+        Args:
+            current: 当前完成数量
+            total: 总数量
+            message: 进度消息
+        """
+        if self.progress_bar is not None and total > 0:
+            progress = (current / total) * 100
+            self.progress_bar['value'] = progress
+        
+        if self.progress_label is not None:
+            if message:
+                self.progress_label.config(text=f"{message} ({current}/{total})")
+            else:
+                self.progress_label.config(text=f"已完成 {current}/{total} 张图像")
+        
+        self.update_idletasks()

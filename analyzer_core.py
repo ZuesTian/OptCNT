@@ -17,10 +17,19 @@ from utils import (
     SCALE_BAR_OCR_MATCH_THRESHOLD, SCALE_BAR_OCR_EARLY_STOP_SCORE,
     SCALE_BAR_VALUE_RANGE, SCALE_BAR_DEFAULT_UM,
     ANALYSIS_BLACKHAT_KERNEL, CALIBRATED_BLUR_KERNEL,
-    CALIBRATED_ADAPTIVE_BLOCK, CALIBRATED_ADAPTIVE_C, SKELETON_ANGLE_THRESHOLDS,
+    CALIBRATED_ADAPTIVE_BLOCK, CALIBRATED_ADAPTIVE_C,
+    PREPROCESS_NOISE_LOW_THRESHOLD, PREPROCESS_NOISE_HIGH_THRESHOLD,
+    SKELETON_ANGLE_THRESHOLDS,
     SKELETON_WALK_ANGLE_DEG,
     CNT_MERGE_MAX_ANGLE_DIFF_DEG, CNT_MERGE_MAX_ALIGNMENT_DEG,
-    LENGTH_DISTRIBUTION_BINS_UM, LENGTH_DISTRIBUTION_LABELS
+    LENGTH_DISTRIBUTION_BINS_UM, LENGTH_DISTRIBUTION_LABELS,
+    SPATIAL_HOTSPOT_POINT_PERCENTILE, SPATIAL_HOTSPOT_COVERAGE_PERCENTILE,
+    SPATIAL_HOTSPOT_SHADOW_PERCENTILE, SPATIAL_HOTSPOT_POINT_WEIGHT,
+    SPATIAL_HOTSPOT_COVERAGE_WEIGHT, SPATIAL_HOTSPOT_SHADOW_WEIGHT,
+    SPATIAL_HOTSPOT_ACTIVE_SCORE_RANGE_MIN, SPATIAL_HOTSPOT_MASK_PERCENTILE_LARGE,
+    SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL, SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE,
+    SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL, SPATIAL_HOTSPOT_OVERLAP_RATIO_THRESHOLD,
+    SPATIAL_HOTSPOT_MASK_UPSAMPLE,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,10 +177,11 @@ class CNTAnalyzer:
                                     text_rect: Optional[tuple] = None) -> tuple:
         """根据比例尺条位置构建固定排除区域"""
         height, width = image_shape[:2]
-        pad_x = max(14, int(bar_w * 0.45))
-        pad_top = max(28, int(max(bar_h * 9, bar_w * 0.65)))
+        # 增大padding以完全覆盖比例尺边缘及形态学操作的扩散效应
+        pad_x = max(20, int(bar_w * 0.8))
+        pad_top = max(40, int(max(bar_h * 12, bar_w * 0.9)))
         # 比例尺文字更常出现在横线下方，因此下方排除区比上方更宽裕
-        pad_bottom = max(34, int(max(bar_h * 14, bar_w * 0.95)))
+        pad_bottom = max(50, int(max(bar_h * 18, bar_w * 1.2)))
 
         x1 = max(0, bar_x - pad_x)
         x2 = min(width, bar_x + bar_w + pad_x)
@@ -353,9 +363,11 @@ class CNTAnalyzer:
         ocr_hint = None if not self.scale_bar_info else self.scale_bar_info.get('micrometers')
         self._update_scale_status(source, confidence, pixels, micrometers, ocr_hint)
 
-    def apply_detected_scale(self, default_micrometers: float = SCALE_BAR_DEFAULT_UM) -> dict:
+    def apply_detected_scale(self,
+                             default_micrometers: float = SCALE_BAR_DEFAULT_UM,
+                             recognize_text: bool = True) -> dict:
         """自动检测并按默认物理长度应用比例尺"""
-        scale_info = self.detect_scale_bar()
+        scale_info = self.detect_scale_bar(recognize_text=recognize_text)
         if scale_info is not None and float(scale_info.get('pixels', 0)) > 0:
             pixels = float(scale_info['pixels'])
             self.set_scale(pixels, default_micrometers)
@@ -638,7 +650,7 @@ class CNTAnalyzer:
             
         return self._parse_scale_value(text)
 
-    def detect_scale_bar(self) -> Optional[dict]:
+    def detect_scale_bar(self, recognize_text: bool = True) -> Optional[dict]:
         """检测图像中的比例尺"""
         image = self.original_image if self.original_image is not None else self._get_analysis_image()
         h, w = image.shape[:2]
@@ -665,7 +677,11 @@ class CNTAnalyzer:
 
         text_rect = self._find_scale_text_rect(image, bar_x, bar_y, bar_w, bar_h)
         text_roi = None if text_rect is None else image[text_rect[1]:text_rect[3], text_rect[0]:text_rect[2]]
-        micrometers = self._recognize_scale_value(text_roi) if text_roi is not None else None
+        micrometers = (
+            self._recognize_scale_value(text_roi)
+            if recognize_text and text_roi is not None else
+            None
+        )
         exclusion_rect = self._build_scale_exclusion_rect(
             image.shape,
             bar_x,
@@ -813,10 +829,10 @@ class CNTAnalyzer:
 
         laplacian = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
         noise_score = float(np.sqrt(max(float(np.var(laplacian[valid_mask])), 0.0)) / contrast_span)
-        if noise_score >= 2.25:
+        if noise_score >= PREPROCESS_NOISE_HIGH_THRESHOLD:
             blur_kernel += 2
             reasons.append(f"高频噪点偏多（噪点指标 {noise_score:.2f}），模糊核加大 2。")
-        elif noise_score <= 1.75:
+        elif noise_score <= PREPROCESS_NOISE_LOW_THRESHOLD:
             blur_kernel -= 2
             reasons.append(f"高频噪点较低（噪点指标 {noise_score:.2f}），模糊核减小 2 以保留细节。")
         else:
@@ -930,16 +946,22 @@ class CNTAnalyzer:
         kernel = np.ones((3, 3), np.uint8)
         self.binary_image = cv2.morphologyEx(self.binary_image, cv2.MORPH_OPEN, kernel)
         self.binary_image = cv2.morphologyEx(self.binary_image, cv2.MORPH_CLOSE, kernel)
+        
+        # 在形态学操作之前先清除比例尺区域，避免边缘扩散
+        exclusion_mask = self.get_scale_exclusion_mask(roi)
+        if exclusion_mask is not None and exclusion_mask.shape == self.binary_image.shape:
+            self.binary_image[exclusion_mask > 0] = 0
+        
         if bridge_strength > 0:
             bridge_size = max(3, min(2 * int(bridge_strength) + 1, 21))
             if bridge_size % 2 == 0:
                 bridge_size += 1
             bridge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_size, bridge_size))
             self.binary_image = cv2.morphologyEx(self.binary_image, cv2.MORPH_CLOSE, bridge_kernel)
-
-        exclusion_mask = self.get_scale_exclusion_mask(roi)
-        if exclusion_mask is not None and exclusion_mask.shape == self.binary_image.shape:
-            self.binary_image[exclusion_mask > 0] = 0
+            
+            # 桥接操作后再次清除比例尺区域，防止桥接扩散到排除区
+            if exclusion_mask is not None and exclusion_mask.shape == self.binary_image.shape:
+                self.binary_image[exclusion_mask > 0] = 0
 
         self.skeleton_image = self._skeletonize(self.binary_image.copy())
         self._generate_skeleton_overlay(y1, y2, x1, x2)
@@ -990,19 +1012,17 @@ class CNTAnalyzer:
         skeleton_points = np.column_stack(np.where(skeleton > 0))
         if len(skeleton_points) < 2:
             return {}
+        point_set = {(int(y), int(x)) for y, x in skeleton_points}
         neighbors = {}
-        for y, x in skeleton_points:
-            y = int(y)
-            x = int(x)
+        for y, x in point_set:
             neigh = []
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     if dy == 0 and dx == 0:
                         continue
-                    ny, nx = y + dy, x + dx
-                    if 0 <= ny < skeleton.shape[0] and 0 <= nx < skeleton.shape[1]:
-                        if skeleton[ny, nx] > 0:
-                            neigh.append((int(ny), int(nx)))
+                    candidate = (y + dy, x + dx)
+                    if candidate in point_set:
+                        neigh.append(candidate)
             neighbors[(y, x)] = neigh
         return neighbors
 
@@ -1026,6 +1046,27 @@ class CNTAnalyzer:
             curr_y, curr_x = path[index]
             length += float(np.hypot(curr_y - prev_y, curr_x - prev_x))
         return length
+
+    @staticmethod
+    def _build_path_neighbors(path: List[Tuple[int, int]]) -> dict:
+        """Build a lightweight adjacency map for an already-pruned primary path."""
+        if len(path) < 2:
+            return {}
+
+        neighbors = {}
+        for index, point in enumerate(path):
+            point_neighbors = []
+            if index > 0:
+                point_neighbors.append(path[index - 1])
+            if index + 1 < len(path):
+                point_neighbors.append(path[index + 1])
+            neighbors[point] = point_neighbors
+        return neighbors
+
+    @staticmethod
+    def _is_simple_skeleton_graph(neighbors: dict) -> bool:
+        """Whether the skeleton graph is already a single unbranched chain."""
+        return bool(neighbors) and all(len(point_neighbors) <= 2 for point_neighbors in neighbors.values())
 
     @staticmethod
     def _continuation_cosine_threshold(angle_deg: float) -> float:
@@ -1108,6 +1149,9 @@ class CNTAnalyzer:
         if len(endpoints) < 2:
             return []
 
+        if self._is_simple_skeleton_graph(neighbors):
+            return self._trace_skeleton_path(endpoints[0], neighbors, float(SKELETON_WALK_ANGLE_DEG))
+
         best_path: List[Tuple[int, int]] = []
         best_length = -1.0
         for angle_deg in angle_candidates:
@@ -1141,6 +1185,12 @@ class CNTAnalyzer:
             neighbors = self._build_skeleton_neighbors(skeleton)
         if len(neighbors) < 2:
             return 0.0
+
+        endpoints = [point for point, neigh in neighbors.items() if len(neigh) == 1]
+        if len(endpoints) >= 2 and self._is_simple_skeleton_graph(neighbors):
+            return self._calculate_path_length(
+                self._trace_skeleton_path(endpoints[0], neighbors, float(SKELETON_WALK_ANGLE_DEG))
+            )
 
         best_path = self._find_best_skeleton_path(neighbors, [float(SKELETON_WALK_ANGLE_DEG)])
         if len(best_path) >= 2:
@@ -1186,8 +1236,8 @@ class CNTAnalyzer:
             return result
 
         result['mean'] = float(np.mean(half_widths)) * 2.0
-        result['median'] = float(np.median(half_widths)) * 2.0
-        q75, q25 = float(np.percentile(half_widths, 75)), float(np.percentile(half_widths, 25))
+        q25, median, q75 = np.percentile(half_widths, [25, 50, 75])
+        result['median'] = float(median) * 2.0
         result['iqr'] = (q75 - q25) * 2.0
         return result
 
@@ -1290,8 +1340,17 @@ class CNTAnalyzer:
         if len(neighbors) < 2:
             return None
 
-        skeleton_region = self._extract_primary_path(skeleton_region, neighbors)
-        neighbors = self._build_skeleton_neighbors(skeleton_region)
+        best_path = self._find_best_skeleton_path(neighbors, list(SKELETON_ANGLE_THRESHOLDS))
+        if len(best_path) < 2:
+            return None
+        length_px = float(self._calculate_path_length(best_path))
+        if length_px < 1.0:
+            return None
+
+        skeleton_region = np.zeros_like(skeleton_region, dtype=np.uint8)
+        for y, x in best_path:
+            skeleton_region[y, x] = 255
+        neighbors = self._build_path_neighbors(best_path)
         if len(neighbors) < 2:
             return None
 
@@ -1300,10 +1359,6 @@ class CNTAnalyzer:
             endpoint_limit = self._get_endpoint_limit(profile)
             if endpoint_count <= 0 or endpoint_count > endpoint_limit:
                 return None
-
-        length_px = float(self._calculate_skeleton_length(skeleton_region, neighbors))
-        if length_px < 1.0:
-            return None
 
         width_stats = self._measure_width(skeleton_region, cnt_binary)
         width_mean_px = float(width_stats['mean'])
@@ -2159,6 +2214,106 @@ class CNTAnalyzer:
         return bool(hotspot_mask[grid_row, grid_col])
 
     @staticmethod
+    def _get_measurement_local_contour(measurement: CNTMeasurement,
+                                       offset_x: int,
+                                       offset_y: int) -> Optional[np.ndarray]:
+        """Convert a measurement contour into ROI-local coordinates."""
+        contour = np.asarray(measurement.contour, dtype=np.float32)
+        if contour.size == 0:
+            return None
+
+        local_contour = contour.copy()
+        local_contour[:, 0, 0] -= float(offset_x)
+        local_contour[:, 0, 1] -= float(offset_y)
+        return local_contour
+
+    @staticmethod
+    def _upsample_hotspot_mask(mask: np.ndarray, factor: int) -> np.ndarray:
+        """Upsample a coarse hotspot grid for contour-overlap estimation."""
+        if mask is None or getattr(mask, 'size', 0) == 0:
+            return np.zeros((0, 0), dtype=np.uint8)
+
+        upscale = max(1, int(factor))
+        return np.kron(mask.astype(np.uint8), np.ones((upscale, upscale), dtype=np.uint8))
+
+    def _get_measurement_hotspot_overlap(self,
+                                         measurement: CNTMeasurement,
+                                         hotspot_mask: np.ndarray,
+                                         offset_x: int,
+                                         offset_y: int,
+                                         width: int,
+                                         height: int,
+                                         grid_size: int,
+                                         upsample_factor: int = SPATIAL_HOTSPOT_MASK_UPSAMPLE) -> float:
+        """Estimate the fraction of a CNT contour area that overlaps hotspot cells."""
+        if hotspot_mask is None or getattr(hotspot_mask, 'size', 0) == 0 or width <= 0 or height <= 0:
+            return 0.0
+
+        local_contour = self._get_measurement_local_contour(measurement, offset_x, offset_y)
+        if local_contour is None:
+            return 0.0
+
+        mask_size = max(1, int(grid_size) * max(1, int(upsample_factor)))
+        scale_x = (mask_size - 1) / max(width - 1, 1)
+        scale_y = (mask_size - 1) / max(height - 1, 1)
+        scaled_contour = np.empty_like(local_contour, dtype=np.int32)
+        scaled_contour[:, 0, 0] = np.clip(np.round(local_contour[:, 0, 0] * scale_x), 0, mask_size - 1).astype(np.int32)
+        scaled_contour[:, 0, 1] = np.clip(np.round(local_contour[:, 0, 1] * scale_y), 0, mask_size - 1).astype(np.int32)
+
+        contour_mask = np.zeros((mask_size, mask_size), dtype=np.uint8)
+        cv2.fillPoly(contour_mask, [scaled_contour], 1)
+        contour_area = int(np.count_nonzero(contour_mask))
+        if contour_area <= 0:
+            return 0.0
+
+        hotspot_scaled = self._upsample_hotspot_mask(hotspot_mask, max(1, int(upsample_factor)))
+        if hotspot_scaled.shape != contour_mask.shape:
+            hotspot_scaled = cv2.resize(
+                hotspot_scaled,
+                (contour_mask.shape[1], contour_mask.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        overlap_area = int(np.count_nonzero((contour_mask > 0) & (hotspot_scaled > 0)))
+        return float(overlap_area / contour_area)
+
+    def _is_measurement_agglomerated(self,
+                                     measurement: CNTMeasurement,
+                                     active_mask: np.ndarray,
+                                     severe_mask: np.ndarray,
+                                     offset_x: int,
+                                     offset_y: int,
+                                     width: int,
+                                     height: int,
+                                     grid_size: int) -> bool:
+        """Classify agglomeration using severe-cell coverage first and centroid fallback last."""
+        severe_overlap = self._get_measurement_hotspot_overlap(
+            measurement,
+            severe_mask,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            grid_size,
+        )
+        if severe_overlap > 0.0:
+            return True
+
+        hotspot_overlap = self._get_measurement_hotspot_overlap(
+            measurement,
+            active_mask,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            grid_size,
+        )
+        if hotspot_overlap >= float(SPATIAL_HOTSPOT_OVERLAP_RATIO_THRESHOLD):
+            return True
+
+        return self._is_cnt_in_hotspot(measurement, active_mask, offset_x, offset_y, width, height, grid_size)
+
+    @staticmethod
     def _normalize_hotspot_grid(grid: np.ndarray, percentile: float = 85.0) -> np.ndarray:
         """Normalize a hotspot grid into 0-1 range using a high-percentile cap."""
         grid = np.asarray(grid, dtype=float)
@@ -2195,19 +2350,33 @@ class CNTAnalyzer:
             }
 
 
-        point_norm = self._normalize_hotspot_grid(point_grid, percentile=86.0)
-        coverage_norm = self._normalize_hotspot_grid(coverage_grid, percentile=82.0)
-        shadow_norm = self._normalize_hotspot_grid(shadow_grid, percentile=84.0)
-        hotspot_grid = np.clip(point_norm * 0.46 + coverage_norm * 0.20 + shadow_norm * 0.34, 0.0, 1.0)
+        point_norm = self._normalize_hotspot_grid(point_grid, percentile=SPATIAL_HOTSPOT_POINT_PERCENTILE)
+        coverage_norm = self._normalize_hotspot_grid(coverage_grid, percentile=SPATIAL_HOTSPOT_COVERAGE_PERCENTILE)
+        shadow_norm = self._normalize_hotspot_grid(shadow_grid, percentile=SPATIAL_HOTSPOT_SHADOW_PERCENTILE)
+        hotspot_grid = np.clip(
+            point_norm * SPATIAL_HOTSPOT_POINT_WEIGHT +
+            coverage_norm * SPATIAL_HOTSPOT_COVERAGE_WEIGHT +
+            shadow_norm * SPATIAL_HOTSPOT_SHADOW_WEIGHT,
+            0.0,
+            1.0,
+        )
 
         active_mask = (point_grid > 0) | (coverage_grid > 0) | (shadow_grid > 0)
         active_scores = hotspot_grid[active_mask]
         hotspot_mask = np.zeros_like(hotspot_grid, dtype=bool)
         severe_mask = np.zeros_like(hotspot_grid, dtype=bool)
 
-        if active_scores.size > 0 and float(np.max(active_scores) - np.min(active_scores)) >= 0.08:
-            hotspot_percentile = 78.0 if active_scores.size >= 6 else 65.0
-            severe_percentile = 91.0 if active_scores.size >= 8 else 82.0
+        if active_scores.size > 0 and float(np.max(active_scores) - np.min(active_scores)) >= SPATIAL_HOTSPOT_ACTIVE_SCORE_RANGE_MIN:
+            hotspot_percentile = (
+                SPATIAL_HOTSPOT_MASK_PERCENTILE_LARGE
+                if active_scores.size >= 6 else
+                SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL
+            )
+            severe_percentile = (
+                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE
+                if active_scores.size >= 8 else
+                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL
+            )
             hotspot_threshold = float(np.percentile(active_scores, hotspot_percentile))
             severe_threshold = float(np.percentile(active_scores, severe_percentile))
             hotspot_mask = active_mask & (hotspot_grid >= hotspot_threshold) & (hotspot_grid > 0)
@@ -2342,7 +2511,16 @@ class CNTAnalyzer:
         agglomerated_measurements = []
         
         for measurement in measurements:
-            if self._is_cnt_in_hotspot(measurement, active_mask, offset_x, offset_y, width, height, grid_size):
+            if self._is_measurement_agglomerated(
+                measurement,
+                active_mask,
+                severe_mask,
+                offset_x,
+                offset_y,
+                width,
+                height,
+                grid_size,
+            ):
                 agglomerated_measurements.append(measurement)
             else:
                 dispersed_measurements.append(measurement)
