@@ -154,6 +154,33 @@ def test_suggest_preprocess_params_uses_configurable_noise_thresholds(monkeypatc
     assert customized["blur_kernel"] == 9
 
 
+def test_preprocess_can_skip_skeleton_generation(monkeypatch):
+    analyzer = CNTAnalyzer()
+    analyzer.image = np.zeros((16, 16, 3), dtype=np.uint8)
+    analyzer.analysis_gray_image = np.full((16, 16), 128, dtype=np.uint8)
+    analyzer.skeleton_image = np.ones((4, 4), dtype=np.uint8)
+    analyzer.skeleton_overlay = np.ones((16, 16, 3), dtype=np.uint8)
+
+    calls = {"skeletonize": 0, "overlay": 0}
+
+    def fake_skeletonize(binary):
+        calls["skeletonize"] += 1
+        return np.ones_like(binary)
+
+    def fake_overlay(*args, **kwargs):
+        calls["overlay"] += 1
+
+    monkeypatch.setattr(analyzer, "_skeletonize", fake_skeletonize)
+    monkeypatch.setattr(analyzer, "_generate_skeleton_overlay", fake_overlay)
+
+    binary = analyzer.preprocess(generate_skeleton=False)
+
+    assert binary.shape == (16, 16)
+    assert calls == {"skeletonize": 0, "overlay": 0}
+    assert analyzer.skeleton_image is None
+    assert analyzer.skeleton_overlay is None
+
+
 def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
     analyzer = CNTAnalyzer()
     measurements = [_make_measurement(0, 10.0), _make_measurement(1, 12.0)]

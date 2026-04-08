@@ -62,6 +62,31 @@ class _DummyStateWidget:
             self.disabled = False
 
 
+class _RunningFuture:
+    def __init__(self):
+        self.cancel_calls = 0
+
+    def done(self):
+        return False
+
+    def cancel(self):
+        self.cancel_calls += 1
+        return False
+
+
+class _DoneFuture:
+    def done(self):
+        return True
+
+
+class _DummyExecutor:
+    def __init__(self):
+        self.shutdown_calls = []
+
+    def shutdown(self, wait=False, cancel_futures=False):
+        self.shutdown_calls.append((wait, cancel_futures))
+
+
 class _DummyControlPanelState:
     def __init__(self):
         self.calls = []
@@ -133,6 +158,7 @@ class _DummyResultPanelState:
 
 def _make_gui_stub() -> CNTAnalyzerGUI:
     gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    gui._preprocess_preview_fast = False
     gui.blur_kernel_var = _DummyVar(9)
     gui.adaptive_block_var = _DummyVar(11)
     gui.adaptive_c_var = _DummyVar(3)
@@ -270,6 +296,57 @@ def test_get_preprocess_signature_changes_when_scale_exclusion_rect_changes():
     signature_with_exclusion = gui._get_preprocess_signature()
 
     assert signature_without_exclusion != signature_with_exclusion
+
+
+def test_apply_preprocessing_skips_skeleton_for_live_binary_preview():
+    gui = _make_gui_stub()
+    gui.current_roi = None
+    gui.display_var = _DummyVar("binary")
+    gui.live_preview_var = _DummyVar(True)
+    gui._preprocess_job = object()
+    gui._last_preprocess_signature = None
+    gui._update_display = lambda: None
+
+    captured = {}
+
+    def fake_preprocess(**kwargs):
+        captured.update(kwargs)
+
+    gui.analyzer = SimpleNamespace(
+        image=np.zeros((24, 24, 3), dtype=np.uint8),
+        binary_image=None,
+        scale_exclusion_rect=None,
+        rois=[],
+        preprocess=fake_preprocess,
+    )
+
+    gui._apply_preprocessing(force=False)
+
+    assert captured["generate_skeleton"] is False
+    assert gui._preprocess_preview_fast is True
+
+
+def test_display_mode_change_forces_full_preprocess_when_skeleton_preview_needs_skeleton():
+    gui = _make_gui_stub()
+    gui.current_roi = None
+    gui.display_var = _DummyVar("skeleton_preview")
+    gui.live_preview_var = _DummyVar(True)
+
+    calls = []
+    gui._apply_preprocessing = lambda force=False: calls.append(force)
+    gui._update_display = lambda: calls.append("display")
+    gui.analyzer = SimpleNamespace(
+        image=np.zeros((24, 24, 3), dtype=np.uint8),
+        binary_image=np.ones((24, 24), dtype=np.uint8),
+        skeleton_image=None,
+        scale_exclusion_rect=None,
+        rois=[],
+    )
+    gui._last_preprocess_signature = gui._get_preprocess_signature()
+
+    gui._on_display_mode_change()
+
+    assert calls == [True]
 
 
 def test_apply_scale_forces_preprocess_refresh_in_preprocess_mode(monkeypatch):
@@ -993,6 +1070,194 @@ def test_run_group_analysis_tasks_falls_back_to_sequential_when_thread_pool_fail
     assert [item[0] for item in results] == [0, 1]
     assert [item[1]["path"] for item in results] == [r"C:\tmp\a.png", r"C:\tmp\b.png"]
     assert [item[2] for item in results] == [None, None]
+
+
+def test_run_group_analysis_tasks_skips_process_pool_for_frozen_windows(monkeypatch):
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    gui._get_group_analysis_worker_count = lambda image_count: 2
+    gui._run_image_analysis = lambda image_path, context, include_visualization=False, preview_visualization=False: _make_batch_analysis_result(
+        image_path,
+        10.0 if image_path.endswith("a.png") else 20.0,
+    )
+    gui._should_use_process_pool_for_group_analysis = lambda: False
+
+    class _ImmediateFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class _ThreadExecutor:
+        def __init__(self, *args, **kwargs):
+            self.submissions = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            self.submissions.append((fn, args, kwargs))
+            return _ImmediateFuture(fn(*args, **kwargs))
+
+    class _ProcessExecutor:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("process pool should be skipped for frozen Windows builds")
+
+    monkeypatch.setattr(gui_module, "ThreadPoolExecutor", _ThreadExecutor)
+    monkeypatch.setattr(gui_module, "ProcessPoolExecutor", _ProcessExecutor)
+
+    results = gui._run_group_analysis_tasks(
+        [(0, r"C:\tmp\a.png"), (1, r"C:\tmp\b.png")],
+        {"preprocess_settings": {}, "detect_settings": {}, "scale_um": 10.0, "manual_scale_pixels": 0.0},
+    )
+
+    assert [item[0] for item in results] == [0, 1]
+    assert [item[1]["path"] for item in results] == [r"C:\tmp\a.png", r"C:\tmp\b.png"]
+    assert [item[2] for item in results] == [None, None]
+
+
+def test_abandon_single_detection_if_running_reenables_detect_button():
+    gui = _make_gui_stub()
+    gui.MODERN_COLORS = {"warning": "#f59e0b"}
+    gui.compare_analysis_button = _DummyStateWidget()
+    detect_button = _DummyStateWidget()
+    old_executor = _DummyExecutor()
+    status_messages = []
+    image_statuses = []
+    refresh_calls = []
+
+    gui.control_panel = SimpleNamespace(
+        detect_button=detect_button,
+        update_analysis_status=lambda text, color=None: status_messages.append((text, color)),
+    )
+    gui.image_panel = SimpleNamespace(show_status=lambda text: image_statuses.append(text))
+    gui._refresh_interaction_state = lambda: refresh_calls.append(True)
+    gui._single_detect_executor = old_executor
+    gui._single_detect_future = _RunningFuture()
+    gui._single_detect_snapshot = {"image_id": 1}
+    gui._single_detect_token = 7
+
+    abandoned = gui._abandon_single_detection_if_running()
+
+    assert abandoned is True
+    assert gui._single_detect_future is None
+    assert gui._single_detect_snapshot is None
+    assert gui._single_detect_token == 8
+    assert old_executor.shutdown_calls == [(False, True)]
+    assert detect_button.disabled is False
+    assert gui.compare_analysis_button.disabled is False
+    assert refresh_calls == [True]
+    assert status_messages[-1][0].startswith("检测参数已更新")
+    assert image_statuses[-1] == "检测参数已更新，可重新开始CNT检测"
+
+def test_load_image_common_discards_stale_single_detection_state(monkeypatch):
+    gui = _make_gui_stub()
+    gui.MODERN_COLORS = {"warning": "#f59e0b"}
+    gui.compare_analysis_button = _DummyStateWidget()
+    detect_button = _DummyStateWidget()
+    old_executor = _DummyExecutor()
+    refresh_calls = []
+    reset_calls = []
+    statuses = []
+    replacement_executors = []
+
+    class _ReplacementExecutor(_DummyExecutor):
+        pass
+
+    def _fake_thread_pool(*args, **kwargs):
+        executor = _ReplacementExecutor()
+        replacement_executors.append((executor, args, kwargs))
+        return executor
+
+    monkeypatch.setattr(gui_module, "ThreadPoolExecutor", _fake_thread_pool)
+
+    gui.control_panel = SimpleNamespace(
+        detect_button=detect_button,
+        update_analysis_status=lambda *args, **kwargs: None,
+    )
+    gui.image_panel = SimpleNamespace(show_status=lambda text: statuses.append(text))
+    gui._refresh_interaction_state = lambda: refresh_calls.append(True)
+    gui._single_detect_executor = old_executor
+    gui._single_detect_future = _RunningFuture()
+    gui._single_detect_snapshot = {"image_id": 1}
+    gui._single_detect_token = 11
+    gui._reset_display = lambda: reset_calls.append(True)
+    gui._refresh_scale_status_ui = lambda: None
+    gui._auto_suggest_params = lambda: None
+    gui._refresh_analysis_status_ui = lambda: None
+    gui.live_preview_var = _DummyVar(False)
+    gui.scale_um_var = _DummyVar(0.0)
+    gui.scale_pixels_var = _DummyVar(0.0)
+    gui.analyzer = SimpleNamespace(
+        apply_detected_scale=lambda default_micrometers: {"applied": False, "scale_info": None},
+    )
+
+    gui._load_image_common()
+
+    assert gui._single_detect_future is None
+    assert gui._single_detect_snapshot is None
+    assert gui._single_detect_token == 12
+    assert old_executor.shutdown_calls == [(False, True)]
+    assert len(replacement_executors) == 1
+    assert isinstance(gui._single_detect_executor, _ReplacementExecutor)
+    assert detect_button.disabled is False
+    assert gui.compare_analysis_button.disabled is False
+    assert refresh_calls == [True]
+    assert reset_calls == [True]
+    assert len(statuses) == 1
+
+
+def test_discard_single_detection_state_can_drop_completed_future_without_notifying():
+    gui = _make_gui_stub()
+    gui.MODERN_COLORS = {"warning": "#f59e0b"}
+    gui.compare_analysis_button = _DummyStateWidget()
+    detect_button = _DummyStateWidget()
+    refresh_calls = []
+    image_statuses = []
+    status_messages = []
+
+    gui.control_panel = SimpleNamespace(
+        detect_button=detect_button,
+        update_analysis_status=lambda text, color=None: status_messages.append((text, color)),
+    )
+    gui.image_panel = SimpleNamespace(show_status=lambda text: image_statuses.append(text))
+    gui._refresh_interaction_state = lambda: refresh_calls.append(True)
+    gui._single_detect_executor = _DummyExecutor()
+    gui._single_detect_future = _DoneFuture()
+    gui._single_detect_snapshot = {"image_id": 2}
+    gui._single_detect_token = 3
+
+    discarded = gui._discard_single_detection_state(include_completed=True, notify=False)
+
+    assert discarded is True
+    assert gui._single_detect_future is None
+    assert gui._single_detect_snapshot is None
+    assert gui._single_detect_token == 4
+    assert refresh_calls == [True]
+    assert status_messages == []
+    assert image_statuses == []
+
+
+def test_get_detection_filter_settings_reports_invalid_range():
+    gui = _make_gui_stub()
+    gui.min_length_um_var = _DummyVar(20.0)
+    gui.max_length_um_var = _DummyVar(10.0)
+    gui.min_slenderness_var = _DummyVar(4.0)
+    gui.merge_distance_px_var = _DummyVar(6.0)
+
+    result = gui._get_detection_filter_settings(strict=False)
+
+    assert result["valid"] is False
+    assert "最大长度不能小于最小长度" in result["message"]
+
+
+def test_group_analysis_process_pool_is_disabled_for_gui_runtime():
+    assert CNTAnalyzerGUI._should_use_process_pool_for_group_analysis() is False
+    assert CNTAnalyzerGUI._should_use_process_pool_for_group_analysis(platform="win32", frozen=False) is False
+    assert CNTAnalyzerGUI._should_use_process_pool_for_group_analysis(platform="linux", frozen=False) is False
 
 
 def test_run_group_analysis_task_collects_expected_analysis_errors():

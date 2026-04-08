@@ -23,6 +23,7 @@ import PyInstaller.__main__
 ROOT_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = ROOT_DIR / ".tools"
 UPX_DIR = TOOLS_DIR / "upx"
+LOCAL_UPX_GLOB = "upx*"
 
 EXCLUDE_MODULES = [
     "Cython",
@@ -52,9 +53,7 @@ EXCLUDE_MODULES = [
     "tkinter.ttk.test",
     "turtle",
     "turtledemo",
-    "unittest",
     "venv",
-    "wheel",
 ]
 
 HIDDEN_IMPORTS = [
@@ -99,6 +98,11 @@ def _iter_upx_candidates() -> Iterable[Path]:
     if UPX_DIR.exists():
         yield from UPX_DIR.rglob("upx.exe")
         yield from UPX_DIR.rglob("upx")
+
+    for local_dir in ROOT_DIR.glob(LOCAL_UPX_GLOB):
+        if local_dir.is_dir():
+            yield from local_dir.rglob("upx.exe")
+            yield from local_dir.rglob("upx")
 
 
 def find_upx_executable() -> Optional[Path]:
@@ -185,7 +189,6 @@ def build_minimal() -> Path:
         "--name=OptCNT",
         "--onefile",
         "--windowed",
-        "--strip",
         f"--upx-dir={upx_exe.parent}",
         "--optimize=2",
         "--clean",
@@ -193,6 +196,9 @@ def build_minimal() -> Path:
         "--collect-data=matplotlib",
         "--collect-data=skimage",
     ]
+
+    if os.name != "nt":
+        args.append("--strip")
 
     for module_name in EXCLUDE_MODULES:
         args.append(f"--exclude-module={module_name}")
