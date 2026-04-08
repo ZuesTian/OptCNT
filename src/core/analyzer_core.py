@@ -7,7 +7,6 @@ from typing import List, Tuple, Optional, Dict
 
 import cv2
 import numpy as np
-from skimage.morphology import skeletonize
 
 try:
     from numba import jit
@@ -987,9 +986,27 @@ class CNTAnalyzer:
 
     def _skeletonize(self, binary: np.ndarray) -> np.ndarray:
         """生成骨架"""
-        binary_bool = binary > 0
-        skeleton = skeletonize(binary_bool)
-        return (skeleton.astype(np.uint8) * 255)
+        work = np.where(binary > 0, 255, 0).astype(np.uint8)
+        if not np.any(work):
+            return work
+
+        thinning = getattr(getattr(cv2, "ximgproc", None), "thinning", None)
+        if thinning is not None:
+            return thinning(work)
+
+        skeleton = np.zeros_like(work)
+        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+        while True:
+            eroded = cv2.erode(work, element)
+            opened = cv2.dilate(eroded, element)
+            residue = cv2.subtract(work, opened)
+            skeleton = cv2.bitwise_or(skeleton, residue)
+            work = eroded
+            if cv2.countNonZero(work) == 0:
+                break
+
+        return skeleton
 
     def _generate_skeleton_overlay(self, y1: int, y2: int, x1: int, x2: int):
         """生成骨架叠加到原图"""

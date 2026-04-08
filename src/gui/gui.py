@@ -24,10 +24,10 @@ from PIL import Image, ImageTk, ImageGrab
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
-from scipy import stats as scipy_stats
 
 from ..core.models import ROIRegion, CNTMeasurement
 from ..core.analyzer_core import CNTAnalyzer
+from ..core.stats_compat import mannwhitneyu, ttest_ind
 from ..core.utils import (
     DEBOUNCE_DELAY_MS,
     CHART_REBUILD_DRAW_LIMIT,
@@ -3200,14 +3200,14 @@ class CNTAnalyzerGUI:
             return result
 
         try:
-            t_stat, t_pvalue = scipy_stats.ttest_ind(base, exp, equal_var=False, nan_policy='omit')
+            t_stat, t_pvalue = ttest_ind(base, exp, equal_var=False, nan_policy='omit')
             result['t_stat'] = float(t_stat) if np.isfinite(t_stat) else None
             result['t_pvalue'] = float(t_pvalue) if np.isfinite(t_pvalue) else None
         except (TypeError, ValueError, FloatingPointError) as exc:
             logger.debug("Welch t-test failed for comparison inputs: %s", exc)
 
         try:
-            mw_stat, mw_pvalue = scipy_stats.mannwhitneyu(base, exp, alternative='two-sided')
+            mw_stat, mw_pvalue = mannwhitneyu(base, exp, alternative='two-sided')
             result['mw_stat'] = float(mw_stat) if np.isfinite(mw_stat) else None
             result['mw_pvalue'] = float(mw_pvalue) if np.isfinite(mw_pvalue) else None
         except (TypeError, ValueError, FloatingPointError) as exc:

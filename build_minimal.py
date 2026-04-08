@@ -4,7 +4,7 @@ Lean Windows packaging script for OptCNT.
 Key goals:
 - build a single-file GUI executable
 - shrink size with UPX when available
-- avoid excluding modules that the app really uses at runtime
+- work best from a dedicated virtual environment
 - drop optional heavyweight dependencies that already have safe fallbacks
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -32,19 +33,37 @@ EXCLUDE_MODULES = [
     "PyQt6",
     "PySide2",
     "PySide6",
+    "Pygments",
+    "_pytest",
     "cython",
     "idlelib",
     "jupyter",
     "lib2to3",
     "llvmlite",
+    "matplotlib.backends.backend_gtk3",
+    "matplotlib.backends.backend_gtk3agg",
+    "matplotlib.backends.backend_gtk4",
+    "matplotlib.backends.backend_gtk4agg",
+    "matplotlib.backends.backend_macosx",
+    "matplotlib.backends.backend_nbagg",
+    "matplotlib.backends.backend_qt",
+    "matplotlib.backends.backend_qt5",
+    "matplotlib.backends.backend_qt5agg",
+    "matplotlib.backends.backend_qtagg",
+    "matplotlib.backends.backend_webagg",
+    "matplotlib.backends.backend_webagg_core",
     "matplotlib.tests",
+    "mpl_toolkits.tests",
     "notebook",
     "numba",
     "numpy.random._examples",
     "pandas",
     "pip",
     "pytest",
+    "scipy",
+    "setuptools",
     "sklearn",
+    "skimage",
     "sphinx",
     "test",
     "threadpoolctl",
@@ -54,26 +73,29 @@ EXCLUDE_MODULES = [
     "turtle",
     "turtledemo",
     "venv",
+    "wheel",
 ]
 
 HIDDEN_IMPORTS = [
-    "cv2",
-    "matplotlib",
+    "matplotlib.backends._backend_tk",
     "matplotlib.backends.backend_tkagg",
-    "matplotlib.pyplot",
-    "numpy",
-    "PIL",
     "PIL._imagingtk",
     "PIL._tkinter_finder",
-    "scipy.stats",
-    "skimage",
-    "skimage.filters",
-    "skimage.morphology",
+]
+
+UPX_EXCLUDES = [
+    "_uuid.pyd",
+    "python3.dll",
 ]
 
 
 def _print(message: str) -> None:
     print(message)
+
+
+def running_in_virtualenv() -> bool:
+    """Whether the current interpreter belongs to a virtual environment."""
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
 
 def clean_build_dirs() -> None:
@@ -181,6 +203,9 @@ def ensure_upx() -> Path:
 
 def build_minimal() -> Path:
     """Build the smallest practical OptCNT GUI executable."""
+    if not running_in_virtualenv():
+        _print("Warning: build_minimal.py is designed to run inside a dedicated virtual environment.")
+
     clean_build_dirs()
     upx_exe = ensure_upx()
 
@@ -194,7 +219,6 @@ def build_minimal() -> Path:
         "--clean",
         "--log-level=WARN",
         "--collect-data=matplotlib",
-        "--collect-data=skimage",
     ]
 
     if os.name != "nt":
@@ -205,6 +229,9 @@ def build_minimal() -> Path:
 
     for module_name in HIDDEN_IMPORTS:
         args.append(f"--hidden-import={module_name}")
+
+    for filename in UPX_EXCLUDES:
+        args.append(f"--upx-exclude={filename}")
 
     _print("Starting PyInstaller build...")
     _print(" ".join(args))
