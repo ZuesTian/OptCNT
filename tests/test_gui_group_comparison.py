@@ -737,7 +737,7 @@ def test_format_comparison_summary_uses_compact_text():
 
     summary = gui._format_comparison_summary(left_result, right_result, "样品A", "样品B")
 
-    assert summary.startswith("对比固定预处理: 模糊9/块11/C3")
+    assert summary.startswith("对比预处理: 模糊9/块11/C3")
     assert "CNT数量" in summary
     assert "样品A: left | CNT=48" in summary
     assert "样品B: right | CNT=41" in summary
@@ -746,6 +746,62 @@ def test_format_comparison_summary_uses_compact_text():
     assert "均匀度(0-100，越高越好)" in summary
     assert "结论: 样品A更优" in summary
     assert "Mann-Whitney" not in summary
+
+
+def test_format_comparison_summary_prefers_stored_compare_context_over_live_widgets():
+    gui = _make_gui_stub()
+    gui.min_length_um_var = _DummyVar(40.0)
+    gui.min_slenderness_var = _DummyVar(9.0)
+    gui.bridge_strength_var = _DummyVar(1)
+    gui.detect_profile_var = _DummyVar("严格（少误检）")
+    gui.split_mode_var = _DummyVar("不拆分")
+    gui.merge_distance_px_var = _DummyVar(0)
+
+    compare_context = {
+        "preprocess_settings": {
+            "blur_kernel": 15,
+            "adaptive_block": 21,
+            "adaptive_c": 5,
+            "bridge_strength": 6,
+            "threshold_invert": True,
+        },
+        "detect_settings": {
+            "min_length_um": 12.0,
+            "max_length_um": 200.0,
+            "min_slenderness": 4.5,
+            "detection_profile": "recall",
+            "merge_distance_px": 8.0,
+            "split_mode": "conservative",
+        },
+        "analysis_roi": {
+            "mode": "center_fraction",
+            "fraction": 0.75,
+            "label": "中部75%",
+        },
+    }
+
+    left_result = {
+        **_make_batch_analysis_result("left.png", 48.0),
+        "analysis_context": compare_context,
+        "stats": {"count": 48, "spatial_distribution": {}},
+        "dispersed_stats": {"dispersed_count": 30, "agglomerated_count": 18, "dispersed_ratio": 30 / 48},
+    }
+    right_result = {
+        **_make_batch_analysis_result("right.png", 41.0),
+        "analysis_context": compare_context,
+        "stats": {"count": 41, "spatial_distribution": {}},
+        "dispersed_stats": {"dispersed_count": 20, "agglomerated_count": 21, "dispersed_ratio": 20 / 41},
+    }
+
+    summary = gui._format_comparison_summary(left_result, right_result, "样品A", "样品B")
+
+    assert summary.startswith("对比预处理: 模糊15/块21/C5")
+    assert "长度≥12.0μm" in summary
+    assert "长宽比≥4.5" in summary
+    assert "敏感（少漏检）" in summary
+    assert "桥接6" in summary
+    assert "标准（推荐）" not in summary
+    assert "长度≥40.0μm" not in summary
 
 
 def test_plot_group_aggregation_risk_chart_uses_fixed_scale_and_group_colors():
@@ -1521,7 +1577,7 @@ def test_compare_two_images_uses_batch_analysis_pipeline(monkeypatch):
     assert rendered == [(r"C:\tmp\a.png", r"C:\tmp\b.png", "图像A", "图像B")]
 
 
-def test_build_compare_analysis_context_freezes_preprocess_triplet():
+def test_build_compare_analysis_context_uses_current_preprocess_triplet():
     gui = _make_gui_stub()
     gui.max_length_um_var = _DummyVar(200.0)
     gui.scale_um_var = _DummyVar(10.0)
@@ -1536,9 +1592,9 @@ def test_build_compare_analysis_context_freezes_preprocess_triplet():
     context = gui._build_compare_analysis_context()
 
     assert context["preprocess_settings"] == {
-        "blur_kernel": 9,
-        "adaptive_block": 11,
-        "adaptive_c": 3,
+        "blur_kernel": 15,
+        "adaptive_block": 21,
+        "adaptive_c": 5,
         "bridge_strength": 4,
         "threshold_invert": True,
     }

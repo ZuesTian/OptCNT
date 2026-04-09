@@ -1208,6 +1208,24 @@ class CNTAnalyzerGUI:
             "敏感（少漏检）": "recall",
         }.get(self.detect_profile_var.get(), "balanced")
 
+    @staticmethod
+    def _get_detection_profile_label(profile_key: str) -> str:
+        """Map the analyzer profile key back to the UI label."""
+        return {
+            "precision": "严格（少误检）",
+            "balanced": "标准（推荐）",
+            "recall": "敏感（少漏检）",
+        }.get(str(profile_key or "").lower(), "标准（推荐）")
+
+    @staticmethod
+    def _get_split_mode_label(split_mode: str) -> str:
+        """Map the analyzer split mode key back to the UI label."""
+        return {
+            "off": "不拆分",
+            "conservative": "标准拆分",
+            "aggressive": "强力拆分",
+        }.get(str(split_mode or "").lower(), str(split_mode or ""))
+
     def _auto_suggest_params(self):
         """根据图像特征自动推荐预处理参数"""
         try:
@@ -2854,14 +2872,8 @@ class CNTAnalyzerGUI:
         return self._compose_analysis_context(preprocess_settings, detect_settings)
 
     def _build_compare_analysis_context(self) -> dict:
-        """Build a comparison-only context with fixed 9/11/3 preprocess parameters."""
+        """Build compare context from the current UI settings plus compare-specific ROI/scale rules."""
         preprocess_settings, detect_settings = self._get_current_analysis_settings()
-        preprocess_settings = {
-            **preprocess_settings,
-            'blur_kernel': int(CALIBRATED_BLUR_KERNEL),
-            'adaptive_block': int(CALIBRATED_ADAPTIVE_BLOCK),
-            'adaptive_c': int(CALIBRATED_ADAPTIVE_C),
-        }
         return self._compose_analysis_context(
             preprocess_settings,
             detect_settings,
@@ -2874,6 +2886,15 @@ class CNTAnalyzerGUI:
                 'recognize_text': False,
             },
         )
+
+    def _get_compare_display_context(self, *results: dict) -> dict:
+        """Prefer the actual comparison context stored on results over current live widget values."""
+        for result in results:
+            if isinstance(result, dict):
+                context = result.get('analysis_context')
+                if isinstance(context, dict):
+                    return context
+        return self._build_compare_analysis_context()
 
     def _compose_analysis_context(self,
                                   preprocess_settings: dict,
@@ -3652,6 +3673,10 @@ class CNTAnalyzerGUI:
                                          note: Optional[str] = None,
                                          failures: Optional[List[str]] = None) -> str:
         """生成组别对比摘要"""
+        compare_context = self._get_compare_display_context(
+            *(base_group.get('results') or []),
+            *(exp_group.get('results') or []),
+        )
         base_count = base_group['count_stats']
         exp_count = exp_group['count_stats']
         base_spatial = base_group['spatial_stats']
@@ -3857,24 +3882,41 @@ class CNTAnalyzerGUI:
             parts.append(f"合并{merge_distance}px")
         return "识别参数: " + " | ".join(str(part) for part in parts if part)
 
-    def _format_compare_fixed_params(self) -> str:
-        """Describe the fixed preprocess parameters used only by comparison analysis."""
+    def _format_compare_fixed_params(self, context: Optional[dict] = None) -> str:
+        """Describe the comparison settings from the actual stored context."""
+        context = context or self._build_compare_analysis_context()
+        preprocess_settings = context.get('preprocess_settings') or {}
+        detect_settings = context.get('detect_settings') or {}
+        analysis_roi = context.get('analysis_roi') or {}
+        roi_label = str(analysis_roi.get('label', '中部75%')).strip() or '中部75%'
         parts = [
-            f"对比固定预处理: 模糊{int(CALIBRATED_BLUR_KERNEL)}/块{int(CALIBRATED_ADAPTIVE_BLOCK)}/C{int(CALIBRATED_ADAPTIVE_C)}",
-            "分析区域=中部75%",
-            f"长度≥{self.min_length_um_var.get():.1f}μm",
-            f"长宽比≥{self.min_slenderness_var.get():.1f}",
-            self.detect_profile_var.get(),
+            (
+                "对比预处理: "
+                f"模糊{int(preprocess_settings.get('blur_kernel', CALIBRATED_BLUR_KERNEL))}"
+                f"/块{int(preprocess_settings.get('adaptive_block', CALIBRATED_ADAPTIVE_BLOCK))}"
+                f"/C{int(preprocess_settings.get('adaptive_c', CALIBRATED_ADAPTIVE_C))}"
+            ),
+            f"分析区域={roi_label}",
+            f"长度≥{float(detect_settings.get('min_length_um', self.min_length_um_var.get())):.1f}μm",
+            f"长宽比≥{float(detect_settings.get('min_slenderness', self.min_slenderness_var.get())):.1f}",
+            self._get_detection_profile_label(
+                str(detect_settings.get('detection_profile', self._get_detection_profile_key()))
+            ),
         ]
-        bridge_strength = self.bridge_strength_var.get()
+        bridge_strength = int(preprocess_settings.get('bridge_strength', self.bridge_strength_var.get()))
         if bridge_strength:
             parts.append(f"桥接{bridge_strength}")
-        split_mode = self.split_mode_var.get()
+        split_mode = self._get_split_mode_label(
+            str(detect_settings.get('split_mode', self.split_mode_var.get()))
+        )
         if split_mode and split_mode != "不拆分":
             parts.append(split_mode)
-        merge_distance = self.merge_distance_px_var.get()
+        merge_distance = float(detect_settings.get('merge_distance_px', self.merge_distance_px_var.get()))
         if merge_distance:
-            parts.append(f"合并{merge_distance}px")
+            if float(merge_distance).is_integer():
+                parts.append(f"合并{int(merge_distance)}px")
+            else:
+                parts.append(f"合并{merge_distance:.1f}px")
         return " | ".join(str(part) for part in parts if part)
 
     def _format_compact_significance(self, test_result: Optional[dict]) -> str:
@@ -4421,6 +4463,10 @@ class CNTAnalyzerGUI:
         exp_dispersed_length = exp_group.get('dispersed_length_mean_stats', self._summarize_numeric_series([]))
         base_spatial = base_group['spatial_stats']
         exp_spatial = exp_group['spatial_stats']
+        compare_context = self._get_compare_display_context(
+            *(base_group.get('results') or []),
+            *(exp_group.get('results') or []),
+        )
         tests = self._compute_group_comparison_tests(base_group, exp_group)
 
         count_tests = tests['count']
@@ -4454,7 +4500,7 @@ class CNTAnalyzerGUI:
             lines.extend([note, ""])
 
         lines.extend([
-            self._format_compare_fixed_params(),
+            self._format_compare_fixed_params(compare_context),
             "",
             "CNT数量",
             (
@@ -4540,6 +4586,7 @@ class CNTAnalyzerGUI:
                                    right_label: str,
                                    note: Optional[str] = None) -> str:
         """生成精简版双图对比摘要。"""
+        compare_context = self._get_compare_display_context(left_result, right_result)
         left_spatial = left_result['stats'].get('spatial_distribution') or {}
         right_spatial = right_result['stats'].get('spatial_distribution') or {}
         left_metrics = self._get_shadow_aggregation_metrics(left_spatial)
@@ -4577,7 +4624,7 @@ class CNTAnalyzerGUI:
             lines.extend([note, ""])
 
         lines.extend([
-            self._format_compare_fixed_params(),
+            self._format_compare_fixed_params(compare_context),
             "",
             "CNT数量",
             f"{left_label}: {left_result['name']} | CNT={left_count}",
@@ -4745,7 +4792,7 @@ class CNTAnalyzerGUI:
                                        image_paths: List[str],
                                        group_label: str,
                                        include_visualization: bool = True) -> Tuple[List[dict], List[str]]:
-        """Analyze compare inputs under the fixed comparison context while remaining compatible with test doubles."""
+        """Analyze compare inputs under the current comparison context while remaining compatible with test doubles."""
         analyze_image_files = self._analyze_image_files
         compare_context = self._build_compare_analysis_context()
         signature = inspect.signature(analyze_image_files).parameters
@@ -4797,9 +4844,9 @@ class CNTAnalyzerGUI:
             exp_group = self._summarize_group_results("实验组", exp_results)
 
             note = (
-                f"本次组别对比固定使用预处理 {int(CALIBRATED_BLUR_KERNEL)}/{int(CALIBRATED_ADAPTIVE_BLOCK)}/{int(CALIBRATED_ADAPTIVE_C)}，"
+                "本次组别对比使用当前界面的预处理与识别参数，"
                 "并仅分析中部 75% 区域以避开比例尺区域干扰；"
-                "其余识别条件沿用当前界面设置，第一组按 base组 统计，第二组按 实验组 统计。"
+                "第一组按 base组 统计，第二组按 实验组 统计。"
             )
             self._show_group_comparison_window(base_group, exp_group, note, failures)
         except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
@@ -4845,9 +4892,8 @@ class CNTAnalyzerGUI:
                 failure_text = "；".join(failures) if failures else "两张图像中至少有一张未成功完成分析"
                 raise ValueError(f"双图对比需要两张图都分析成功: {failure_text}")
             note = (
-                f"本次双图对比固定使用预处理 {int(CALIBRATED_BLUR_KERNEL)}/{int(CALIBRATED_ADAPTIVE_BLOCK)}/{int(CALIBRATED_ADAPTIVE_C)}，"
-                "并仅分析中部 75% 区域以避开比例尺区域干扰；"
-                "其余识别条件沿用当前界面设置。"
+                "本次双图对比使用当前界面的预处理与识别参数，"
+                "并仅分析中部 75% 区域以避开比例尺区域干扰。"
             )
             self._show_comparison_window(left_result, right_result, "图像A", "图像B", note)
         except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
