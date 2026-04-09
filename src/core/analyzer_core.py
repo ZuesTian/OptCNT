@@ -1,6 +1,7 @@
 """
 图像分析核心模块 - 包含CNTAnalyzer类及其所有图像处理方法
 """
+import heapq
 import logging
 import os
 from typing import List, Tuple, Optional, Dict
@@ -82,8 +83,8 @@ class CNTAnalyzer:
 
         self.ocr_templates = {}
         fonts = [cv2.FONT_HERSHEY_SIMPLEX, cv2.FONT_HERSHEY_DUPLEX, cv2.FONT_HERSHEY_PLAIN]
-        scales = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
-        thicknesses = [1, 2, 3]
+        scales = [0.8, 1.0, 1.2]
+        thicknesses = [1, 2]
         for d in range(10):
             key = str(d)
             self.ocr_templates[key] = []
@@ -991,6 +992,12 @@ class CNTAnalyzer:
             return work
 
         thinning = getattr(getattr(cv2, "ximgproc", None), "thinning", None)
+        if thinning is None:
+            try:
+                import cv2.ximgproc as cv2_ximgproc  # type: ignore[import-not-found]
+            except Exception:
+                cv2_ximgproc = None
+            thinning = getattr(cv2_ximgproc, "thinning", None)
         if thinning is not None:
             return thinning(work)
 
@@ -1073,6 +1080,11 @@ class CNTAnalyzer:
         if len(path) < 2:
             return 0.0
 
+        path_array = np.asarray(path, dtype=np.float64)
+        deltas = np.diff(path_array, axis=0)
+        segment_lengths = np.hypot(deltas[:, 0], deltas[:, 1])
+        return float(np.sum(segment_lengths))
+
         # 使用优化版本（如果可用）
         if NUMBA_AVAILABLE:
             path_array = np.array(path, dtype=np.float64)
@@ -1101,6 +1113,74 @@ class CNTAnalyzer:
                 point_neighbors.append(path[index + 1])
             neighbors[point] = point_neighbors
         return neighbors
+
+    @staticmethod
+    def _edge_length(point_a: Tuple[int, int], point_b: Tuple[int, int]) -> float:
+        """Return the graph edge length between two neighboring skeleton pixels."""
+        return float(np.hypot(point_b[0] - point_a[0], point_b[1] - point_a[1]))
+
+    def _find_farthest_graph_node(self,
+                                  start_pt: Tuple[int, int],
+                                  neighbors: dict,
+                                  targets: Optional[List[Tuple[int, int]]] = None) -> Tuple[Tuple[int, int], dict, dict]:
+        """Run Dijkstra on the skeleton graph and return the farthest reachable node."""
+        distances = {start_pt: 0.0}
+        parents = {start_pt: None}
+        queue = [(0.0, start_pt)]
+
+        while queue:
+            current_dist, point = heapq.heappop(queue)
+            if current_dist > distances.get(point, float('inf')) + 1e-9:
+                continue
+
+            for neighbor in neighbors.get(point, []):
+                new_dist = current_dist + self._edge_length(point, neighbor)
+                if new_dist + 1e-9 < distances.get(neighbor, float('inf')):
+                    distances[neighbor] = new_dist
+                    parents[neighbor] = point
+                    heapq.heappush(queue, (new_dist, neighbor))
+
+        candidate_nodes = targets if targets else list(distances.keys())
+        farthest_point = start_pt
+        farthest_distance = -1.0
+        for point in candidate_nodes:
+            point_distance = distances.get(point)
+            if point_distance is None:
+                continue
+            if point_distance > farthest_distance:
+                farthest_point = point
+                farthest_distance = point_distance
+
+        return farthest_point, parents, distances
+
+    @staticmethod
+    def _reconstruct_graph_path(end_pt: Tuple[int, int], parents: dict) -> List[Tuple[int, int]]:
+        """Rebuild a graph path from the stored parent pointers."""
+        path: List[Tuple[int, int]] = []
+        current = end_pt
+        while current is not None:
+            path.append(current)
+            current = parents.get(current)
+        path.reverse()
+        return path
+
+    def _find_graph_diameter_path(self, neighbors: dict) -> List[Tuple[int, int]]:
+        """Approximate the skeleton backbone with a graph-diameter path."""
+        if len(neighbors) < 2:
+            return []
+
+        endpoints = [point for point, point_neighbors in neighbors.items() if len(point_neighbors) == 1]
+        if len(endpoints) < 2:
+            return []
+
+        farthest_from_seed, _, _ = self._find_farthest_graph_node(endpoints[0], neighbors, targets=endpoints)
+        farthest_endpoint, parents, _ = self._find_farthest_graph_node(
+            farthest_from_seed,
+            neighbors,
+            targets=endpoints,
+        )
+        path = self._reconstruct_graph_path(farthest_endpoint, parents)
+        return path if len(path) >= 2 else []
 
     @staticmethod
     def _is_simple_skeleton_graph(neighbors: dict) -> bool:
@@ -1158,10 +1238,12 @@ class CNTAnalyzer:
         path = [start_pt]
         prev_pt = None
         curr_pt = start_pt
+        visited = {start_pt}
+        max_steps = max(1, len(neighbors))
 
-        while True:
+        while len(path) < max_steps:
             neigh = neighbors.get(curr_pt, [])
-            candidates = [point for point in neigh if point != prev_pt]
+            candidates = [point for point in neigh if point != prev_pt and point not in visited]
             if not candidates:
                 break
 
@@ -1176,6 +1258,7 @@ class CNTAnalyzer:
                 break
 
             path.append(next_pt)
+            visited.add(next_pt)
             prev_pt, curr_pt = curr_pt, next_pt
 
         return path
@@ -1187,6 +1270,10 @@ class CNTAnalyzer:
         endpoints = [point for point, neigh in neighbors.items() if len(neigh) == 1]
         if len(endpoints) < 2:
             return []
+
+        diameter_path = self._find_graph_diameter_path(neighbors)
+        if len(diameter_path) >= 2:
+            return diameter_path
 
         if self._is_simple_skeleton_graph(neighbors):
             return self._trace_skeleton_path(endpoints[0], neighbors, float(SKELETON_WALK_ANGLE_DEG))
@@ -1295,10 +1382,6 @@ class CNTAnalyzer:
             return [region]
 
         # 保守策略：仅对“面积较大且骨架端点异常”的连通域尝试分离，降低过分割风险
-        skeleton = self._skeletonize(region)
-        neighbors = self._build_skeleton_neighbors(skeleton)
-        endpoints = self._count_endpoints(skeleton, neighbors) if neighbors else 0
-
         if mode == "aggressive":
             area_threshold = 180
             peak_ratio = 0.35
@@ -1312,6 +1395,10 @@ class CNTAnalyzer:
 
         if area < area_threshold:
             return [region]
+
+        skeleton = self._skeletonize(region)
+        neighbors = self._build_skeleton_neighbors(skeleton)
+        endpoints = self._count_endpoints(skeleton, neighbors) if neighbors else 0
         if not bypass_endpoint_check and endpoints == 2:
             return [region]
 
@@ -1358,6 +1445,36 @@ class CNTAnalyzer:
             return 4
         return 3
 
+    @staticmethod
+    def _get_profile_length_factor(profile: str) -> float:
+        """Return the profile-specific length threshold multiplier."""
+        mode = (profile or "balanced").lower()
+        if mode == "precision":
+            return 1.10
+        if mode == "recall":
+            return 0.85
+        return 1.0
+
+    @staticmethod
+    def _estimate_contour_length_upper_bound(contour: np.ndarray) -> float:
+        """Cheap upper bound used to skip obviously too-short fragments."""
+        if contour is None or len(contour) < 2:
+            return 0.0
+        return float(cv2.arcLength(contour, closed=True) * 0.5)
+
+    @staticmethod
+    def _estimate_centerline_length_from_contour(contour: np.ndarray, width_px: float) -> float:
+        """Estimate CNT centerline length from a smoothed contour perimeter."""
+        if contour is None or len(contour) < 2:
+            return 0.0
+
+        width_px = float(max(0.0, width_px))
+        epsilon = max(2.0, width_px * 0.75)
+        approx_contour = cv2.approxPolyDP(contour, epsilon, True)
+        smoothed_half_perimeter = float(cv2.arcLength(approx_contour, True) * 0.5)
+        corrected = smoothed_half_perimeter - width_px
+        return max(0.0, corrected)
+
     def _build_cnt_candidate(self,
                              cnt_binary: np.ndarray,
                              x_offset: int,
@@ -1403,6 +1520,9 @@ class CNTAnalyzer:
         width_mean_px = float(width_stats['mean'])
         width_median_px = float(width_stats['median'])
         width_iqr_px = float(width_stats['iqr'])
+        contour_length_px = self._estimate_centerline_length_from_contour(sub_contour, width_median_px)
+        if contour_length_px > length_px * 1.25:
+            length_px = contour_length_px
         slenderness_val = (length_px / width_median_px) if width_median_px > 0 else None
 
         contour_local = (sub_contour + np.array([x_offset, y_offset])).astype(np.int32)
@@ -1593,14 +1713,12 @@ class CNTAnalyzer:
                                   profile: str) -> bool:
         """对候选 CNT 应用长度和长宽比过滤"""
         mode = (profile or "balanced").lower()
+        length_factor = self._get_profile_length_factor(mode)
         if mode == "precision":
-            length_factor = 1.10
             slenderness_factor = 1.15
         elif mode == "recall":
-            length_factor = 0.85
             slenderness_factor = 0.85
         else:
-            length_factor = 1.0
             slenderness_factor = 1.0
 
         length_um = float(candidate['length_pixels']) * self.scale_um_per_pixel
@@ -1679,12 +1797,18 @@ class CNTAnalyzer:
 
         y1, y2, x1, x2 = self._get_analysis_region(roi)
         candidates: List[dict] = []
+        length_factor = self._get_profile_length_factor(profile)
+        eff_min_length_px = 0.0
+        if min_length_um > 0 and self.scale_um_per_pixel > 0:
+            eff_min_length_px = (min_length_um * length_factor) / float(self.scale_um_per_pixel)
         contours, _ = cv2.findContours(
             self.binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         for contour in contours:
             if cv2.contourArea(contour) < 1:
+                continue
+            if eff_min_length_px > 0 and self._estimate_contour_length_upper_bound(contour) < eff_min_length_px:
                 continue
 
             x_min = int(contour[:, 0, 0].min())

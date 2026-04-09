@@ -1,9 +1,11 @@
+import cv2
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
-import analyzer_core as analyzer_core_module
-from analyzer_core import CNTAnalyzer
-from models import CNTMeasurement
+import src.core.analyzer_core as analyzer_core_module
+from src.core.analyzer_core import CNTAnalyzer
+from src.core.models import CNTMeasurement
 
 
 def _make_measurement(measurement_id: int, length_um: float) -> CNTMeasurement:
@@ -123,7 +125,7 @@ def test_recognize_characters_stops_after_high_confidence_template_match(monkeyp
         score = 0.95 if calls["count"] == 1 else 0.1
         return np.array([[score]], dtype=np.float32)
 
-    monkeypatch.setattr("analyzer_core.cv2.matchTemplate", fake_match_template)
+    monkeypatch.setattr("src.core.analyzer_core.cv2.matchTemplate", fake_match_template)
 
     binary = np.full((10, 10), 255, dtype=np.uint8)
     result = analyzer._recognize_characters(binary, [(0, 0, 10, 10)])
@@ -179,6 +181,117 @@ def test_preprocess_can_skip_skeleton_generation(monkeypatch):
     assert calls == {"skeletonize": 0, "overlay": 0}
     assert analyzer.skeleton_image is None
     assert analyzer.skeleton_overlay is None
+
+
+def test_skeletonize_prefers_opencv_thinning_when_available(monkeypatch):
+    analyzer = CNTAnalyzer()
+    binary = np.array(
+        [
+            [0, 255, 0],
+            [255, 255, 255],
+            [0, 255, 0],
+        ],
+        dtype=np.uint8,
+    )
+    expected = np.array(
+        [
+            [0, 0, 0],
+            [0, 255, 0],
+            [0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    calls = {"count": 0}
+
+    def fake_thinning(work):
+        calls["count"] += 1
+        assert work.dtype == np.uint8
+        return expected
+
+    monkeypatch.setattr(analyzer_core_module.cv2, "ximgproc", SimpleNamespace(thinning=fake_thinning), raising=False)
+
+    result = analyzer._skeletonize(binary)
+
+    assert calls["count"] == 1
+    assert np.array_equal(result, expected)
+
+
+def test_trace_skeleton_path_does_not_loop_on_cycle_graph():
+    analyzer = CNTAnalyzer()
+    neighbors = {
+        (0, 0): [(0, 1), (1, 0)],
+        (0, 1): [(0, 0), (1, 1)],
+        (1, 1): [(0, 1), (1, 0)],
+        (1, 0): [(1, 1), (0, 0)],
+    }
+
+    path = analyzer._trace_skeleton_path((0, 0), neighbors, 160.0)
+
+    assert len(path) == len(set(path))
+    assert len(path) <= len(neighbors)
+
+
+def test_find_graph_diameter_path_prefers_longest_branch_to_branch_path():
+    analyzer = CNTAnalyzer()
+    neighbors = {
+        (0, 0): [(0, 1)],
+        (0, 1): [(0, 0), (0, 2)],
+        (0, 2): [(0, 1), (0, 3), (1, 2)],
+        (0, 3): [(0, 2)],
+        (1, 2): [(0, 2), (2, 2)],
+        (2, 2): [(1, 2), (3, 2)],
+        (3, 2): [(2, 2)],
+    }
+
+    path = analyzer._find_graph_diameter_path(neighbors)
+
+    assert {path[0], path[-1]} == {(0, 0), (3, 2)}
+    assert analyzer._calculate_path_length(path) == pytest.approx(5.0)
+
+
+def test_detect_cnts_hybrid_skips_candidates_whose_upper_bound_is_below_min_length(monkeypatch):
+    analyzer = CNTAnalyzer()
+    analyzer.image = np.zeros((16, 16, 3), dtype=np.uint8)
+    analyzer.analysis_image = analyzer.image.copy()
+    analyzer.binary_image = np.zeros((16, 16), dtype=np.uint8)
+    analyzer.binary_image[4:7, 4:7] = 255
+    analyzer.scale_um_per_pixel = 1.0
+
+    calls = {"count": 0}
+
+    def fake_build(*args, **kwargs):
+        calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(analyzer, "_build_cnt_candidate", fake_build)
+
+    measurements = analyzer.detect_cnts_hybrid(min_length_um=10.0)
+
+    assert measurements == []
+    assert calls["count"] == 0
+
+
+def test_build_cnt_candidate_uses_contour_correction_for_sinuous_shape():
+    analyzer = CNTAnalyzer()
+    cnt_binary = np.zeros((220, 420), dtype=np.uint8)
+    points = []
+    for x in range(20, 390, 6):
+        y = int(90 + 45 * np.sin((x - 20) / 55.0))
+        points.append((x, y))
+    for start, end in zip(points, points[1:]):
+        cv2.line(cnt_binary, start, end, 255, 9)
+
+    candidate = analyzer._build_cnt_candidate(
+        cnt_binary,
+        x_offset=0,
+        y_offset=0,
+        profile="balanced",
+        bypass_endpoint_filter=True,
+    )
+
+    assert candidate is not None
+    assert candidate["length_pixels"] > 350.0
+    assert candidate["width_median_px"] > 0.0
 
 
 def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):

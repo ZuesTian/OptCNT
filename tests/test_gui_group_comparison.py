@@ -8,8 +8,8 @@ from matplotlib.figure import Figure
 
 matplotlib.use("Agg")
 
-import gui as gui_module
-from gui import CNTAnalyzerGUI
+import src.gui.gui as gui_module
+from src.gui.gui import CNTAnalyzerGUI
 
 
 class _DummyVar:
@@ -87,6 +87,31 @@ class _DummyExecutor:
         self.shutdown_calls.append((wait, cancel_futures))
 
 
+class _DummySubmitExecutor(_DummyExecutor):
+    def __init__(self, future):
+        super().__init__()
+        self.future = future
+        self.submissions = []
+
+    def submit(self, fn, *args, **kwargs):
+        self.submissions.append((fn, args, kwargs))
+        return self.future
+
+
+class _DummyRoot:
+    def __init__(self):
+        self.after_calls = []
+        self.after_cancel_calls = []
+
+    def after(self, delay, callback, *args):
+        token = f"after-{len(self.after_calls) + 1}"
+        self.after_calls.append((delay, callback, args, token))
+        return token
+
+    def after_cancel(self, token):
+        self.after_cancel_calls.append(token)
+
+
 class _DummyControlPanelState:
     def __init__(self):
         self.calls = []
@@ -116,6 +141,7 @@ class _DummyAnalysisPanel:
         self.cleared_keys = []
         self.refresh_count = 0
         self.scroll_count = 0
+        self.frames = {}
 
     def clear_chart_content(self, key: str):
         self.cleared_keys.append(key)
@@ -125,6 +151,9 @@ class _DummyAnalysisPanel:
 
     def scroll_to_top(self):
         self.scroll_count += 1
+
+    def get_chart_frame(self, key: str):
+        return self.frames.get(key)
 
 
 class _DummyTextWidget:
@@ -159,6 +188,11 @@ class _DummyResultPanelState:
 def _make_gui_stub() -> CNTAnalyzerGUI:
     gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
     gui._preprocess_preview_fast = False
+    gui._preprocess_result_exact = False
+    gui._preprocess_future = None
+    gui._preprocess_snapshot = None
+    gui._preprocess_token = 0
+    gui._preprocess_job = None
     gui.blur_kernel_var = _DummyVar(9)
     gui.adaptive_block_var = _DummyVar(11)
     gui.adaptive_c_var = _DummyVar(3)
@@ -306,6 +340,7 @@ def test_apply_preprocessing_skips_skeleton_for_live_binary_preview():
     gui._preprocess_job = object()
     gui._last_preprocess_signature = None
     gui._update_display = lambda: None
+    gui.bridge_strength_var = _DummyVar(9)
 
     captured = {}
 
@@ -323,7 +358,106 @@ def test_apply_preprocessing_skips_skeleton_for_live_binary_preview():
     gui._apply_preprocessing(force=False)
 
     assert captured["generate_skeleton"] is False
+    assert captured["bridge_strength"] == 5
     assert gui._preprocess_preview_fast is True
+    assert gui._preprocess_result_exact is False
+
+
+def test_apply_preprocessing_submits_background_preview_when_root_available():
+    gui = _make_gui_stub()
+    gui.root = _DummyRoot()
+    gui.current_roi = None
+    gui.display_var = _DummyVar("binary")
+    gui.live_preview_var = _DummyVar(True)
+    gui._last_preprocess_signature = None
+    gui.image_panel = SimpleNamespace(show_status=lambda text: None)
+    gui._update_display = lambda: None
+    gui.bridge_strength_var = _DummyVar(8)
+    gui._preprocess_executor = _DummySubmitExecutor(_RunningFuture())
+
+    analyzer = gui_module.CNTAnalyzer()
+    analyzer.image = np.zeros((24, 24, 3), dtype=np.uint8)
+    analyzer.original_image = analyzer.image.copy()
+    analyzer.analysis_gray_image = np.zeros((24, 24), dtype=np.uint8)
+    gui.analyzer = analyzer
+
+    gui._apply_preprocessing(force=False)
+
+    assert gui._preprocess_future is gui._preprocess_executor.future
+    assert gui._preprocess_snapshot["fast_preview"] is True
+    assert gui._preprocess_snapshot["result_exact"] is False
+    assert len(gui._preprocess_executor.submissions) == 1
+    _, args, _ = gui._preprocess_executor.submissions[0]
+    assert args[1]["bridge_strength"] == 5
+    assert args[1]["generate_skeleton"] is False
+    assert len(gui.root.after_calls) == 1
+
+
+def test_needs_preprocessing_requires_exact_result_for_skeleton_preview():
+    gui = _make_gui_stub()
+    gui.current_roi = None
+    gui.display_var = _DummyVar("skeleton_preview")
+    gui.live_preview_var = _DummyVar(True)
+    gui.analyzer = SimpleNamespace(
+        binary_image=np.ones((8, 8), dtype=np.uint8),
+        skeleton_image=np.ones((8, 8), dtype=np.uint8),
+        scale_exclusion_rect=None,
+        rois=[],
+    )
+    gui._last_preprocess_signature = gui._get_preprocess_signature()
+    gui._preprocess_result_exact = False
+
+    assert gui._needs_preprocessing() is True
+
+
+def test_load_image_common_discards_stale_preprocess_state(monkeypatch):
+    gui = _make_gui_stub()
+    gui.root = _DummyRoot()
+    gui.MODERN_COLORS = {"warning": "#f59e0b"}
+    old_executor = _DummyExecutor()
+    replacement_executors = []
+    reset_calls = []
+    statuses = []
+
+    class _ReplacementExecutor(_DummyExecutor):
+        pass
+
+    def _fake_thread_pool(*args, **kwargs):
+        executor = _ReplacementExecutor()
+        replacement_executors.append((executor, args, kwargs))
+        return executor
+
+    monkeypatch.setattr(gui_module, "ThreadPoolExecutor", _fake_thread_pool)
+
+    gui._preprocess_executor = old_executor
+    gui._preprocess_future = _RunningFuture()
+    gui._preprocess_snapshot = {"image_id": 1}
+    gui._preprocess_token = 4
+    gui._preprocess_job = "after-1"
+    gui._discard_single_detection_state = lambda *args, **kwargs: None
+    gui._reset_display = lambda: reset_calls.append(True)
+    gui._refresh_scale_status_ui = lambda: None
+    gui._auto_suggest_params = lambda: None
+    gui._refresh_analysis_status_ui = lambda: None
+    gui.live_preview_var = _DummyVar(False)
+    gui.scale_um_var = _DummyVar(0.0)
+    gui.scale_pixels_var = _DummyVar(0.0)
+    gui.image_panel = SimpleNamespace(show_status=lambda text: statuses.append(text))
+    gui.analyzer = SimpleNamespace(
+        apply_detected_scale=lambda default_micrometers: {"applied": False, "scale_info": None},
+    )
+
+    gui._load_image_common()
+
+    assert gui._preprocess_future is None
+    assert gui._preprocess_snapshot is None
+    assert gui._preprocess_token == 5
+    assert old_executor.shutdown_calls == [(False, True)]
+    assert len(replacement_executors) == 1
+    assert isinstance(gui._preprocess_executor, _ReplacementExecutor)
+    assert gui.root.after_cancel_calls == ["after-1"]
+    assert reset_calls == [True]
+    assert len(statuses) == 1
 
 
 def test_display_mode_change_forces_full_preprocess_when_skeleton_preview_needs_skeleton():
@@ -347,6 +481,88 @@ def test_display_mode_change_forces_full_preprocess_when_skeleton_preview_needs_
     gui._on_display_mode_change()
 
     assert calls == [True]
+
+
+def test_init_chart_removes_cached_colorbar_before_redraw():
+    gui = _make_gui_stub()
+    gui.analysis_panel = _DummyAnalysisPanel()
+    gui.analysis_panel.frames["heatmap"] = object()
+
+    class _DummyColorbar:
+        def __init__(self):
+            self.remove_calls = 0
+
+        def remove(self):
+            self.remove_calls += 1
+
+    class _DummyAxes:
+        def __init__(self):
+            self.clear_calls = 0
+
+        def clear(self):
+            self.clear_calls += 1
+
+    colorbar = _DummyColorbar()
+    axes = _DummyAxes()
+    gui._charts = {
+        "heatmap": {
+            "fig": object(),
+            "ax": axes,
+            "canvas": object(),
+            "colorbar": colorbar,
+            "draw_count": 1,
+        }
+    }
+
+    chart = gui._init_chart("heatmap")
+
+    assert chart["colorbar"] is None
+    assert colorbar.remove_calls == 1
+    assert axes.clear_calls == 1
+
+
+def test_handle_single_detection_result_defers_advanced_analysis_refresh(monkeypatch):
+    gui = _make_gui_stub()
+    gui.root = _DummyRoot()
+    gui.current_roi = None
+    gui._single_detect_token = 3
+    gui._single_detect_future = None
+    gui._single_detect_snapshot = None
+    gui._last_preprocess_signature = ("sig",)
+    gui._roi_signature = lambda roi: None
+    gui.MODERN_COLORS = {"info": "#0ea5e9"}
+    gui.analyzer = SimpleNamespace(image=np.zeros((12, 12, 3), dtype=np.uint8), measurements=[])
+
+    status_calls = []
+    sync_calls = []
+    busy_calls = []
+    refresh_calls = []
+    image_statuses = []
+
+    gui.control_panel = SimpleNamespace(update_analysis_status=lambda *args, **kwargs: status_calls.append((args, kwargs)))
+    gui.image_panel = SimpleNamespace(show_status=lambda text: image_statuses.append(text))
+    gui._sync_views = lambda **kwargs: sync_calls.append(kwargs)
+    gui._set_single_detection_busy_state = lambda busy: busy_calls.append(busy)
+    gui._refresh_analysis_status_ui = lambda: refresh_calls.append(True)
+    gui._update_advanced_analysis = lambda: None
+
+    class _DoneFutureWithResult:
+        def result(self):
+            return [SimpleNamespace(id=0)]
+
+    monkeypatch.setattr(gui_module.messagebox, "showinfo", lambda *args, **kwargs: None)
+
+    future = _DoneFutureWithResult()
+    snapshot = {"image_id": id(gui.analyzer.image), "preprocess_signature": ("sig",), "roi_signature": None}
+    gui._handle_single_detection_result(3, snapshot, future)
+
+    assert sync_calls == [{"refresh_analysis": False}]
+    assert busy_calls == [False]
+    assert refresh_calls == [True]
+    assert gui.root.after_calls[0][0] == 10
+    assert gui.root.after_calls[0][1] == gui._update_advanced_analysis
+    assert len(gui.analyzer.measurements) == 1
+    assert image_statuses
 
 
 def test_apply_scale_forces_preprocess_refresh_in_preprocess_mode(monkeypatch):

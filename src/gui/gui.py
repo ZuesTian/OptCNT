@@ -92,13 +92,18 @@ class CNTAnalyzerGUI:
         self.roi_counter = 0
         self.zoom_level = 1.0
         self._preprocess_job = None
+        self._preprocess_executor = self._create_preprocess_executor()
+        self._preprocess_future = None
+        self._preprocess_snapshot = None
+        self._preprocess_token = 0
+        self._preprocess_result_exact = False
         self._layout_job = None
         self._layout_retry_count = 0
         self._comparison_layout_job = None
         self.main_paned: Optional[tk.PanedWindow] = None
         self.current_image_path: Optional[str] = None
         self._analysis_cache = OrderedDict()
-        self._analysis_cache_limit = 48
+        self._analysis_cache_limit = 24
         self._last_auto_suggest_result = None
         self._last_root_size: Optional[Tuple[int, int]] = None
         self._pending_scale_selection = None
@@ -115,11 +120,11 @@ class CNTAnalyzerGUI:
         
         # 图表缓存
         self._charts = {
-            'histogram': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
-            'pie': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
-            'cluster': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
-            'heatmap': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
-            'comparison': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
+            'histogram': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
+            'pie': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
+            'cluster': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
+            'heatmap': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
+            'comparison': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
         }
 
         # Tkinter变量
@@ -455,6 +460,64 @@ class CNTAnalyzerGUI:
         """Whether a background single-image detection job is still running."""
         future = getattr(self, '_single_detect_future', None)
         return future is not None and not future.done()
+
+    def _is_preprocessing_running(self) -> bool:
+        """Whether a background preprocess preview job is still running."""
+        future = getattr(self, '_preprocess_future', None)
+        return future is not None and not future.done()
+
+    @staticmethod
+    def _create_preprocess_executor() -> ThreadPoolExecutor:
+        """Create the dedicated executor used for background preprocess previews."""
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="cnt-preprocess")
+
+    def _reset_preprocess_executor(self) -> None:
+        """Swap in a fresh preprocess executor so stale jobs cannot block newer previews."""
+        executor = getattr(self, '_preprocess_executor', None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                logger.debug("Unable to reset the preprocess executor cleanly.")
+        self._preprocess_executor = self._create_preprocess_executor()
+
+    def _discard_preprocess_state(self,
+                                  *,
+                                  include_completed: bool = False,
+                                  notify: bool = False,
+                                  image_reason: Optional[str] = None) -> bool:
+        """Invalidate stale preprocess preview state after context changes."""
+        preprocess_job = getattr(self, '_preprocess_job', None)
+        if preprocess_job is not None and getattr(self, 'root', None) is not None:
+            try:
+                self.root.after_cancel(preprocess_job)
+            except Exception:
+                logger.debug("Unable to cancel the pending preprocess debounce callback cleanly.")
+            self._preprocess_job = None
+
+        future = getattr(self, '_preprocess_future', None)
+        snapshot = getattr(self, '_preprocess_snapshot', None)
+        if future is None and snapshot is None:
+            return preprocess_job is not None
+
+        is_running = future is not None and not future.done()
+        if not include_completed and not is_running:
+            return preprocess_job is not None
+
+        if is_running:
+            try:
+                future.cancel()
+            except Exception:
+                logger.debug("Unable to cancel the in-flight preprocess future; it will finish in the background.")
+            self._reset_preprocess_executor()
+
+        self._preprocess_future = None
+        self._preprocess_snapshot = None
+        self._preprocess_token += 1
+
+        if notify and image_reason and getattr(self, 'image_panel', None) is not None:
+            self.image_panel.show_status(image_reason)
+        return True
 
     @staticmethod
     def _create_single_detect_executor() -> ThreadPoolExecutor:
@@ -820,6 +883,10 @@ class CNTAnalyzerGUI:
 
     def _on_close(self) -> None:
         """Release background resources before closing the main window."""
+        preprocess_executor = getattr(self, '_preprocess_executor', None)
+        if preprocess_executor is not None:
+            preprocess_executor.shutdown(wait=False, cancel_futures=True)
+            self._preprocess_executor = None
         executor = getattr(self, '_single_detect_executor', None)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -829,6 +896,7 @@ class CNTAnalyzerGUI:
     # ===== 文件操作 =====
     def _load_image_common(self):
         """加载图像后的通用流程"""
+        self._discard_preprocess_state(include_completed=True, notify=False)
         self._discard_single_detection_state(include_completed=True, notify=False)
         self._reset_display()
 
@@ -928,6 +996,7 @@ class CNTAnalyzerGUI:
         self.zoom_level = 1.0
         self._pending_scale_selection = None
         self._preprocess_preview_fast = False
+        self._preprocess_result_exact = False
         if self.image_panel is not None:
             self.image_panel.set_zoom_level(self.zoom_level)
         self.current_roi = None
@@ -1181,6 +1250,10 @@ class CNTAnalyzerGUI:
         params = self._auto_suggest_params()
         if self.live_preview_var.get() and self._is_preprocess_mode():
             self._schedule_preprocessing()
+        elif not self.live_preview_var.get():
+            self._discard_preprocess_state(include_completed=True, notify=False)
+        elif not self.live_preview_var.get():
+            self._discard_preprocess_state(include_completed=True, notify=False)
         elif self._is_preprocess_mode():
             self._apply_preprocessing(force=True)
         if params:
@@ -1217,6 +1290,21 @@ class CNTAnalyzerGUI:
             and self.display_var.get() == "binary"
         )
 
+    def _should_limit_bridge_for_preview(self, force: bool = False) -> bool:
+        """Use a smaller bridge kernel while the UI is in live preview mode."""
+        return (
+            not force
+            and self.live_preview_var.get()
+            and self._is_preprocess_mode()
+        )
+
+    def _get_effective_bridge_strength(self, force: bool = False) -> int:
+        """Clamp bridge strength during live previews to keep interaction responsive."""
+        bridge_strength = int(self.bridge_strength_var.get())
+        if self._should_limit_bridge_for_preview(force=force):
+            return min(bridge_strength, 5)
+        return bridge_strength
+
     def _get_active_preprocess_roi(self) -> Optional[ROIRegion]:
         """获取当前预处理使用的ROI"""
         roi_to_use = self.current_roi
@@ -1241,11 +1329,27 @@ class CNTAnalyzerGUI:
 
     def _needs_preprocessing(self) -> bool:
         """判断当前参数/ROI是否需要重新预处理"""
+        require_skeleton = self.display_var.get() == "skeleton_preview"
+        require_exact = require_skeleton
+        return not self._has_usable_preprocess_result(
+            require_exact=require_exact,
+            require_skeleton=require_skeleton,
+        )
+
+    def _has_usable_preprocess_result(self,
+                                      *,
+                                      require_exact: bool = False,
+                                      require_skeleton: bool = False) -> bool:
+        """Whether the live analyzer already has a preprocess result we can trust."""
         if self.analyzer.binary_image is None:
-            return True
-        if self.display_var.get() == "skeleton_preview" and getattr(self.analyzer, "skeleton_image", None) is None:
-            return True
-        return self._get_preprocess_signature() != self._last_preprocess_signature
+            return False
+        if self._get_preprocess_signature() != self._last_preprocess_signature:
+            return False
+        if require_exact and not getattr(self, '_preprocess_result_exact', False):
+            return False
+        if require_skeleton and getattr(self.analyzer, "skeleton_image", None) is None:
+            return False
+        return True
 
     def _on_live_preview_toggle(self):
         """实时预览开关切换 - 控制滑块拖动时是否自动刷新"""
@@ -1287,23 +1391,72 @@ class CNTAnalyzerGUI:
             roi_to_use = self._get_active_preprocess_roi()
             signature = self._get_preprocess_signature()
             fast_preview = self._should_use_fast_preprocess_preview(force=force)
+            effective_bridge_strength = self._get_effective_bridge_strength(force=force)
+            result_exact = (not fast_preview) and effective_bridge_strength == int(self.bridge_strength_var.get())
 
-            if not force and self.analyzer.binary_image is not None and signature == self._last_preprocess_signature:
+            require_skeleton = self.display_var.get() == "skeleton_preview" and not fast_preview
+            if (
+                not force
+                and self._has_usable_preprocess_result(
+                    require_exact=False,
+                    require_skeleton=require_skeleton,
+                )
+            ):
                 self._update_display()
                 return
 
-            self.analyzer.preprocess(
-                blur_kernel=blur_kernel,
-                adaptive_block=adaptive_block,
-                adaptive_c=adaptive_c,
-                bridge_strength=int(self.bridge_strength_var.get()),
-                threshold_invert=True,
-                roi=roi_to_use,
-                generate_skeleton=not fast_preview,
+            pending_snapshot = getattr(self, '_preprocess_snapshot', None)
+            if (
+                not force
+                and self._is_preprocessing_running()
+                and pending_snapshot is not None
+                and pending_snapshot.get('preprocess_signature') == signature
+                and pending_snapshot.get('active_roi_signature') == self._roi_signature(roi_to_use)
+                and pending_snapshot.get('fast_preview') == fast_preview
+                and pending_snapshot.get('effective_bridge_strength') == effective_bridge_strength
+            ):
+                return
+
+            preprocess_settings = {
+                'blur_kernel': int(blur_kernel),
+                'adaptive_block': int(adaptive_block),
+                'adaptive_c': int(adaptive_c),
+                'bridge_strength': int(effective_bridge_strength),
+                'threshold_invert': True,
+                'generate_skeleton': not fast_preview,
+            }
+            snapshot = {
+                'image_id': id(self.analyzer.image),
+                'preprocess_signature': signature,
+                'active_roi_signature': self._roi_signature(roi_to_use),
+                'fast_preview': fast_preview,
+                'result_exact': result_exact,
+                'effective_bridge_strength': int(effective_bridge_strength),
+            }
+
+            if force or getattr(self, 'root', None) is None:
+                self._discard_preprocess_state(include_completed=True, notify=False)
+                self.analyzer.preprocess(roi=roi_to_use, **preprocess_settings)
+                self._preprocess_preview_fast = fast_preview
+                self._preprocess_result_exact = result_exact
+                self._last_preprocess_signature = signature
+                self._update_display()
+                return
+
+            self._discard_preprocess_state(include_completed=True, notify=False)
+            analyzer_snapshot, roi_snapshot = self._clone_analyzer_for_preprocess()
+            self._preprocess_token += 1
+            task_token = self._preprocess_token
+            self._preprocess_snapshot = snapshot
+            self._preprocess_future = self._preprocess_executor.submit(
+                self._run_preprocess_task,
+                analyzer_snapshot,
+                preprocess_settings,
+                roi_snapshot,
             )
-            self._preprocess_preview_fast = fast_preview
-            self._last_preprocess_signature = signature
-            self._update_display()
+            if getattr(self, 'image_panel', None) is not None:
+                self.image_panel.show_status("预处理预览更新中...")
+            self.root.after(40, self._poll_preprocess_result, task_token, snapshot)
         except (TypeError, ValueError, tk.TclError, cv2.error) as e:
             logger.exception(f"预处理错误: {e}")
         except Exception as e:
@@ -1387,20 +1540,25 @@ class CNTAnalyzerGUI:
             measurements=[],
         )
 
-    def _clone_analyzer_for_detection(self) -> Tuple[CNTAnalyzer, Optional[ROIRegion]]:
-        """Snapshot the current analyzer state for background single-image detection."""
+    def _clone_analyzer_snapshot(self, *, include_preprocess_outputs: bool) -> CNTAnalyzer:
+        """Snapshot the live analyzer state for background work."""
         snapshot = CNTAnalyzer()
-        for attr in (
+        attrs = [
             'original_image',
             'analysis_image',
             'analysis_gray_image',
             'image',
-            'processed_image',
-            'binary_image',
-            'skeleton_image',
-            'skeleton_overlay',
             'scale_exclusion_mask',
-        ):
+        ]
+        if include_preprocess_outputs:
+            attrs.extend([
+                'processed_image',
+                'binary_image',
+                'skeleton_image',
+                'skeleton_overlay',
+            ])
+
+        for attr in attrs:
             value = getattr(self.analyzer, attr, None)
             setattr(snapshot, attr, value.copy() if isinstance(value, np.ndarray) else value)
 
@@ -1410,8 +1568,33 @@ class CNTAnalyzerGUI:
         snapshot.scale_status = dict(self.analyzer.scale_status)
         snapshot.auto_enhance_enabled = bool(self.analyzer.auto_enhance_enabled)
         snapshot.rois = [self._clone_roi_region(roi) for roi in self.analyzer.rois]
+        return snapshot
+
+    def _clone_analyzer_for_preprocess(self) -> Tuple[CNTAnalyzer, Optional[ROIRegion]]:
+        """Snapshot the current analyzer state for background preprocess previews."""
+        roi_to_use = self._get_active_preprocess_roi()
+        snapshot = self._clone_analyzer_snapshot(include_preprocess_outputs=False)
+        roi_snapshot = self._clone_roi_region(roi_to_use) if roi_to_use is not None else None
+        return snapshot, roi_snapshot
+
+    def _clone_analyzer_for_detection(self) -> Tuple[CNTAnalyzer, Optional[ROIRegion]]:
+        """Snapshot the current analyzer state for background single-image detection."""
+        snapshot = self._clone_analyzer_snapshot(include_preprocess_outputs=True)
         roi_snapshot = self._clone_roi_region(self.current_roi) if self.current_roi is not None else None
         return snapshot, roi_snapshot
+
+    @staticmethod
+    def _run_preprocess_task(analyzer_snapshot: CNTAnalyzer,
+                             preprocess_settings: dict,
+                             roi_snapshot: Optional[ROIRegion]) -> dict:
+        """Run preprocess work off the UI thread using a frozen analyzer snapshot."""
+        analyzer_snapshot.preprocess(roi=roi_snapshot, **preprocess_settings)
+        return {
+            'binary_image': None if analyzer_snapshot.binary_image is None else analyzer_snapshot.binary_image.copy(),
+            'processed_image': None if analyzer_snapshot.processed_image is None else analyzer_snapshot.processed_image.copy(),
+            'skeleton_image': None if analyzer_snapshot.skeleton_image is None else analyzer_snapshot.skeleton_image.copy(),
+            'skeleton_overlay': None if analyzer_snapshot.skeleton_overlay is None else analyzer_snapshot.skeleton_overlay.copy(),
+        }
 
     @staticmethod
     def _run_single_detection_task(analyzer_snapshot: CNTAnalyzer,
@@ -1419,6 +1602,62 @@ class CNTAnalyzerGUI:
                                    roi_snapshot: Optional[ROIRegion]) -> List[CNTMeasurement]:
         """Run CNT detection off the UI thread using a frozen analyzer snapshot."""
         return list(analyzer_snapshot.detect_cnts_hybrid(roi=roi_snapshot, **detect_settings))
+
+    def _handle_preprocess_result(self,
+                                  task_token: int,
+                                  snapshot: dict,
+                                  future) -> None:
+        """Apply a finished preprocess preview back onto the live analyzer."""
+        if getattr(self, '_preprocess_future', None) is future:
+            self._preprocess_future = None
+        if getattr(self, '_preprocess_snapshot', None) is snapshot:
+            self._preprocess_snapshot = None
+
+        try:
+            result = future.result()
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
+            logger.exception("Preprocess preview failed")
+            if getattr(self, 'image_panel', None) is not None:
+                self.image_panel.show_status(f"预处理预览失败: {exc}")
+            return
+        except Exception as exc:
+            logger.exception("Unexpected preprocess preview failure")
+            if getattr(self, 'image_panel', None) is not None:
+                self.image_panel.show_status(f"预处理预览失败: {exc}")
+            return
+
+        current_roi_signature = self._roi_signature(self._get_active_preprocess_roi())
+        if (
+            task_token != getattr(self, '_preprocess_token', -1) or
+            self.analyzer.image is None or
+            id(self.analyzer.image) != snapshot.get('image_id') or
+            self._get_preprocess_signature() != snapshot.get('preprocess_signature') or
+            current_roi_signature != snapshot.get('active_roi_signature')
+        ):
+            logger.debug("Discarding stale preprocess preview result.")
+            return
+
+        self.analyzer.binary_image = result.get('binary_image')
+        self.analyzer.processed_image = result.get('processed_image')
+        self.analyzer.skeleton_image = result.get('skeleton_image')
+        self.analyzer.skeleton_overlay = result.get('skeleton_overlay')
+        self._preprocess_preview_fast = bool(snapshot.get('fast_preview', False))
+        self._preprocess_result_exact = bool(snapshot.get('result_exact', False))
+        self._last_preprocess_signature = snapshot.get('preprocess_signature')
+        self._update_display()
+
+    def _poll_preprocess_result(self, task_token: int, snapshot: dict) -> None:
+        """Poll a background preprocess future from the Tk main thread."""
+        future = getattr(self, '_preprocess_future', None)
+        if future is None or task_token != getattr(self, '_preprocess_token', -1):
+            return
+        if not future.done():
+            try:
+                self.root.after(40, self._poll_preprocess_result, task_token, snapshot)
+            except tk.TclError:
+                logger.debug("Preprocess preview polling was cancelled after the window closed.")
+            return
+        self._handle_preprocess_result(task_token, snapshot, future)
 
     def _handle_single_detection_result(self,
                                         task_token: int,
@@ -1475,9 +1714,14 @@ class CNTAnalyzerGUI:
         else:
             self.analyzer.measurements = list(measurements)
 
-        self._sync_views()
+        self._sync_views(refresh_analysis=False)
         self._set_single_detection_busy_state(False)
         self._refresh_analysis_status_ui()
+        if getattr(self, 'root', None) is not None:
+            try:
+                self.root.after(10, self._update_advanced_analysis)
+            except tk.TclError:
+                logger.debug("Advanced analysis refresh was skipped after the window closed.")
 
         target_text = f"ROI {self.current_roi.name}" if self.current_roi is not None else "全图"
         count = len(measurements)
@@ -1519,7 +1763,8 @@ class CNTAnalyzerGUI:
             filter_settings = self._get_detection_filter_settings(strict=True)
 
             current_signature = self._get_preprocess_signature()
-            if self.analyzer.binary_image is None or current_signature != self._last_preprocess_signature:
+            if not self._has_usable_preprocess_result(require_exact=True, require_skeleton=False):
+                self._discard_preprocess_state(include_completed=True, notify=False)
                 self._apply_preprocessing(force=True)
             current_signature = self._last_preprocess_signature
 
@@ -1910,6 +2155,12 @@ class CNTAnalyzerGUI:
     def _dispose_chart(self, key: str):
         """销毁图表对象，避免长时间运行时累积旧 Figure。"""
         chart = self._charts[key]
+        colorbar = chart.get('colorbar')
+        if colorbar is not None:
+            try:
+                colorbar.remove()
+            except Exception:
+                logger.debug("Unable to remove cached colorbar for chart %s during disposal.", key)
         canvas = chart.get('canvas')
         if canvas is not None:
             try:
@@ -1924,6 +2175,7 @@ class CNTAnalyzerGUI:
         chart['fig'] = None
         chart['ax'] = None
         chart['canvas'] = None
+        chart['colorbar'] = None
         chart['draw_count'] = 0
 
     def _init_chart(self, key: str, figsize=(6, 4)):
@@ -1947,6 +2199,13 @@ class CNTAnalyzerGUI:
             chart['canvas'] = FigureCanvasTkAgg(chart['fig'], master=frame)
             chart['canvas'].get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
         elif chart['ax'] is not None:
+            colorbar = chart.get('colorbar')
+            if colorbar is not None:
+                try:
+                    colorbar.remove()
+                except Exception:
+                    logger.debug("Unable to remove cached colorbar for chart %s before redraw.", key)
+                chart['colorbar'] = None
             chart['ax'].clear()
 
         chart['draw_count'] = chart.get('draw_count', 0) + 1
@@ -2514,10 +2773,7 @@ class CNTAnalyzerGUI:
                 },
             )
 
-            if 'colorbar' not in chart or chart['colorbar'] is None:
-                chart['colorbar'] = chart['fig'].colorbar(heatmap, ax=ax, fraction=0.046, pad=0.04)
-            else:
-                chart['colorbar'].update_normal(heatmap)
+            chart['colorbar'] = chart['fig'].colorbar(heatmap, ax=ax, fraction=0.046, pad=0.04)
             chart['colorbar'].ax.tick_params(colors=self.MODERN_COLORS['text_secondary'])
             chart['colorbar'].set_label('阴影团聚强度 (0-100)', color=self.MODERN_COLORS['text_secondary'])
 

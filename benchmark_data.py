@@ -13,8 +13,8 @@ from typing import Dict, List
 import cv2
 import numpy as np
 
-from analyzer_core import CNTAnalyzer
-from utils import (
+from src.core.analyzer_core import CNTAnalyzer
+from src.core.utils import (
     SCALE_BAR_DEFAULT_UM,
     CALIBRATED_BLUR_KERNEL,
     CALIBRATED_ADAPTIVE_BLOCK,

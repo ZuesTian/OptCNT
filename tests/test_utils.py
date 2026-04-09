@@ -1,6 +1,6 @@
 import numpy as np
 
-from utils import get_length_histogram_bins
+from src.core.utils import get_length_histogram_bins
 
 
 def test_get_length_histogram_bins_returns_default_bins_for_empty_input():

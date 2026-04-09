@@ -12,10 +12,13 @@ $BuildRequirements = Join-Path $ProjectRoot "requirements-build.txt"
 $BuildScript = Join-Path $ProjectRoot "build_minimal.py"
 $ExePath = Join-Path $ProjectRoot "dist\\OptCNT.exe"
 
-if (-not (Test-Path $ResolvedVenvDir)) {
-    Write-Host "Creating virtual environment at $ResolvedVenvDir"
-    & $Python -m venv $ResolvedVenvDir
+if (Test-Path $ResolvedVenvDir) {
+    Write-Host "Refreshing build virtual environment at $ResolvedVenvDir"
+    Remove-Item -LiteralPath $ResolvedVenvDir -Recurse -Force
 }
+
+Write-Host "Creating virtual environment at $ResolvedVenvDir"
+& $Python -m venv $ResolvedVenvDir
 
 if (-not (Test-Path $VenvPython)) {
     throw "Virtual environment python was not found: $VenvPython"

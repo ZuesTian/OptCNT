@@ -18,9 +18,9 @@ The script will:
 
 ## Minimal runtime dependencies
 
-`requirements.txt` intentionally excludes optional heavy packages:
+`requirements.txt` keeps the packaged GUI lean while preserving fast thinning:
 
-- `opencv-python-headless` is used instead of the full OpenCV desktop build
+- `opencv-contrib-python-headless` is used so `cv2.ximgproc.thinning` is available in packaged builds
 - `scikit-learn` is optional and listed in `requirements-optional.txt`
 - `scipy` and `scikit-image` are no longer required for the packaged GUI build
 

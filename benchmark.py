@@ -7,7 +7,7 @@ import time
 from typing import Dict, List, Optional
 import numpy as np
 
-from analyzer_core import CNTAnalyzer
+from src.core.analyzer_core import CNTAnalyzer
 from profiler import PerformanceTimer, PerformanceProfiler
 
 

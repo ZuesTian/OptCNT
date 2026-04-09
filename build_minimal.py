@@ -77,6 +77,7 @@ EXCLUDE_MODULES = [
 ]
 
 HIDDEN_IMPORTS = [
+    "cv2.ximgproc",
     "matplotlib.backends._backend_tk",
     "matplotlib.backends.backend_tkagg",
     "PIL._imagingtk",
