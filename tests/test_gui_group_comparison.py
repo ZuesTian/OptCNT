@@ -79,6 +79,14 @@ class _DoneFuture:
         return True
 
 
+class _ResultFuture(_DoneFuture):
+    def __init__(self, payload):
+        self.payload = payload
+
+    def result(self):
+        return self.payload
+
+
 class _DummyExecutor:
     def __init__(self):
         self.shutdown_calls = []
@@ -156,6 +164,30 @@ class _DummyAnalysisPanel:
         return self.frames.get(key)
 
 
+class _DummyComparisonPanel(_DummyAnalysisPanel):
+    def __init__(self):
+        super().__init__()
+        self.progress_visible = False
+        self.progress_updates = []
+        self.section_heights = {}
+        self.text_content = {}
+
+    def show_progress(self):
+        self.progress_visible = True
+
+    def hide_progress(self):
+        self.progress_visible = False
+
+    def update_progress(self, current: int, total: int, message: str = ""):
+        self.progress_updates.append((current, total, message))
+
+    def set_section_height(self, key: str, value: int):
+        self.section_heights[key] = value
+
+    def set_text_content(self, key: str, value: str):
+        self.text_content[key] = value
+
+
 class _DummyTextWidget:
     def __init__(self):
         self.parts = []
@@ -193,6 +225,13 @@ def _make_gui_stub() -> CNTAnalyzerGUI:
     gui._preprocess_snapshot = None
     gui._preprocess_token = 0
     gui._preprocess_job = None
+    gui._single_detect_future = None
+    gui._single_detect_snapshot = None
+    gui._single_detect_token = 0
+    gui._compare_future = None
+    gui._compare_snapshot = None
+    gui._compare_token = 0
+    gui._comparison_layout_job = None
     gui.blur_kernel_var = _DummyVar(9)
     gui.adaptive_block_var = _DummyVar(11)
     gui.adaptive_c_var = _DummyVar(3)
@@ -973,6 +1012,36 @@ def test_show_group_comparison_window_reuses_dispersion_dashboard():
     assert len(captured["figure"].axes) == 4
 
 
+def test_plot_dispersion_bar_chart_ylim_includes_error_bars_and_pvalue_annotation():
+    gui = _make_gui_stub()
+    figure = Figure()
+    ax = figure.add_subplot(111)
+    left_group = {
+        "label": "base缁?",
+        "dispersed_count_stats": {"mean": 8.0, "std": 28.0},
+    }
+    right_group = {
+        "label": "瀹為獙缁?",
+        "dispersed_count_stats": {"mean": 12.0, "std": 18.0},
+    }
+
+    gui._plot_dispersion_bar_chart(
+        ax,
+        left_group,
+        right_group,
+        "dispersed_count_stats",
+        "鍒嗘暎CNT鏁伴噺瀵规瘮",
+        "鏁伴噺",
+        "{:.1f}",
+        test_result={"t_pvalue": 0.012},
+    )
+
+    lower, upper = ax.get_ylim()
+    assert lower == 0.0
+    assert upper > 36.0
+    assert any("p=" in text.get_text() for text in ax.texts)
+
+
 def test_prepare_comparison_display_image_skips_near_identity_resize():
     gui = _make_gui_stub()
     image = np.zeros((620, 1000, 3), dtype=np.uint8)
@@ -1109,6 +1178,7 @@ def test_update_advanced_analysis_clears_stale_charts_when_active_context_has_no
     gui.current_roi = SimpleNamespace(measurements=[])
     gui.analyzer = SimpleNamespace(measurements=[object()])
     gui._charts = {
+        'score': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
         'histogram': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
         'pie': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
         'cluster': {'fig': None, 'ax': None, 'canvas': None, 'draw_count': 0},
@@ -1118,7 +1188,48 @@ def test_update_advanced_analysis_clears_stale_charts_when_active_context_has_no
 
     gui._update_advanced_analysis()
 
-    assert gui.analysis_panel.cleared_keys == ['histogram', 'pie', 'cluster', 'heatmap']
+    assert gui.analysis_panel.cleared_keys == ['score', 'histogram', 'pie', 'cluster', 'heatmap']
+    assert gui.analysis_panel.refresh_count == 1
+
+
+def test_update_advanced_analysis_populates_expanded_chart_set():
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    measurements = [
+        SimpleNamespace(id=1, length_um=10.0, width_mean_um=0.3),
+        SimpleNamespace(id=2, length_um=12.0, width_mean_um=0.5),
+        SimpleNamespace(id=3, length_um=16.0, width_mean_um=0.7),
+    ]
+    gui.current_roi = None
+    gui._get_active_measurements = lambda: measurements
+    gui.analysis_panel = _DummyAnalysisPanel()
+    gui.analyzer = SimpleNamespace(
+        get_statistics=lambda roi=None: {
+            "count": 3,
+            "spatial_distribution": {"uniformity_scores": {}, "aggregation_scores": {}},
+        },
+        get_dispersed_statistics=lambda roi=None: {
+            "dispersed_count": 2,
+            "agglomerated_count": 1,
+            "dispersed_measurements": measurements[:2],
+        },
+    )
+
+    calls = []
+    gui._draw_spatial_score_chart = lambda spatial, cnt_count=None: calls.append(("score", cnt_count))
+    gui._draw_distribution_chart = lambda values: calls.append(("histogram", [m.id for m in values]))
+    gui._draw_pie_chart = lambda distribution: calls.append(("pie", distribution))
+    gui._draw_cluster_analysis = lambda values: calls.append(("cluster", [m.id for m in values]))
+    gui._draw_spatial_heatmap = lambda spatial, cnt_count=None: calls.append(("heatmap", cnt_count))
+
+    gui._update_advanced_analysis()
+
+    assert calls == [
+        ("score", 3),
+        ("histogram", [1, 2]),
+        ("pie", {"分散CNT": 2, "团聚CNT": 1}),
+        ("cluster", [1, 2]),
+        ("heatmap", 3),
+    ]
     assert gui.analysis_panel.refresh_count == 1
 
 
@@ -1212,6 +1323,7 @@ def test_update_results_prioritizes_dispersed_statistics_for_primary_summary():
             "agglomerated_count": 6,
             "dispersed_ratio": 1 / 3,
             "dispersed_measurements": measurements[:2],
+            "agglomerated_measurements": measurements[2:],
             "dispersed_length_stats": {
                 "count": 2,
                 "length_mean": 11.0,
@@ -1231,6 +1343,8 @@ def test_update_results_prioritizes_dispersed_statistics_for_primary_summary():
     assert "11.00" in text
     assert "99.00" not in text
     assert len(gui.result_panel.rows) == 3
+    assert gui.result_panel.rows[0] == (1, "10.00", "是", "")
+    assert gui.result_panel.rows[2] == (3, "18.00", "", "是")
 
 
 def test_update_results_falls_back_to_base_statistics_when_dispersed_stats_fail():
@@ -1261,6 +1375,7 @@ def test_update_results_falls_back_to_base_statistics_when_dispersed_stats_fail(
     assert "2\n\n" in text
     assert "11.00" in text
     assert len(gui.result_panel.rows) == 2
+    assert gui.result_panel.rows[0] == (1, "10.00", "", "")
 
 
 def test_analyze_image_files_reuses_cache_and_dispatches_only_uncached_tasks():
@@ -1552,29 +1667,89 @@ def test_compare_two_images_uses_batch_analysis_pipeline(monkeypatch):
     selected_paths = iter([r"C:\tmp\a.png", r"C:\tmp\b.png"])
     monkeypatch.setattr(gui_module.filedialog, "askopenfilename", lambda **kwargs: next(selected_paths))
 
-    calls = []
-    left_result = _make_batch_analysis_result(r"C:\tmp\a.png", 12.0)
-    right_result = _make_batch_analysis_result(r"C:\tmp\b.png", 15.0)
-    left_result["visualization"] = np.zeros((32, 48, 3), dtype=np.uint8)
-    right_result["visualization"] = np.zeros((32, 48, 3), dtype=np.uint8)
-    left_result["dispersed_stats"] = {"dispersed_count": 8, "agglomerated_count": 4, "dispersed_ratio": 8 / 12}
-    right_result["dispersed_stats"] = {"dispersed_count": 9, "agglomerated_count": 6, "dispersed_ratio": 9 / 15}
-
-    def _fake_analyze_image_files(paths, group_label):
-        calls.append((list(paths), group_label))
-        return [left_result, right_result], []
-
-    rendered = []
-    gui._analyze_image_files = _fake_analyze_image_files
-    gui._analyze_image_file = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not call single-image analysis"))
-    gui._show_comparison_window = lambda left, right, left_label, right_label, note=None: rendered.append(
-        (left["path"], right["path"], left_label, right_label)
-    )
+    requests = []
+    gui._start_compare_analysis = lambda request: requests.append(dict(request))
 
     gui._compare_two_images()
 
-    assert calls == [([r"C:\tmp\a.png", r"C:\tmp\b.png"], "双图对比")]
-    assert rendered == [(r"C:\tmp\a.png", r"C:\tmp\b.png", "图像A", "图像B")]
+    assert requests == [{
+        "mode": "pair",
+        "left_path": r"C:\tmp\a.png",
+        "right_path": r"C:\tmp\b.png",
+        "total_images": 2,
+    }]
+
+
+def test_start_compare_analysis_freezes_context_and_submits_background_task():
+    gui = _make_gui_stub()
+    gui.root = _DummyRoot()
+    gui.MODERN_COLORS = {"warning": "#f59e0b"}
+    gui.comparison_panel = _DummyComparisonPanel()
+    gui.compare_analysis_button = _DummyStateWidget()
+    detect_button = _DummyStateWidget()
+    selected_tabs = []
+
+    gui.control_panel = SimpleNamespace(detect_button=detect_button)
+    gui._refresh_interaction_state = lambda: None
+    gui._select_center_tab = lambda key: selected_tabs.append(key)
+    gui._build_compare_analysis_context = lambda: {"token": "frozen-context"}
+    gui._compare_executor = _DummySubmitExecutor(_RunningFuture())
+
+    gui._start_compare_analysis({
+        "mode": "group",
+        "base_paths": [r"C:\tmp\base_a.png"],
+        "exp_paths": [r"C:\tmp\exp_a.png", r"C:\tmp\exp_b.png"],
+        "total_images": 3,
+    })
+
+    submission = gui._compare_executor.submissions[0]
+    submitted_request = submission[1][0]
+    assert submitted_request["context"] == {"token": "frozen-context"}
+    assert gui._compare_snapshot["request"]["context"] == {"token": "frozen-context"}
+    assert gui._compare_future is gui._compare_executor.future
+    assert gui.comparison_panel.progress_visible is True
+    assert gui.comparison_panel.progress_updates[0] == (0, 3, "准备开始...")
+    assert gui.compare_analysis_button.disabled is True
+    assert detect_button.disabled is True
+    assert selected_tabs == ["comparison"]
+    assert gui.root.after_calls[0][0] == 80
+
+
+def test_poll_compare_analysis_result_renders_pair_result_and_resets_busy_state():
+    gui = _make_gui_stub()
+    gui.root = _DummyRoot()
+    gui.comparison_panel = _DummyComparisonPanel()
+    gui.compare_analysis_button = _DummyStateWidget()
+    detect_button = _DummyStateWidget()
+    refresh_calls = []
+    rendered = []
+
+    gui.control_panel = SimpleNamespace(detect_button=detect_button)
+    gui._refresh_interaction_state = lambda: refresh_calls.append(True)
+    gui._show_comparison_window = lambda left, right, left_label, right_label, note=None: rendered.append(
+        (left["path"], right["path"], left_label, right_label, note)
+    )
+    gui._compare_token = 5
+    gui._compare_future = _ResultFuture({
+        "mode": "pair",
+        "left_result": {"path": r"C:\tmp\a.png"},
+        "right_result": {"path": r"C:\tmp\b.png"},
+        "note": "done",
+    })
+    gui._compare_snapshot = {
+        "progress_state": {"current": 2, "total": 2, "message": "分析完成"},
+    }
+
+    gui._poll_compare_analysis_result(5)
+
+    assert rendered == [(r"C:\tmp\a.png", r"C:\tmp\b.png", "图像A", "图像B", "done")]
+    assert gui._compare_future is None
+    assert gui._compare_snapshot is None
+    assert gui.comparison_panel.progress_visible is False
+    assert gui.comparison_panel.progress_updates[-1] == (2, 2, "分析完成")
+    assert gui.compare_analysis_button.disabled is False
+    assert detect_button.disabled is False
+    assert refresh_calls == [True]
 
 
 def test_build_compare_analysis_context_uses_current_preprocess_triplet():

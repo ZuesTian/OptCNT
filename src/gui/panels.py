@@ -768,7 +768,7 @@ class ResultPanel(ttk.Frame):
         self.tree: Optional[SortableTreeview] = None
         self.stats_text: Optional[tk.Text] = None
         self._result_paned: Optional[tk.PanedWindow] = None
-        self._tree_columns = ('ID', '长度(μm)')
+        self._tree_columns = ('ID', '长度(μm)', '分散CNT', '团聚CNT')
 
         self._setup_ui()
 
@@ -820,7 +820,8 @@ class ResultPanel(ttk.Frame):
         # 配置列标题和列属性，统一居中对齐
         for col in self._tree_columns:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=80 if col == 'ID' else 120, anchor='center')
+            default_width = 80 if col == 'ID' else 110
+            self.tree.column(col, width=default_width, anchor='center')
 
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
                                   command=self.tree.yview)
@@ -839,19 +840,22 @@ class ResultPanel(ttk.Frame):
 
 
     def _on_tree_resize(self, event=None) -> None:
-        """根据可用宽度自适应结果列表列宽，使用固定比例 ID:30%, 长度:70%。"""
+        """根据可用宽度自适应结果列表列宽。"""
         if self.tree is None:
             return
 
         total_width = int(event.width) if event is not None else self.tree.winfo_width()
-        total_width = max(180, total_width)
-        
-        # 固定比例：ID 30%, 长度 70%
-        id_width = max(54, int(total_width * 0.30))
-        length_width = max(96, total_width - id_width - 6)
+        total_width = max(320, total_width)
 
-        self.tree.column(self._tree_columns[0], width=id_width, minwidth=54, stretch=False, anchor='center')
-        self.tree.column(self._tree_columns[1], width=length_width, minwidth=96, stretch=True, anchor='center')
+        id_width = max(56, int(total_width * 0.16))
+        length_width = max(104, int(total_width * 0.34))
+        dispersed_width = max(88, int(total_width * 0.25))
+        agglomerated_width = max(88, total_width - id_width - length_width - dispersed_width - 8)
+
+        self.tree.column(self._tree_columns[0], width=id_width, minwidth=56, stretch=False, anchor='center')
+        self.tree.column(self._tree_columns[1], width=length_width, minwidth=104, stretch=True, anchor='center')
+        self.tree.column(self._tree_columns[2], width=dispersed_width, minwidth=88, stretch=True, anchor='center')
+        self.tree.column(self._tree_columns[3], width=agglomerated_width, minwidth=88, stretch=True, anchor='center')
 
     def clear_stats(self) -> None:
         """清空统计信息"""
@@ -1053,9 +1057,27 @@ class AdvancedAnalysisPanel(ScrollableDashboardPanel):
     def _setup_sections(self) -> None:
         """设置高级分析布局"""
         self._create_chart_container(
+            "score",
+            "阴影团聚与均匀度总览",
+            placeholder="完成检测后，这里会显示当前图像或当前 ROI 的阴影团聚与均匀度双指标概览。",
+            title_color=self.colors['accent_primary'],
+        )
+        self._create_chart_container(
             "histogram",
-            "阴影团聚与均匀度",
-            placeholder="完成检测后，这里会显示当前图像或当前 ROI 的阴影团聚与均匀度双指标。",
+            "CNT 长度分布",
+            placeholder="完成检测后，这里会显示当前图像或当前 ROI 的 CNT 长度分布。",
+            title_color=self.colors['accent_secondary'],
+        )
+        self._create_chart_container(
+            "pie",
+            "分散 / 团聚占比",
+            placeholder="完成检测后，这里会显示分散 CNT 与团聚 CNT 的数量占比。",
+            title_color=self.colors['accent_amber'],
+        )
+        self._create_chart_container(
+            "cluster",
+            "长度-宽度散点 / 聚类",
+            placeholder="完成检测后，这里会显示 CNT 的长度-宽度散点与简单聚类结果。",
             title_color=self.colors['accent_primary'],
         )
         self._create_chart_container(

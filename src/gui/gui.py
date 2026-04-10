@@ -7,6 +7,7 @@ import csv
 import inspect
 import os
 import sys
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -103,6 +104,7 @@ class CNTAnalyzerGUI:
         self.main_paned: Optional[tk.PanedWindow] = None
         self.current_image_path: Optional[str] = None
         self._analysis_cache = OrderedDict()
+        self._analysis_cache_lock = threading.Lock()
         self._analysis_cache_limit = 24
         self._last_auto_suggest_result = None
         self._last_root_size: Optional[Tuple[int, int]] = None
@@ -112,6 +114,10 @@ class CNTAnalyzerGUI:
         self._single_detect_future = None
         self._single_detect_snapshot = None
         self._single_detect_token = 0
+        self._compare_executor = self._create_compare_executor()
+        self._compare_future = None
+        self._compare_snapshot = None
+        self._compare_token = 0
         self.open_image_button: Optional[ttk.Button] = None
         self.paste_image_button: Optional[ttk.Button] = None
         self.save_results_button: Optional[ttk.Button] = None
@@ -120,6 +126,7 @@ class CNTAnalyzerGUI:
         
         # 图表缓存
         self._charts = {
+            'score': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
             'histogram': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
             'pie': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
             'cluster': {'fig': None, 'ax': None, 'canvas': None, 'colorbar': None, 'draw_count': 0},
@@ -461,6 +468,11 @@ class CNTAnalyzerGUI:
         future = getattr(self, '_single_detect_future', None)
         return future is not None and not future.done()
 
+    def _is_compare_analysis_running(self) -> bool:
+        """Whether a background comparison-analysis job is still running."""
+        future = getattr(self, '_compare_future', None)
+        return future is not None and not future.done()
+
     def _is_preprocessing_running(self) -> bool:
         """Whether a background preprocess preview job is still running."""
         future = getattr(self, '_preprocess_future', None)
@@ -524,6 +536,11 @@ class CNTAnalyzerGUI:
         """Create the dedicated executor used for single-image CNT detection."""
         return ThreadPoolExecutor(max_workers=1, thread_name_prefix="cnt-single")
 
+    @staticmethod
+    def _create_compare_executor() -> ThreadPoolExecutor:
+        """Create the dedicated executor used for compare-analysis requests."""
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="cnt-compare")
+
     def _reset_single_detect_executor(self) -> None:
         """Swap in a fresh executor so a stale running task cannot block new image analysis."""
         executor = getattr(self, '_single_detect_executor', None)
@@ -533,6 +550,16 @@ class CNTAnalyzerGUI:
             except Exception:
                 logger.debug("Unable to reset the single-image detection executor cleanly.")
         self._single_detect_executor = self._create_single_detect_executor()
+
+    def _reset_compare_executor(self) -> None:
+        """Swap in a fresh executor so a stale compare task cannot block the next request."""
+        executor = getattr(self, '_compare_executor', None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                logger.debug("Unable to reset the compare-analysis executor cleanly.")
+        self._compare_executor = self._create_compare_executor()
 
     def _discard_single_detection_state(self,
                                         *,
@@ -593,6 +620,47 @@ class CNTAnalyzerGUI:
         if not busy:
             self._refresh_interaction_state()
 
+    def _set_compare_analysis_busy_state(self, busy: bool) -> None:
+        """Toggle compare-analysis entry points while a background compare task is running."""
+        if getattr(self, 'control_panel', None) is not None:
+            self._set_ttk_widget_enabled(getattr(self.control_panel, 'detect_button', None), not busy)
+        self._set_ttk_widget_enabled(self.compare_analysis_button, not busy)
+        if not busy:
+            self._refresh_interaction_state()
+
+    def _discard_compare_analysis_state(self,
+                                        *,
+                                        include_completed: bool = False,
+                                        notify: bool = False,
+                                        reason: Optional[str] = None) -> bool:
+        """Invalidate stale compare-analysis state and optionally cancel an in-flight request."""
+        future = getattr(self, '_compare_future', None)
+        snapshot = getattr(self, '_compare_snapshot', None)
+        if future is None and snapshot is None:
+            return False
+
+        is_running = future is not None and not future.done()
+        if not include_completed and not is_running:
+            return False
+
+        if is_running:
+            try:
+                future.cancel()
+            except Exception:
+                logger.debug("Unable to cancel the in-flight compare future; it will finish in the background.")
+            self._reset_compare_executor()
+
+        self._compare_future = None
+        self._compare_snapshot = None
+        self._compare_token += 1
+        if getattr(self, 'comparison_panel', None) is not None:
+            self.comparison_panel.hide_progress()
+        self._set_compare_analysis_busy_state(False)
+
+        if notify and reason and getattr(self, 'image_panel', None) is not None:
+            self.image_panel.show_status(reason)
+        return True
+
     def _refresh_interaction_state(self) -> None:
         """根据当前上下文启用或禁用关键交互入口。"""
         has_image = self.analyzer.image is not None
@@ -607,6 +675,8 @@ class CNTAnalyzerGUI:
         self._set_ttk_widget_enabled(self.save_results_button, has_measurements)
         self._set_ttk_widget_enabled(self.export_report_button, has_measurements)
         self._set_ttk_widget_enabled(self.compare_analysis_button, True)
+        if self._is_compare_analysis_running():
+            self._set_compare_analysis_busy_state(True)
         if self._is_single_detection_running():
             self._set_single_detection_busy_state(True)
 
@@ -648,7 +718,7 @@ class CNTAnalyzerGUI:
         if self.analysis_panel is None:
             return
 
-        for key in ('histogram', 'pie', 'cluster', 'heatmap'):
+        for key in ('score', 'histogram', 'pie', 'cluster', 'heatmap'):
             self._dispose_chart(key)
             self.analysis_panel.clear_chart_content(key)
 
@@ -668,6 +738,7 @@ class CNTAnalyzerGUI:
             'comparison_summary',
             "尚未执行对比分析。使用顶部“对比分析”按钮后，结果会显示在这里。",
         )
+        self.comparison_panel.hide_progress()
         self.comparison_panel.clear_chart_content('comparison')
         self.comparison_panel.refresh_layout()
         if reset_scroll:
@@ -891,6 +962,10 @@ class CNTAnalyzerGUI:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
             self._single_detect_executor = None
+        compare_executor = getattr(self, '_compare_executor', None)
+        if compare_executor is not None:
+            compare_executor.shutdown(wait=False, cancel_futures=True)
+            self._compare_executor = None
         self.root.destroy()
 
     # ===== 文件操作 =====
@@ -898,6 +973,7 @@ class CNTAnalyzerGUI:
         """加载图像后的通用流程"""
         self._discard_preprocess_state(include_completed=True, notify=False)
         self._discard_single_detection_state(include_completed=True, notify=False)
+        self._discard_compare_analysis_state(include_completed=True, notify=False)
         self._reset_display()
 
         self.scale_um_var.set(SCALE_BAR_DEFAULT_UM)
@@ -2043,12 +2119,16 @@ class CNTAnalyzerGUI:
         primary_count = int(stats.get('count', len(measurements)))
         length_stats = stats
         display_measurements = measurements
+        dispersed_ids = set()
+        agglomerated_ids = set()
         try:
             dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
             if dispersed_stats:
                 primary_count = int(dispersed_stats.get('dispersed_count', primary_count))
                 length_stats = dispersed_stats.get('dispersed_length_stats') or stats
                 display_measurements = dispersed_stats.get('dispersed_measurements') or []
+                dispersed_ids = {int(measurement.id) for measurement in (dispersed_stats.get('dispersed_measurements') or [])}
+                agglomerated_ids = {int(measurement.id) for measurement in (dispersed_stats.get('agglomerated_measurements') or [])}
         except GUI_EXPECTED_DATA_EXCEPTIONS as e:
             logger.debug(f"获取分散统计失败: {e}")
         except Exception as e:
@@ -2112,7 +2192,13 @@ class CNTAnalyzerGUI:
             text_widget.insert(tk.END, f"{spatial['occupancy_ratio']:.1%}\n", 'value')
 
         for m in measurements:
-            self.result_panel.add_measurement((m.id, f"{m.length_um:.2f}"))
+            measurement_id = int(m.id)
+            self.result_panel.add_measurement((
+                measurement_id,
+                f"{m.length_um:.2f}",
+                "是" if measurement_id in dispersed_ids else "",
+                "是" if measurement_id in agglomerated_ids else "",
+            ))
 
     def _on_select_cnt(self, event):
         """选择CNT时高亮显示"""
@@ -2162,9 +2248,30 @@ class CNTAnalyzerGUI:
         stats = self.analyzer.get_statistics(self.current_roi)
         spatial = stats.get('spatial_distribution') or {}
         cnt_count = int(stats.get('count', len(measurements)))
+        dispersed_stats = None
+        analysis_measurements = measurements
+        try:
+            dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
+            if dispersed_stats:
+                analysis_measurements = dispersed_stats.get('dispersed_measurements') or measurements
+        except GUI_EXPECTED_DATA_EXCEPTIONS as e:
+            logger.debug(f"获取高级分析分散统计失败: {e}")
+        except Exception:
+            logger.exception("获取高级分析分散统计时发生未预期的错误")
 
-        # 高级分析保留数量信息，并聚焦阴影团聚与均匀度
+        pie_distribution = (
+            {
+                '分散CNT': int(dispersed_stats.get('dispersed_count', 0)),
+                '团聚CNT': int(dispersed_stats.get('agglomerated_count', 0)),
+            }
+            if dispersed_stats
+            else {'CNT': int(cnt_count)}
+        )
+
         self._draw_spatial_score_chart(spatial, cnt_count=cnt_count)
+        self._draw_distribution_chart(analysis_measurements)
+        self._draw_pie_chart(pie_distribution)
+        self._draw_cluster_analysis(analysis_measurements)
         self._draw_spatial_heatmap(spatial, cnt_count=cnt_count)
 
         # 强制刷新布局
@@ -2232,7 +2339,7 @@ class CNTAnalyzerGUI:
     def _draw_spatial_score_chart(self, spatial: dict, cnt_count: Optional[int] = None):
         """绘制阴影团聚、均匀度与数量概览。"""
         try:
-            chart = self._init_chart('histogram', figsize=(6.2, 4.3))
+            chart = self._init_chart('score', figsize=(6.2, 4.3))
             ax = chart['ax']
             canvas = chart['canvas']
             if not canvas:
@@ -2300,6 +2407,73 @@ class CNTAnalyzerGUI:
         except Exception as e:
             logger.exception(f"绘制双指标概览错误: {e}")
 
+    @staticmethod
+    def _build_detailed_length_bins(lengths: List[float], max_bins: int = 22) -> np.ndarray:
+        """Build finer adaptive histogram bins for the on-screen length distribution chart."""
+        values = np.array([float(v) for v in lengths if np.isfinite(v)], dtype=float)
+        base_bins = get_length_histogram_bins(values.tolist())
+        left_edge = float(base_bins[0])
+        right_edge = float(base_bins[-1])
+
+        if values.size == 0:
+            return base_bins
+
+        value_min = float(np.min(values))
+        value_max = float(np.max(values))
+        if values.size == 1 or np.isclose(value_min, value_max):
+            spread = max(0.5, value_max * 0.15 if value_max > 0 else 1.0)
+            left = max(0.0, value_min - spread)
+            right = max(left + 1.0, value_max + spread)
+            return np.linspace(left, right, 7, dtype=float)
+
+        value_range = max(value_max - value_min, 1e-6)
+        q25, q75 = np.percentile(values, [25, 75])
+        iqr = max(float(q75 - q25), 0.0)
+        if iqr > 1e-6:
+            bin_width = 2.0 * iqr / np.cbrt(values.size)
+        else:
+            bin_width = value_range / max(6, min(max_bins, int(np.sqrt(values.size)) + 4))
+
+        if not np.isfinite(bin_width) or bin_width <= 1e-6:
+            bin_width = value_range / max(6, min(max_bins, int(np.sqrt(values.size)) + 4))
+
+        bin_count = int(np.clip(np.ceil((right_edge - left_edge) / max(bin_width, 1e-6)), 6, max_bins))
+        bins = np.linspace(left_edge, right_edge, bin_count + 1, dtype=float)
+        if np.any(np.diff(bins) <= 0):
+            return base_bins
+        return bins
+
+    @staticmethod
+    def _build_smoothed_length_curve(lengths: List[float],
+                                     bins: np.ndarray,
+                                     sample_points: int = 240) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Approximate a Gaussian-like smooth curve for the histogram using a lightweight KDE."""
+        values = np.array([float(v) for v in lengths if np.isfinite(v)], dtype=float)
+        original_count = int(values.size)
+        if original_count < 2 or bins.size < 2:
+            return None, None
+
+        if original_count > 4000:
+            sample_idx = np.linspace(0, original_count - 1, 4000, dtype=int)
+            values = values[np.unique(sample_idx)]
+
+        value_range = max(float(np.max(values) - np.min(values)), 1e-6)
+        std = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+        if std <= 1e-6:
+            std = max(value_range / 6.0, 0.25)
+
+        bandwidth = 1.06 * std * (values.size ** (-1.0 / 5.0))
+        if not np.isfinite(bandwidth) or bandwidth <= 1e-6:
+            bandwidth = max(value_range / 8.0, 0.25)
+
+        x_curve = np.linspace(float(bins[0]), float(bins[-1]), int(sample_points), dtype=float)
+        scaled = (x_curve[:, None] - values[None, :]) / bandwidth
+        kernel = np.exp(-0.5 * np.square(scaled)) / (np.sqrt(2.0 * np.pi) * bandwidth)
+        density = np.mean(kernel, axis=1)
+        mean_bin_width = float(np.mean(np.diff(bins)))
+        y_curve = density * original_count * mean_bin_width
+        return x_curve, y_curve
+
     def _draw_distribution_chart(self, measurements: List[CNTMeasurement]):
         """绘制长度分布图 (直方图)"""
         try:
@@ -2317,7 +2491,7 @@ class CNTAnalyzerGUI:
                 canvas.draw()
                 return
 
-            bins = get_length_histogram_bins(lengths)
+            bins = self._build_detailed_length_bins(lengths)
 
             counts, _, _ = ax.hist(
                 lengths,
@@ -2327,6 +2501,24 @@ class CNTAnalyzerGUI:
                 color=self.MODERN_COLORS['accent_primary']
             )
 
+            x_curve, y_curve = self._build_smoothed_length_curve(lengths, bins)
+            if x_curve is not None and y_curve is not None:
+                ax.plot(
+                    x_curve,
+                    y_curve,
+                    color=self.MODERN_COLORS['accent_teal'],
+                    linewidth=2.2,
+                    label='平滑趋势',
+                    zorder=3,
+                )
+                ax.fill_between(
+                    x_curve,
+                    y_curve,
+                    color=self.MODERN_COLORS['accent_teal'],
+                    alpha=0.08,
+                    zorder=2,
+                )
+
             # 若数据全部未落入分箱（极端边界情况下），给出明确提示
             if np.sum(counts) == 0:
                 ax.text(0.5, 0.5, "当前分箱下无可视柱形，请检查比例尺或过滤参数",
@@ -2335,6 +2527,9 @@ class CNTAnalyzerGUI:
 
             ax.set_xlabel('长度 (μm)', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
             ax.set_ylabel('数量', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
+            ax.set_title('CNT 长度分布', fontsize=10, color=self.MODERN_COLORS['text_primary'])
+            if x_curve is not None and y_curve is not None:
+                ax.legend(frameon=False, fontsize=8, loc='upper right')
 
             ax.grid(True, axis='y', alpha=0.3, linestyle='--', color=self.MODERN_COLORS['border'])
             ax.spines['top'].set_visible(False)
@@ -2496,6 +2691,9 @@ class CNTAnalyzerGUI:
 
             ax.set_xlabel('长度 (μm)', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
             ax.set_ylabel('平均宽度 (μm)', fontsize=9, color=self.MODERN_COLORS['text_secondary'])
+            ax.set_title('长度-宽度散点 / 聚类', fontsize=10, color=self.MODERN_COLORS['text_primary'])
+            if n_clusters > 1:
+                ax.legend(frameon=False, fontsize=8)
             
             # 样式
             ax.grid(True, alpha=0.3, linestyle='--', color=self.MODERN_COLORS['border'])
@@ -2983,18 +3181,36 @@ class CNTAnalyzerGUI:
 
     def _get_cached_analysis_result(self, cache_key: tuple) -> Optional[dict]:
         """读取缓存结果，并刷新其 LRU 顺序"""
-        cached = self._analysis_cache.get(cache_key)
-        if cached is None:
-            return None
-        self._analysis_cache.move_to_end(cache_key)
-        return cached
+        cache_lock = getattr(self, '_analysis_cache_lock', None)
+        if cache_lock is None:
+            cached = self._analysis_cache.get(cache_key)
+            if cached is None:
+                return None
+            self._analysis_cache.move_to_end(cache_key)
+            return cached
+
+        with cache_lock:
+            cached = self._analysis_cache.get(cache_key)
+            if cached is None:
+                return None
+            self._analysis_cache.move_to_end(cache_key)
+            return cached
 
     def _store_analysis_result(self, cache_key: tuple, result: dict) -> dict:
         """写入分析缓存，并限制缓存大小"""
-        self._analysis_cache[cache_key] = result
-        self._analysis_cache.move_to_end(cache_key)
-        while len(self._analysis_cache) > self._analysis_cache_limit:
-            self._analysis_cache.popitem(last=False)
+        cache_lock = getattr(self, '_analysis_cache_lock', None)
+        if cache_lock is None:
+            self._analysis_cache[cache_key] = result
+            self._analysis_cache.move_to_end(cache_key)
+            while len(self._analysis_cache) > self._analysis_cache_limit:
+                self._analysis_cache.popitem(last=False)
+            return result
+
+        with cache_lock:
+            self._analysis_cache[cache_key] = result
+            self._analysis_cache.move_to_end(cache_key)
+            while len(self._analysis_cache) > self._analysis_cache_limit:
+                self._analysis_cache.popitem(last=False)
         return result
 
     def _run_image_analysis(self,
@@ -3235,7 +3451,8 @@ class CNTAnalyzerGUI:
                              group_label: str,
                              context: Optional[dict] = None,
                              include_visualization: bool = True,
-                             preview_visualization: bool = True) -> Tuple[List[dict], List[str]]:
+                             preview_visualization: bool = True,
+                             progress_callback: Optional[Callable[[int, int, str], None]] = None) -> Tuple[List[dict], List[str]]:
         """批量分析一组图像，优先复用缓存并并行处理未命中的图片。"""
         context = context or self._build_analysis_context()
         ordered_results: List[Optional[dict]] = [None] * len(image_paths)
@@ -3257,17 +3474,8 @@ class CNTAnalyzerGUI:
             pending_tasks.append((index, image_path))
             pending_cache_keys[index] = base_cache_key
 
-        comparison_panel = getattr(self, 'comparison_panel', None)
-
-        # 显示进度条
-        if comparison_panel and pending_tasks:
-            comparison_panel.show_progress()
-            comparison_panel.update_progress(0, len(pending_tasks), "准备开始...")
-
-        def progress_callback(current: int, total: int, message: str):
-            """进度回调函数"""
-            if comparison_panel:
-                comparison_panel.update_progress(current, total, message)
+        if progress_callback and pending_tasks:
+            progress_callback(0, len(pending_tasks), "准备开始...")
 
         run_group_analysis_tasks = self._run_group_analysis_tasks
         task_kwargs = {
@@ -3290,10 +3498,6 @@ class CNTAnalyzerGUI:
                     self._store_analysis_result(visual_cache_key, stored)
             elif error:
                 failures.append(error)
-
-        # 隐藏进度条
-        if comparison_panel:
-            comparison_panel.hide_progress()
 
         results = [result for result in ordered_results if result is not None]
 
@@ -4269,17 +4473,30 @@ class CNTAnalyzerGUI:
         ax.set_ylabel(y_label, color=self.MODERN_COLORS['text_secondary'])
         ax.grid(True, axis='y', alpha=0.25, linestyle='--')
 
-        max_value = max(values) if values else 0.0
-        top_padding = max(max_value * 0.18, 1.0 if scale == 1.0 else 3.0)
-        upper_bound = max_value + top_padding
+        bar_tops = [
+            max(0.0, value) + (max(0.0, error) if use_errorbar else 0.0)
+            for value, error in zip(values, errors)
+        ]
+        content_top = max(bar_tops) if bar_tops else 0.0
+        if content_top <= 0.0:
+            content_top = max(
+                max((max(0.0, value) for value in values), default=0.0),
+                max((max(0.0, error) for error in errors), default=0.0),
+            )
+
+        base_floor = 1.0 if scale == 1.0 else 10.0
+        top_padding = max(content_top * 0.18, 1.0 if scale == 1.0 else 3.0)
+        label_padding = max(content_top * 0.08, 0.4 if scale == 1.0 else 1.5)
+        upper_bound = max(content_top + top_padding + label_padding, base_floor)
 
         if test_result is not None:
             pvalue = self._get_preferred_pvalue(test_result)
             if pvalue is not None:
                 marker = self._get_significance_marker(pvalue)
+                annotation_y = content_top + top_padding * 0.55
                 ax.text(
                     0.5,
-                    max_value + top_padding * 0.25,
+                    annotation_y,
                     f"p={self._format_pvalue(pvalue)} | {marker}",
                     transform=ax.get_yaxis_transform(),
                     ha='center',
@@ -4287,9 +4504,9 @@ class CNTAnalyzerGUI:
                     fontsize=8.5,
                     color=self.MODERN_COLORS['text_primary'],
                 )
-                upper_bound += top_padding * 0.35
+                upper_bound = max(upper_bound, annotation_y + top_padding * 0.85)
 
-        ax.set_ylim(0, upper_bound if upper_bound > 0 else (1.0 if scale == 1.0 else 10.0))
+        ax.set_ylim(0, upper_bound)
         self._annotate_bar_values(ax, bars, fmt=value_fmt, offset_ratio=0.03)
 
     def _format_representative_caption(self, group_summary: dict, representative_result: dict) -> str:
@@ -4717,7 +4934,7 @@ class CNTAnalyzerGUI:
         ).pack(anchor='w')
         tk.Label(
             header,
-            text="对比分析会固定使用 9/11/3 预处理参数，并仅分析中部 75% 区域；长度、长宽比、策略、拆分与合并条件仍沿用当前界面设置。",
+            text="对比分析会沿用当前界面的预处理和识别参数，并仅分析中部 75% 区域；分析会在后台执行，便于重复对比而不把界面卡死。",
             font=('Segoe UI', 9),
             bg=self.MODERN_COLORS['bg_secondary'],
             fg=self.MODERN_COLORS['text_secondary'],
@@ -4791,10 +5008,12 @@ class CNTAnalyzerGUI:
     def _invoke_compare_batch_analysis(self,
                                        image_paths: List[str],
                                        group_label: str,
-                                       include_visualization: bool = True) -> Tuple[List[dict], List[str]]:
+                                       include_visualization: bool = True,
+                                       progress_callback: Optional[Callable[[int, int, str], None]] = None,
+                                       context: Optional[dict] = None) -> Tuple[List[dict], List[str]]:
         """Analyze compare inputs under the current comparison context while remaining compatible with test doubles."""
         analyze_image_files = self._analyze_image_files
-        compare_context = self._build_compare_analysis_context()
+        compare_context = context or self._build_compare_analysis_context()
         signature = inspect.signature(analyze_image_files).parameters
         kwargs = {}
         if 'context' in signature:
@@ -4803,7 +5022,194 @@ class CNTAnalyzerGUI:
             kwargs['include_visualization'] = include_visualization
         if 'preview_visualization' in signature:
             kwargs['preview_visualization'] = include_visualization
+        if 'progress_callback' in signature:
+            kwargs['progress_callback'] = progress_callback
         return analyze_image_files(image_paths, group_label, **kwargs)
+
+    @staticmethod
+    def _make_compare_progress_state(total: int, message: str = "准备开始...") -> dict:
+        """Create a thread-safe progress snapshot for a compare-analysis request."""
+        return {
+            'current': 0,
+            'total': max(0, int(total)),
+            'message': str(message),
+        }
+
+    def _build_compare_note(self, mode: str) -> str:
+        """Build a user-facing note for the current compare-analysis mode."""
+        if str(mode).lower() == 'group':
+            return (
+                "本次组别对比使用当前界面的预处理与识别参数，"
+                "并仅分析中部 75% 区域以避开比例尺区域干扰；"
+                "第一组按 base组 统计，第二组按 实验组 统计。"
+            )
+        return (
+            "本次双图对比使用当前界面的预处理与识别参数，"
+            "并仅分析中部 75% 区域以避开比例尺区域干扰。"
+        )
+
+    def _run_compare_analysis_request(self, request: dict, progress_state: dict) -> dict:
+        """Execute a compare-analysis request off the main Tk thread."""
+        mode = str(request.get('mode', '')).lower()
+        context = request.get('context') or self._build_compare_analysis_context()
+
+        def report(current: int, total: int, message: str = "") -> None:
+            progress_state['current'] = max(0, int(current))
+            progress_state['total'] = max(0, int(total))
+            progress_state['message'] = str(message or progress_state.get('message') or "准备开始...")
+
+        if mode == 'group':
+            base_paths = list(request.get('base_paths') or [])
+            exp_paths = list(request.get('exp_paths') or [])
+            total_images = len(base_paths) + len(exp_paths)
+            report(0, total_images, "准备开始...")
+
+            base_results, base_failures = self._invoke_compare_batch_analysis(
+                base_paths,
+                "base组",
+                include_visualization=False,
+                context=context,
+                progress_callback=lambda current, total, message: report(
+                    current,
+                    total_images,
+                    f"base组 | {message}" if message else "base组分析中",
+                ),
+            )
+            exp_results, exp_failures = self._invoke_compare_batch_analysis(
+                exp_paths,
+                "实验组",
+                include_visualization=False,
+                context=context,
+                progress_callback=lambda current, total, message: report(
+                    len(base_paths) + current,
+                    total_images,
+                    f"实验组 | {message}" if message else "实验组分析中",
+                ),
+            )
+
+            report(total_images, total_images, "分析完成")
+            return {
+                'mode': 'group',
+                'base_group': self._summarize_group_results("base组", base_results),
+                'exp_group': self._summarize_group_results("实验组", exp_results),
+                'failures': base_failures + exp_failures,
+                'note': self._build_compare_note('group'),
+            }
+
+        if mode == 'pair':
+            left_path = str(request.get('left_path', ''))
+            right_path = str(request.get('right_path', ''))
+            image_paths = [left_path, right_path]
+            total_images = len(image_paths)
+            report(0, total_images, "准备开始...")
+            results, failures = self._invoke_compare_batch_analysis(
+                image_paths,
+                "双图对比",
+                include_visualization=True,
+                context=context,
+                progress_callback=report,
+            )
+            result_by_path = {str(Path(result['path']).resolve()): result for result in results}
+            left_result = result_by_path.get(str(Path(left_path).resolve()))
+            right_result = result_by_path.get(str(Path(right_path).resolve()))
+            if left_result is None or right_result is None:
+                failure_text = "；".join(failures) if failures else "两张图像中至少有一张未成功完成分析"
+                raise ValueError(f"双图对比需要两张图都分析成功: {failure_text}")
+
+            report(total_images, total_images, "分析完成")
+            return {
+                'mode': 'pair',
+                'left_result': left_result,
+                'right_result': right_result,
+                'note': self._build_compare_note('pair'),
+            }
+
+        raise ValueError(f"Unsupported compare-analysis mode: {request.get('mode')}")
+
+    def _start_compare_analysis(self, request: dict) -> None:
+        """Submit a compare-analysis request to the dedicated background executor."""
+        self._discard_compare_analysis_state(include_completed=True, notify=False)
+        request = {
+            **dict(request),
+            'context': request.get('context') or self._build_compare_analysis_context(),
+        }
+
+        total_images = int(request.get('total_images', 0))
+        progress_state = self._make_compare_progress_state(total_images)
+        self._compare_token += 1
+        task_token = self._compare_token
+        self._compare_snapshot = {
+            'request': dict(request),
+            'progress_state': progress_state,
+        }
+
+        if self.comparison_panel is not None:
+            self._select_center_tab('comparison')
+            self.comparison_panel.show_progress()
+            self.comparison_panel.update_progress(0, max(1, total_images), "准备开始...")
+
+        self._set_compare_analysis_busy_state(True)
+        self._compare_future = self._compare_executor.submit(
+            self._run_compare_analysis_request,
+            dict(request),
+            progress_state,
+        )
+        self.root.after(80, self._poll_compare_analysis_result, task_token)
+
+    def _poll_compare_analysis_result(self, task_token: int) -> None:
+        """Poll a background compare-analysis task and update the UI from the main thread."""
+        if task_token != getattr(self, '_compare_token', None):
+            return
+
+        future = getattr(self, '_compare_future', None)
+        snapshot = getattr(self, '_compare_snapshot', None)
+        if future is None or snapshot is None:
+            return
+
+        progress_state = snapshot.get('progress_state') or {}
+        total = max(1, int(progress_state.get('total', 0) or 0))
+        current = max(0, int(progress_state.get('current', 0) or 0))
+        message = str(progress_state.get('message') or "准备开始...")
+        if self.comparison_panel is not None:
+            self.comparison_panel.show_progress()
+            self.comparison_panel.update_progress(current, total, message)
+
+        if not future.done():
+            self.root.after(80, self._poll_compare_analysis_result, task_token)
+            return
+
+        try:
+            payload = future.result()
+        except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
+            logger.exception("对比分析失败")
+            messagebox.showerror("错误", f"对比分析失败: {exc}")
+        except Exception as exc:
+            logger.exception("对比分析失败")
+            messagebox.showerror("错误", f"对比分析失败: {exc}")
+        else:
+            mode = str(payload.get('mode', '')).lower()
+            if mode == 'group':
+                self._show_group_comparison_window(
+                    payload['base_group'],
+                    payload['exp_group'],
+                    payload.get('note'),
+                    payload.get('failures'),
+                )
+            elif mode == 'pair':
+                self._show_comparison_window(
+                    payload['left_result'],
+                    payload['right_result'],
+                    "图像A",
+                    "图像B",
+                    payload.get('note'),
+                )
+        finally:
+            if task_token == getattr(self, '_compare_token', None):
+                self._compare_future = None
+                self._compare_snapshot = None
+                if self.comparison_panel is not None:
+                    self.comparison_panel.hide_progress()
+                self._set_compare_analysis_busy_state(False)
 
     def _compare_image_groups(self):
         """按组批量选择图像并进行组别对比"""
@@ -4836,24 +5242,17 @@ class CNTAnalyzerGUI:
             return
 
         try:
-            base_results, base_failures = self._invoke_compare_batch_analysis(base_paths, "base组", include_visualization=False)
-            exp_results, exp_failures = self._invoke_compare_batch_analysis(exp_paths, "实验组", include_visualization=False)
-
-            failures = base_failures + exp_failures
-            base_group = self._summarize_group_results("base组", base_results)
-            exp_group = self._summarize_group_results("实验组", exp_results)
-
-            note = (
-                "本次组别对比使用当前界面的预处理与识别参数，"
-                "并仅分析中部 75% 区域以避开比例尺区域干扰；"
-                "第一组按 base组 统计，第二组按 实验组 统计。"
-            )
-            self._show_group_comparison_window(base_group, exp_group, note, failures)
+            self._start_compare_analysis({
+                'mode': 'group',
+                'base_paths': base_paths,
+                'exp_paths': exp_paths,
+                'total_images': len(base_paths) + len(exp_paths),
+            })
         except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
-            logger.exception("组别对比失败")
+            logger.exception("组别对比启动失败")
             messagebox.showerror("错误", f"组别对比失败: {e}")
         except Exception as e:
-            logger.exception("组别对比失败")
+            logger.exception("组别对比启动失败")
             messagebox.showerror("错误", f"组别对比失败: {e}")
 
     def _compare_two_images(self):
@@ -4884,23 +5283,17 @@ class CNTAnalyzerGUI:
             return
 
         try:
-            results, failures = self._invoke_compare_batch_analysis([left_path, right_path], "双图对比", include_visualization=True)
-            result_by_path = {str(Path(result['path']).resolve()): result for result in results}
-            left_result = result_by_path.get(str(Path(left_path).resolve()))
-            right_result = result_by_path.get(str(Path(right_path).resolve()))
-            if left_result is None or right_result is None:
-                failure_text = "；".join(failures) if failures else "两张图像中至少有一张未成功完成分析"
-                raise ValueError(f"双图对比需要两张图都分析成功: {failure_text}")
-            note = (
-                "本次双图对比使用当前界面的预处理与识别参数，"
-                "并仅分析中部 75% 区域以避开比例尺区域干扰。"
-            )
-            self._show_comparison_window(left_result, right_result, "图像A", "图像B", note)
+            self._start_compare_analysis({
+                'mode': 'pair',
+                'left_path': left_path,
+                'right_path': right_path,
+                'total_images': 2,
+            })
         except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as e:
-            logger.exception("双图对比失败")
+            logger.exception("双图对比启动失败")
             messagebox.showerror("错误", f"双图对比失败: {e}")
         except Exception as e:
-            logger.exception("双图对比失败")
+            logger.exception("双图对比启动失败")
             messagebox.showerror("错误", f"双图对比失败: {e}")
 
     # ===== 保存和导出 =====
