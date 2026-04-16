@@ -7,6 +7,7 @@ from typing import Optional, Callable, List
 from datetime import datetime
 
 from .widgets import SortableTreeview, ScrollableFrame
+from .gui_styles import get_platform_font, get_cjk_font
 from ..core.utils import (
     SCALE_BAR_DEFAULT_UM,
     CNT_BRIDGE_STRENGTH_DEFAULT,
@@ -28,6 +29,8 @@ class ControlPanel(ttk.Frame):
         self.colors = colors
         self.callbacks = callbacks
         self.variables = variables
+        # 平台自适应字体
+        self._ui_font = get_platform_font(self.winfo_toplevel())
         self.display_mode_buttons: List[ttk.Radiobutton] = []
         self.select_scale_button: Optional[ttk.Button] = None
         self.apply_scale_button: Optional[ttk.Button] = None
@@ -94,14 +97,14 @@ class ControlPanel(ttk.Frame):
 
         self.scale_label = ttk.Label(scale_frame, text=f"当前比例尺: 默认 {SCALE_BAR_DEFAULT_UM:g}μm（待应用）",
                                      foreground=self.colors['accent_primary'],
-                                     font=('Segoe UI', 9, 'italic'))
+                                     font=(self._ui_font, 9, 'italic'))
         self.scale_label.pack(anchor=tk.W, padx=8, pady=5)
 
         self.scale_status_label = ttk.Label(
             scale_frame,
             text="比例尺状态: 待检测",
             foreground=self.colors['text_secondary'],
-            font=('Segoe UI', 9),
+            font=(self._ui_font, 9),
             wraplength=230,
             justify=tk.LEFT,
         )
@@ -132,7 +135,7 @@ class ControlPanel(ttk.Frame):
                                         highlightthickness=1,
                                         highlightcolor=self.colors['accent_primary'],
                                         highlightbackground=self.colors['border'],
-                                        font=('Segoe UI', 9))
+                                        font=(self._ui_font, 9))
         self.roi_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=2)
         self.roi_listbox.bind('<<ListboxSelect>>', self.callbacks.get('on_select_roi'))
 
@@ -189,7 +192,7 @@ class ControlPanel(ttk.Frame):
         self.blur_label = ttk.Label(
             blur_frame,
             text=str(int(self.variables.get('blur_kernel').get()) if self.variables.get('blur_kernel') else 9),
-            font=('Segoe UI', 9, 'bold'),
+            font=(self._ui_font, 9, 'bold'),
         )
         self.blur_label.pack(side=tk.RIGHT)
 
@@ -205,7 +208,7 @@ class ControlPanel(ttk.Frame):
         self.block_label = ttk.Label(
             block_frame,
             text=str(int(self.variables.get('adaptive_block').get()) if self.variables.get('adaptive_block') else 15),
-            font=('Segoe UI', 9, 'bold'),
+            font=(self._ui_font, 9, 'bold'),
         )
         self.block_label.pack(side=tk.RIGHT)
 
@@ -221,7 +224,7 @@ class ControlPanel(ttk.Frame):
         self.c_label = ttk.Label(
             c_frame,
             text=str(int(self.variables.get('adaptive_c').get()) if self.variables.get('adaptive_c') else 2),
-            font=('Segoe UI', 9, 'bold'),
+            font=(self._ui_font, 9, 'bold'),
         )
         self.c_label.pack(side=tk.RIGHT)
 
@@ -236,7 +239,7 @@ class ControlPanel(ttk.Frame):
         self.bridge_label = ttk.Label(
             bridge_frame,
             text=str(int(self.variables.get('bridge_strength').get()) if self.variables.get('bridge_strength') else CNT_BRIDGE_STRENGTH_DEFAULT),
-            font=('Segoe UI', 9, 'bold'),
+            font=(self._ui_font, 9, 'bold'),
         )
         self.bridge_label.pack(side=tk.RIGHT)
 
@@ -311,7 +314,7 @@ class ControlPanel(ttk.Frame):
         self.merge_distance_label = ttk.Label(
             merge_frame,
             text=str(int(self.variables.get('merge_distance_px').get()) if self.variables.get('merge_distance_px') else CNT_MERGE_DISTANCE_DEFAULT_PX),
-            font=('Segoe UI', 9, 'bold'),
+            font=(self._ui_font, 9, 'bold'),
         )
         self.merge_distance_label.pack(side=tk.RIGHT)
 
@@ -336,7 +339,7 @@ class ControlPanel(ttk.Frame):
             analysis_frame,
             text="检测输入状态: 待加载图像",
             foreground=self.colors['text_secondary'],
-            font=('Segoe UI', 9),
+            font=(self._ui_font, 9),
             wraplength=260,
             justify=tk.LEFT,
         )
@@ -422,6 +425,7 @@ class ImagePanel(ttk.Frame):
         super().__init__(parent, **kwargs)
         self.colors = colors
         self.callbacks = callbacks
+        self._ui_font = get_platform_font(self.winfo_toplevel())
         self.canvas: Optional[tk.Canvas] = None
         self._image_origin = (0.0, 0.0)  # 图像在画布坐标系中的左上角
         self._image_size = (0.0, 0.0)    # 当前显示图像尺寸（缩放后）
@@ -455,7 +459,7 @@ class ImagePanel(ttk.Frame):
             textvariable=self.zoom_var,
             bg=footer_bg,
             fg=self.colors.get('accent_primary', '#6366F1'),
-            font=('Segoe UI', 9, 'bold'),
+            font=(self._ui_font, 9, 'bold'),
             padx=2,
         )
         self.zoom_label.pack(side=tk.LEFT, pady=4)
@@ -472,7 +476,7 @@ class ImagePanel(ttk.Frame):
             textvariable=self.status_var,
             bg=footer_bg,
             fg=self.colors.get('text_secondary', '#64748B'),
-            font=('Segoe UI', 9),
+            font=(self._ui_font, 9),
             anchor='w',
             padx=10,
         )
@@ -640,7 +644,7 @@ class ImagePanel(ttk.Frame):
                 mid_x + 10, mid_y - 10,
                 text=f"原图: {real_length:.1f}px",
                 fill='#00FF00',
-                font=('Segoe UI', 10),
+                font=(self._ui_font, 10),
                 tags='scale_text'
             )
 
@@ -790,6 +794,7 @@ class ResultPanel(ttk.Frame):
         stats_text_frame = ttk.Frame(stats_frame)
         stats_text_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
 
+        _ui_font = get_platform_font(self.winfo_toplevel())
         self.stats_text = tk.Text(stats_text_frame,
                                    height=10,
                                    wrap=tk.WORD,
@@ -800,14 +805,14 @@ class ResultPanel(ttk.Frame):
                                    highlightthickness=1,
                                    highlightcolor=self.colors['accent_primary'],
                                    highlightbackground=self.colors['border'],
-                                   font=('Segoe UI', 9))
+                                   font=(_ui_font, 9))
         stats_scrollbar = ttk.Scrollbar(stats_text_frame, orient=tk.VERTICAL, command=self.stats_text.yview)
         self.stats_text.configure(yscrollcommand=stats_scrollbar.set)
         self.stats_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         stats_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        self.stats_text.tag_configure('header', foreground=self.colors['accent_primary'], font=('Segoe UI', 9, 'bold'))
-        self.stats_text.tag_configure('value', foreground=self.colors['accent_secondary'], font=('Segoe UI', 9, 'bold'))
+        self.stats_text.tag_configure('header', foreground=self.colors['accent_primary'], font=(_ui_font, 9, 'bold'))
+        self.stats_text.tag_configure('value', foreground=self.colors['accent_secondary'], font=(_ui_font, 9, 'bold'))
         self.stats_text.tag_configure('success', foreground=self.colors['success'])
         self.stats_text.tag_configure('warning', foreground=self.colors['warning'])
         self.stats_text.tag_configure('error', foreground=self.colors['error'])
@@ -830,10 +835,11 @@ class ResultPanel(ttk.Frame):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 配置统一字体：Microsoft YaHei 9pt
+        # 配置统一字体：使用平台自适应中文字体
+        cjk = get_cjk_font()
         style = ttk.Style()
-        style.configure('Treeview', font=('Microsoft YaHei', 9))
-        style.configure('Treeview.Heading', font=('Microsoft YaHei', 9, 'bold'))
+        style.configure('Treeview', font=(cjk, 9))
+        style.configure('Treeview.Heading', font=(cjk, 9, 'bold'))
 
         self.tree.bind('<<TreeviewSelect>>', self.callbacks.get('on_select_cnt'))
         self.tree.bind('<Configure>', self._on_tree_resize, add='+')
@@ -916,10 +922,11 @@ class ScrollableDashboardPanel(ttk.Frame):
         container.configure(height=height)
         container.pack_propagate(False)
 
+        _ui_font = get_platform_font(self.winfo_toplevel())
         ttk.Label(
             container,
             text=title,
-            font=('Segoe UI', 10, 'bold'),
+            font=(_ui_font, 10, 'bold'),
             foreground=title_color or self.colors['text_primary'],
         ).pack(anchor=tk.W, padx=5, pady=5)
 
@@ -957,10 +964,11 @@ class ScrollableDashboardPanel(ttk.Frame):
         container.configure(height=height)
         container.pack_propagate(False)
 
+        _ui_font = get_platform_font(self.winfo_toplevel())
         ttk.Label(
             container,
             text=title,
-            font=('Segoe UI', 10, 'bold'),
+            font=(_ui_font, 10, 'bold'),
             foreground=title_color or self.colors['text_primary'],
         ).pack(anchor=tk.W, padx=5, pady=5)
 
@@ -973,7 +981,7 @@ class ScrollableDashboardPanel(ttk.Frame):
             bg=self.colors['bg_secondary'],
             fg=self.colors['text_primary'],
             relief='flat',
-            font=('Microsoft YaHei', 10),
+            font=(get_cjk_font(), 10),
             padx=8,
             pady=8,
         )
@@ -1127,10 +1135,11 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
         container.pack(fill=tk.X, expand=False, padx=10, pady=10)
         container.pack_forget()  # 初始隐藏
 
+        _ui_font = get_platform_font(self.winfo_toplevel())
         ttk.Label(
             container,
             text="正在分析图像...",
-            font=('Segoe UI', 10, 'bold'),
+            font=(_ui_font, 10, 'bold'),
             foreground=self.colors['accent_amber'],
         ).pack(anchor=tk.W, padx=5, pady=5)
 
@@ -1151,7 +1160,7 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
             text="0%",
             bg=self.colors['bg_secondary'],
             fg=self.colors['accent_amber'],
-            font=('Segoe UI', 9, 'bold'),
+            font=(_ui_font, 9, 'bold'),
         )
         self.progress_percent_label.pack(anchor=tk.E, pady=(0, 4))
 
@@ -1160,7 +1169,7 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
             text="准备开始...",
             bg=self.colors['bg_secondary'],
             fg=self.colors['text_secondary'],
-            font=('Segoe UI', 9, 'bold'),
+            font=(_ui_font, 9, 'bold'),
         )
         self.progress_label.pack(anchor=tk.W)
 

@@ -264,6 +264,18 @@ def _make_result(name: str,
     }
     dispersed_count = max(0.0, round(count * 0.7))
     agglomerated_count = max(0.0, count - dispersed_count)
+    framework = {
+        "uniformity": {"score": float(uniformity_grid)},
+        "thick_bundle": {"score": float(max(20.0, 88.0 - count * 0.6))},
+        "long_cnt": {"score": float(min(100.0, 35.0 + count))},
+        "agglomeration": {"score": float(uniformity_overall)},
+    }
+    framework["hybrid_score"] = (
+        framework["uniformity"]["score"] * 0.35 +
+        framework["thick_bundle"]["score"] * 0.20 +
+        framework["long_cnt"]["score"] * 0.25 +
+        framework["agglomeration"]["score"] * 0.20
+    )
     return {
         "name": name,
         "path": f"/tmp/{name}.png",
@@ -296,6 +308,7 @@ def _make_result(name: str,
                 "length_std": 1.5,
             },
         },
+        "evaluation_framework": framework,
     }
 
 
@@ -328,6 +341,13 @@ def _make_batch_analysis_result(image_path: str, count: float) -> dict:
         "stats": {
             "count": count,
             "spatial_distribution": {},
+        },
+        "evaluation_framework": {
+            "uniformity": {"score": 60.0},
+            "thick_bundle": {"score": 70.0},
+            "long_cnt": {"score": 65.0},
+            "agglomeration": {"score": 62.0},
+            "hybrid_score": 63.9,
         },
         "scale_info": None,
         "scale_status": {},
@@ -769,6 +789,47 @@ def test_format_group_comparison_summary_uses_cautious_conclusion_when_gap_is_sm
     assert "结论: 实验组更优" not in summary
 
 
+def test_legacy_group_comparison_summary_delegates_to_current_formatter():
+    gui = _make_gui_stub()
+    base_group = gui._summarize_group_results(
+        "base组",
+        _make_group_results(
+            "base",
+            [
+                (30.0, 46.0, 45.0, 47.0, 46.0, 0.38),
+                (31.0, 47.0, 46.0, 48.0, 47.0, 0.37),
+                (29.0, 45.0, 44.0, 46.0, 45.0, 0.39),
+            ],
+        ),
+    )
+    exp_group = gui._summarize_group_results(
+        "实验组",
+        _make_group_results(
+            "exp",
+            [
+                (32.0, 49.0, 48.0, 50.0, 49.0, 0.34),
+                (31.0, 50.0, 49.0, 51.0, 50.0, 0.33),
+                (30.0, 48.0, 47.0, 49.0, 48.0, 0.35),
+            ],
+        ),
+    )
+
+    legacy = gui._legacy_format_group_comparison_summary(
+        base_group,
+        exp_group,
+        note="note",
+        failures=["bad.png"],
+    )
+    current = gui._format_group_comparison_summary(
+        base_group,
+        exp_group,
+        note="note",
+        failures=["bad.png"],
+    )
+
+    assert legacy == current
+
+
 def test_format_comparison_summary_uses_compact_text():
     gui = _make_gui_stub()
     left_result = _make_result("left", 48.0, 60.0, 61.0, 59.0, 60.0, 0.39, 0.41, 0.18)
@@ -972,8 +1033,8 @@ def test_show_comparison_window_renders_only_dispersion_charts():
     gui._show_comparison_window(left_result, right_result, "图像A", "图像B")
 
     titles = [ax.get_title() for ax in captured["figure"].axes]
-    assert titles[:2] == ["分散CNT数量对比", "分散比例对比"]
-    assert len(captured["figure"].axes) == 4
+    assert titles[:3] == ["分散CNT数量对比", "分散比例对比", "混合评分对比"]
+    assert len(captured["figure"].axes) == 5
 
 
 def test_show_group_comparison_window_reuses_dispersion_dashboard():
@@ -1008,8 +1069,8 @@ def test_show_group_comparison_window_reuses_dispersion_dashboard():
     gui._show_group_comparison_window(base_group, exp_group)
 
     titles = [ax.get_title() for ax in captured["figure"].axes]
-    assert titles[:2] == ["分散CNT数量对比", "分散比例对比"]
-    assert len(captured["figure"].axes) == 4
+    assert titles[:3] == ["分散CNT数量对比", "分散比例对比", "混合评分对比"]
+    assert len(captured["figure"].axes) == 5
 
 
 def test_plot_dispersion_bar_chart_ylim_includes_error_bars_and_pvalue_annotation():
@@ -1376,6 +1437,58 @@ def test_update_results_falls_back_to_base_statistics_when_dispersed_stats_fail(
     assert "11.00" in text
     assert len(gui.result_panel.rows) == 2
     assert gui.result_panel.rows[0] == (1, "10.00", "", "")
+
+
+def test_update_results_appends_evaluation_framework_when_available():
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    gui.current_roi = None
+    gui.result_panel = _DummyResultPanelState()
+    measurements = [
+        SimpleNamespace(id=1, length_um=10.0, width_median_um=0.4, width_iqr_um=0.1),
+        SimpleNamespace(id=2, length_um=35.0, width_median_um=0.8, width_iqr_um=0.2),
+    ]
+    gui._get_active_measurements = lambda: measurements
+    gui.analyzer = SimpleNamespace(
+        get_statistics=lambda roi=None: {
+            "count": 2,
+            "length_mean": 22.5,
+            "length_std": 12.5,
+            "length_min": 10.0,
+            "length_max": 35.0,
+            "length_distribution": {"A": 2},
+            "spatial_distribution": {"grid_size": 4, "grid_density_cv": 0.31, "nearest_neighbor_cv": 0.2, "nearest_neighbor_index": 1.1, "grid_entropy": 0.8, "morans_i": 0.12, "occupancy_ratio": 0.5, "uniformity_scores": {"overall": 78.0}},
+        },
+        get_dispersed_statistics=lambda roi=None: {
+            "total_count": 2,
+            "dispersed_count": 2,
+            "agglomerated_count": 0,
+            "dispersed_ratio": 1.0,
+            "dispersed_measurements": measurements,
+            "agglomerated_measurements": [],
+            "dispersed_length_stats": {
+                "count": 2,
+                "length_mean": 22.5,
+                "length_std": 12.5,
+                "length_min": 10.0,
+                "length_max": 35.0,
+                "length_distribution": {"A": 2},
+            },
+        },
+        get_evaluation_framework=lambda roi=None, stats=None, dispersed_stats=None: {
+            "uniformity": {"grid_density_cv": 0.31},
+            "thick_bundle": {"apparent_width_mean_um": 0.72, "width_p90_um": 0.95},
+            "long_cnt": {"skeleton_length_mean_um": 22.5, "ultra_long_threshold_um": 30.0, "ultra_long_ratio": 0.5},
+            "agglomeration": {"agglomerated_area_ratio": 0.18, "largest_agglomerate_area_um2": 14.2},
+        },
+    )
+
+    gui._update_results()
+
+    text = gui.result_panel.stats_text.getvalue()
+    assert "评判框架" in text
+    assert "A. 均匀性主指标" in text
+    assert "P90 宽度" in text
+    assert "最大团聚体面积" in text
 
 
 def test_analyze_image_files_reuses_cache_and_dispatches_only_uncached_tasks():

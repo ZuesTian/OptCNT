@@ -38,11 +38,12 @@ from ..core.utils import (
     CALIBRATED_BLUR_KERNEL,
     CALIBRATED_ADAPTIVE_BLOCK,
     CALIBRATED_ADAPTIVE_C,
+    UNIFORMITY_LONG_TUBE_THRESHOLD_UM,
     get_length_histogram_bins,
 )
 from .widgets import SortableTreeview
 from .panels import ControlPanel, ImagePanel, ResultPanel, AdvancedAnalysisPanel, ComparisonAnalysisPanel
-from .gui_styles import MODERN_COLORS, apply_modern_style
+from .gui_styles import MODERN_COLORS, apply_modern_style, get_platform_font
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,10 @@ class CNTAnalyzerGUI:
 
         # 应用Modern样式
         apply_modern_style(self.root, MODERN_COLORS)
+
+        # 平台自适应字体和统一图表 DPI
+        self._ui_font = get_platform_font(self.root)
+        self._chart_dpi = getattr(self.root, '_chart_dpi', 100)
 
         # 核心分析器
         self.analyzer = CNTAnalyzer()
@@ -430,7 +435,7 @@ class CNTAnalyzerGUI:
         self._draw_status_indicator('idle')
         
         title_label = tk.Label(status_frame, text="CNT图像分析系统", 
-                                font=('Segoe UI', 12, 'bold'),
+                                font=(self._ui_font, 12, 'bold'),
                                 bg=self.MODERN_COLORS['bg_secondary'],
                                 fg=self.MODERN_COLORS['accent_primary'])
         title_label.pack(side=tk.LEFT)
@@ -1346,8 +1351,6 @@ class CNTAnalyzerGUI:
             self._schedule_preprocessing()
         elif not self.live_preview_var.get():
             self._discard_preprocess_state(include_completed=True, notify=False)
-        elif not self.live_preview_var.get():
-            self._discard_preprocess_state(include_completed=True, notify=False)
         elif self._is_preprocess_mode():
             self._apply_preprocessing(force=True)
         if params:
@@ -2103,6 +2106,155 @@ class CNTAnalyzerGUI:
         self.image_panel.show_status("图像已适应当前窗口")
 
     # ===== 结果更新 =====
+    def _get_evaluation_framework(self,
+                                  *,
+                                  stats: Optional[dict] = None,
+                                  dispersed_stats: Optional[dict] = None) -> dict:
+        """Fetch the four-part evaluation framework while remaining compatible with test doubles."""
+        getter = getattr(self.analyzer, 'get_evaluation_framework', None)
+        if not callable(getter):
+            return {}
+        try:
+            return getter(self.current_roi, stats=stats, dispersed_stats=dispersed_stats) or {}
+        except TypeError:
+            try:
+                return getter(self.current_roi) or {}
+            except TypeError:
+                return getter() or {}
+        except GUI_EXPECTED_DATA_EXCEPTIONS as e:
+            logger.debug(f"获取评判框架失败: {e}")
+        except Exception:
+            logger.exception("获取评判框架时发生未预期的错误")
+        return {}
+
+    @staticmethod
+    def _format_framework_metric(value: Optional[float],
+                                 fmt: str,
+                                 suffix: str = "") -> str:
+        """Format a framework metric with optional suffix, returning N/A when unavailable."""
+        if value is None:
+            return "N/A"
+        numeric_value = float(value)
+        if not np.isfinite(numeric_value):
+            return "N/A"
+        return f"{fmt.format(numeric_value)}{suffix}"
+
+    def _append_evaluation_framework_text(self, text_widget, framework: dict) -> None:
+        """Append the four-part evaluation framework to the single-image stats panel."""
+        if not framework:
+            return
+
+        uniformity = framework.get('uniformity') or {}
+        thick_bundle = framework.get('thick_bundle') or {}
+        long_cnt = framework.get('long_cnt') or {}
+        agglomeration = framework.get('agglomeration') or {}
+        long_threshold = float(
+            long_cnt.get('ultra_long_threshold_um', UNIFORMITY_LONG_TUBE_THRESHOLD_UM)
+            or UNIFORMITY_LONG_TUBE_THRESHOLD_UM
+        )
+
+        text_widget.insert(tk.END, "\n===== 评判框架 =====\n", 'header')
+        text_widget.insert(tk.END, "A. 均匀性主指标\n", 'header')
+        text_widget.insert(tk.END, "网格化局部长度密度 CV: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(uniformity.get('grid_density_cv'), '{:.3f}')}（越小越均匀）\n",
+            'value',
+        )
+
+        text_widget.insert(tk.END, "\nB. 粗管/束化指标\n", 'header')
+        text_widget.insert(tk.END, "表观宽度均值: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(thick_bundle.get('apparent_width_mean_um'), '{:.3f}', ' μm')}\n",
+            'value',
+        )
+        text_widget.insert(tk.END, "P90 宽度: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(thick_bundle.get('width_p90_um'), '{:.3f}', ' μm')}（越大说明粗管/束化越明显）\n",
+            'value',
+        )
+
+        text_widget.insert(tk.END, "\nC. 长管指标\n", 'header')
+        text_widget.insert(tk.END, "骨架平均长度: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(long_cnt.get('skeleton_length_mean_um'), '{:.2f}', ' μm')}\n",
+            'value',
+        )
+        text_widget.insert(tk.END, f"超长 CNT 占比 (≥{long_threshold:.0f}μm): ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(long_cnt.get('ultra_long_ratio'), '{:.1%}')}（越大说明长管更多）\n",
+            'value',
+        )
+
+        text_widget.insert(tk.END, "\nD. 团聚指标\n", 'header')
+        text_widget.insert(tk.END, "团聚区面积占比: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(agglomeration.get('agglomerated_area_ratio'), '{:.1%}')}（越大说明团聚越明显）\n",
+            'value',
+        )
+        text_widget.insert(tk.END, "最大团聚体面积: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{self._format_framework_metric(agglomeration.get('largest_agglomerate_area_um2'), '{:.2f}', ' μm²')}\n",
+            'value',
+        )
+
+    def _build_evaluation_framework_report_text(self, framework: dict) -> str:
+        """Build a plain-text block for the exported report."""
+        if not framework:
+            return ""
+
+        uniformity = framework.get('uniformity') or {}
+        thick_bundle = framework.get('thick_bundle') or {}
+        long_cnt = framework.get('long_cnt') or {}
+        agglomeration = framework.get('agglomeration') or {}
+        long_threshold = float(
+            long_cnt.get('ultra_long_threshold_um', UNIFORMITY_LONG_TUBE_THRESHOLD_UM)
+            or UNIFORMITY_LONG_TUBE_THRESHOLD_UM
+        )
+
+        lines = [
+            "评判框架:",
+            "  A. 均匀性主指标",
+            (
+                "    - 网格化局部长度密度 CV: "
+                f"{self._format_framework_metric(uniformity.get('grid_density_cv'), '{:.3f}')}（越小越均匀）"
+            ),
+            "  B. 粗管/束化指标",
+            (
+                "    - 表观宽度均值: "
+                f"{self._format_framework_metric(thick_bundle.get('apparent_width_mean_um'), '{:.3f}', ' μm')}"
+            ),
+            (
+                "    - P90 宽度: "
+                f"{self._format_framework_metric(thick_bundle.get('width_p90_um'), '{:.3f}', ' μm')}（越大说明粗管/束化越明显）"
+            ),
+            "  C. 长管指标",
+            (
+                "    - 骨架平均长度: "
+                f"{self._format_framework_metric(long_cnt.get('skeleton_length_mean_um'), '{:.2f}', ' μm')}"
+            ),
+            (
+                f"    - 超长 CNT 占比 (≥{long_threshold:.0f}μm): "
+                f"{self._format_framework_metric(long_cnt.get('ultra_long_ratio'), '{:.1%}')}（越大说明长管更多）"
+            ),
+            "  D. 团聚指标",
+            (
+                "    - 团聚区面积占比: "
+                f"{self._format_framework_metric(agglomeration.get('agglomerated_area_ratio'), '{:.1%}')}（越大说明团聚越明显）"
+            ),
+            (
+                "    - 最大团聚体面积: "
+                f"{self._format_framework_metric(agglomeration.get('largest_agglomerate_area_um2'), '{:.2f}', ' μm²')}"
+            ),
+        ]
+        return "\n".join(lines)
+
     def _update_results(self):
         """更新结果显示"""
         self.result_panel.clear_stats()
@@ -2121,6 +2273,7 @@ class CNTAnalyzerGUI:
         display_measurements = measurements
         dispersed_ids = set()
         agglomerated_ids = set()
+        framework = {}
         try:
             dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
             if dispersed_stats:
@@ -2133,6 +2286,8 @@ class CNTAnalyzerGUI:
             logger.debug(f"获取分散统计失败: {e}")
         except Exception as e:
             logger.exception("获取分散统计时发生未预期的错误")
+
+        framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
 
         if dispersed_stats:
             text_widget.insert(tk.END, "分散CNT数量: ", 'header')
@@ -2178,6 +2333,13 @@ class CNTAnalyzerGUI:
             uniformity_scores = spatial.get('uniformity_scores') or {}
             text_widget.insert(tk.END, "综合均匀性得分: ", 'header')
             text_widget.insert(tk.END, f"{uniformity_scores.get('overall', 0.0):.1f} / 100（越大越均匀）\n", 'value')
+            long_tube_ratio = float(
+                spatial.get('long_tube_ratio', uniformity_scores.get('long_tube_ratio', 0.0)) or 0.0
+            )
+            long_tube_threshold = float(spatial.get('long_tube_threshold_um', 40.0) or 40.0)
+            if long_tube_ratio > 0:
+                text_widget.insert(tk.END, f"长管比例(>{long_tube_threshold:.0f}μm): ", 'header')
+                text_widget.insert(tk.END, f"{long_tube_ratio:.1%}（仅作长管指标参考，不再扣减均匀度分数）\n", 'warning')
             text_widget.insert(tk.END, "中心点最近邻距离CV: ", 'header')
             text_widget.insert(tk.END, f"{spatial['nearest_neighbor_cv']:.3f}（越小越均匀）\n", 'value')
             text_widget.insert(tk.END, "最近邻指数NNI: ", 'header')
@@ -2190,6 +2352,8 @@ class CNTAnalyzerGUI:
             text_widget.insert(tk.END, f"{spatial['morans_i']:.3f}（越大越聚集）\n", 'value')
             text_widget.insert(tk.END, "网格占用率: ", 'header')
             text_widget.insert(tk.END, f"{spatial['occupancy_ratio']:.1%}\n", 'value')
+
+        self._append_evaluation_framework_text(text_widget, framework)
 
         for m in measurements:
             measurement_id = int(m.id)
@@ -2318,7 +2482,7 @@ class CNTAnalyzerGUI:
             self._dispose_chart(key)
             for child in frame.winfo_children():
                 child.destroy()
-            chart['fig'] = Figure(figsize=figsize, dpi=100)
+            chart['fig'] = Figure(figsize=figsize, dpi=getattr(self, '_chart_dpi', 100))
             chart['fig'].patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
             chart['ax'] = chart['fig'].add_subplot(111)
             chart['canvas'] = FigureCanvasTkAgg(chart['fig'], master=frame)
@@ -3241,6 +3405,20 @@ class CNTAnalyzerGUI:
         analyzer.detect_cnts_hybrid(**detect_settings, roi=analysis_roi)
         stats = analyzer.get_statistics(analysis_roi)
         dispersed_stats = analyzer.get_dispersed_statistics(analysis_roi)
+        evaluation_framework = {}
+        framework_getter = getattr(analyzer, 'get_evaluation_framework', None)
+        if callable(framework_getter):
+            try:
+                evaluation_framework = framework_getter(
+                    analysis_roi,
+                    stats=stats,
+                    dispersed_stats=dispersed_stats,
+                ) or {}
+            except TypeError:
+                try:
+                    evaluation_framework = framework_getter(analysis_roi) or {}
+                except TypeError:
+                    evaluation_framework = framework_getter() or {}
 
         visualization = None
         if include_visualization:
@@ -3259,6 +3437,7 @@ class CNTAnalyzerGUI:
             'name': Path(image_path).name,
             'stats': stats,
             'dispersed_stats': dispersed_stats,
+            'evaluation_framework': evaluation_framework,
             'scale_info': scale_info,
             'scale_status': analyzer.get_scale_status(),
             'visualization': visualization,
@@ -3529,6 +3708,12 @@ class CNTAnalyzerGUI:
             'total': float(np.sum(array)),
         }
 
+    @staticmethod
+    def _get_result_evaluation_framework(result: dict) -> dict:
+        """Read the stored evaluation framework from an analysis result."""
+        framework = result.get('evaluation_framework') or {}
+        return framework if isinstance(framework, dict) else {}
+
     def _summarize_group_results(self, group_label: str, results: List[dict]) -> dict:
         """汇总一组图像的CNT统计结果"""
         count_values: List[float] = []
@@ -3552,12 +3737,18 @@ class CNTAnalyzerGUI:
         aggregation_moran_values: List[float] = []
         aggregation_values: List[float] = []
         shadow_aggregation_values: List[float] = []
+        hybrid_score_values: List[float] = []
+        hybrid_uniformity_values: List[float] = []
+        hybrid_thick_bundle_values: List[float] = []
+        hybrid_long_cnt_values: List[float] = []
+        hybrid_agglomeration_values: List[float] = []
         density_grids: List[np.ndarray] = []
         file_details: List[dict] = []
 
         for result in results:
             stats = result.get('stats', {})
             dispersed_stats = result.get('dispersed_stats', {})
+            framework = self._get_result_evaluation_framework(result)
             spatial = stats.get('spatial_distribution') or {}
             uniformity_scores = spatial.get('uniformity_scores') or {}
             aggregation_scores = spatial.get('aggregation_scores') or {}
@@ -3583,6 +3774,11 @@ class CNTAnalyzerGUI:
             aggregation_moran = float(aggregation_scores.get('moran', 100.0 - uniformity_moran))
             aggregation_overall = float(aggregation_scores.get('overall', 100.0 - uniformity_overall))
             shadow_aggregation = float(self._get_shadow_aggregation_metrics(spatial).get('score', aggregation_overall))
+            hybrid_score = float(framework.get('hybrid_score', 0.0) or 0.0)
+            hybrid_uniformity = float((framework.get('uniformity') or {}).get('score', 0.0) or 0.0)
+            hybrid_thick_bundle = float((framework.get('thick_bundle') or {}).get('score', 0.0) or 0.0)
+            hybrid_long_cnt = float((framework.get('long_cnt') or {}).get('score', 0.0) or 0.0)
+            hybrid_agglomeration = float((framework.get('agglomeration') or {}).get('score', 0.0) or 0.0)
 
             count_values.append(count)
             dispersed_count_values.append(dispersed_count)
@@ -3605,6 +3801,11 @@ class CNTAnalyzerGUI:
             aggregation_moran_values.append(aggregation_moran)
             aggregation_values.append(aggregation_overall)
             shadow_aggregation_values.append(shadow_aggregation)
+            hybrid_score_values.append(hybrid_score)
+            hybrid_uniformity_values.append(hybrid_uniformity)
+            hybrid_thick_bundle_values.append(hybrid_thick_bundle)
+            hybrid_long_cnt_values.append(hybrid_long_cnt)
+            hybrid_agglomeration_values.append(hybrid_agglomeration)
 
             density_grid = np.array(spatial.get('density_grid') or np.zeros((10, 10)), dtype=float)
             density_grids.append(density_grid)
@@ -3630,6 +3831,7 @@ class CNTAnalyzerGUI:
                 'uniformity_grid_score': uniformity_grid,
                 'uniformity_moran_score': uniformity_moran,
                 'uniformity_score': uniformity_overall,
+                'hybrid_score': hybrid_score,
             })
 
         mean_density_grid = np.mean(np.stack(density_grids, axis=0), axis=0) if density_grids else np.zeros((10, 10))
@@ -3645,6 +3847,7 @@ class CNTAnalyzerGUI:
             'dispersed_ratio_stats': self._summarize_numeric_series(dispersed_ratio_values),
             'length_mean_stats': self._summarize_numeric_series(length_mean_values),
             'dispersed_length_mean_stats': self._summarize_numeric_series(dispersed_length_mean_values),
+            'hybrid_score_stats': self._summarize_numeric_series(hybrid_score_values),
             'spatial_stats': {
                 'nearest_neighbor_cv': self._summarize_numeric_series(nn_values),
                 'nearest_neighbor_index': self._summarize_numeric_series(nn_index_values),
@@ -3661,6 +3864,12 @@ class CNTAnalyzerGUI:
                 'uniformity_grid_score': self._summarize_numeric_series(uniformity_grid_values),
                 'uniformity_moran_score': self._summarize_numeric_series(uniformity_moran_values),
                 'uniformity_score': self._summarize_numeric_series(uniformity_values),
+            },
+            'hybrid_component_stats': {
+                'uniformity': self._summarize_numeric_series(hybrid_uniformity_values),
+                'thick_bundle': self._summarize_numeric_series(hybrid_thick_bundle_values),
+                'long_cnt': self._summarize_numeric_series(hybrid_long_cnt_values),
+                'agglomeration': self._summarize_numeric_series(hybrid_agglomeration_values),
             },
             'mean_density_grid': mean_density_grid.tolist(),
         }
@@ -3755,6 +3964,10 @@ class CNTAnalyzerGUI:
             'dispersed_ratio': self._compute_two_group_tests(
                 self._get_group_detail_series(base_group, 'dispersed_ratio'),
                 self._get_group_detail_series(exp_group, 'dispersed_ratio'),
+            ),
+            'hybrid_score': self._compute_two_group_tests(
+                self._get_group_detail_series(base_group, 'hybrid_score'),
+                self._get_group_detail_series(exp_group, 'hybrid_score'),
             ),
             'nearest_neighbor_cv': self._compute_two_group_tests(
                 self._get_group_detail_series(base_group, 'nearest_neighbor_cv'),
@@ -3877,92 +4090,12 @@ class CNTAnalyzerGUI:
                                          note: Optional[str] = None,
                                          failures: Optional[List[str]] = None) -> str:
         """生成组别对比摘要"""
-        compare_context = self._get_compare_display_context(
-            *(base_group.get('results') or []),
-            *(exp_group.get('results') or []),
+        return self._format_group_comparison_summary(
+            base_group,
+            exp_group,
+            note=note,
+            failures=failures,
         )
-        base_count = base_group['count_stats']
-        exp_count = exp_group['count_stats']
-        base_spatial = base_group['spatial_stats']
-        exp_spatial = exp_group['spatial_stats']
-        base_counts = [detail['count'] for detail in base_group['file_details']]
-        exp_counts = [detail['count'] for detail in exp_group['file_details']]
-        base_nn = [detail['nearest_neighbor_cv'] for detail in base_group['file_details']]
-        exp_nn = [detail['nearest_neighbor_cv'] for detail in exp_group['file_details']]
-        base_grid = [detail['grid_density_cv'] for detail in base_group['file_details']]
-        exp_grid = [detail['grid_density_cv'] for detail in exp_group['file_details']]
-        base_uniformity = [detail.get('uniformity_score', 0.0) for detail in base_group['file_details']]
-        exp_uniformity = [detail.get('uniformity_score', 0.0) for detail in exp_group['file_details']]
-        count_tests = self._compute_two_group_tests(base_counts, exp_counts)
-        nn_tests = self._compute_two_group_tests(base_nn, exp_nn)
-        grid_tests = self._compute_two_group_tests(base_grid, exp_grid)
-        uniformity_tests = self._compute_two_group_tests(base_uniformity, exp_uniformity)
-
-        split_mode_label = self.split_mode_var.get()
-        profile_label = self.detect_profile_var.get()
-        count_diff = exp_count['mean'] - base_count['mean']
-        count_ratio = (count_diff / base_count['mean'] * 100.0) if base_count['mean'] > 0 else 0.0
-
-        uniformity_diff = exp_spatial['uniformity_score']['mean'] - base_spatial['uniformity_score']['mean']
-        exp_more_uniform = uniformity_diff > 1.0
-        base_more_clustered = base_spatial['morans_i']['mean'] > exp_spatial['morans_i']['mean']
-
-        lines: List[str] = []
-        if note:
-            lines.append(note)
-            lines.append("")
-
-        lines.extend([
-            f"相同识别条件: 模糊={self.blur_kernel_var.get()} / 自适应块={self.adaptive_block_var.get()} / C={self.adaptive_c_var.get()} / 桥接={self.bridge_strength_var.get()} / 最小长度={self.min_length_um_var.get():.1f}μm / 最小长宽比={self.min_slenderness_var.get():.1f} / 检测风格={profile_label} / 拆分模式={split_mode_label} / 合并距离={self.merge_distance_px_var.get()}px",
-            f"base组: 共 {base_group['image_count']} 张图，总CNT {int(round(base_count['total']))}，平均 {base_count['mean']:.2f}，标准差 {base_count['std']:.2f}，方差 {base_count['var']:.2f}，范围 {base_count['min']:.0f}~{base_count['max']:.0f}",
-            f"实验组: 共 {exp_group['image_count']} 张图，总CNT {int(round(exp_count['total']))}，平均 {exp_count['mean']:.2f}，标准差 {exp_count['std']:.2f}，方差 {exp_count['var']:.2f}，范围 {exp_count['min']:.0f}~{exp_count['max']:.0f}",
-        ])
-
-        if count_diff >= 0:
-            lines.append(f"CNT数量均值差异: 实验组比base组高 {count_diff:.2f}（+{count_ratio:.1f}%）")
-        else:
-            lines.append(f"CNT数量均值差异: base组比实验组高 {abs(count_diff):.2f}（+{abs(count_ratio):.1f}%）")
-
-        lines.extend([
-            "",
-            "组别均匀性统计:",
-            f"综合均匀性得分: base组 {base_spatial['uniformity_score']['mean']:.1f}±{base_spatial['uniformity_score']['std']:.1f}，实验组 {exp_spatial['uniformity_score']['mean']:.1f}±{exp_spatial['uniformity_score']['std']:.1f}。该得分范围 0-100，越大越均匀。",
-            f"方法一 中心点最近邻CV: base组 {base_spatial['nearest_neighbor_cv']['mean']:.3f}±{base_spatial['nearest_neighbor_cv']['std']:.3f}，实验组 {exp_spatial['nearest_neighbor_cv']['mean']:.3f}±{exp_spatial['nearest_neighbor_cv']['std']:.3f}。该值越小越均匀。",
-            f"补充指标 最近邻指数NNI: base组 {base_spatial['nearest_neighbor_index']['mean']:.3f}±{base_spatial['nearest_neighbor_index']['std']:.3f}，实验组 {exp_spatial['nearest_neighbor_index']['mean']:.3f}±{exp_spatial['nearest_neighbor_index']['std']:.3f}。该值大于 1 表示比随机分布更均匀。",
-            f"方法二 网格CNT数CV: base组 {base_spatial['grid_density_cv']['mean']:.3f}±{base_spatial['grid_density_cv']['std']:.3f}，实验组 {exp_spatial['grid_density_cv']['mean']:.3f}±{exp_spatial['grid_density_cv']['std']:.3f}。该值越小越均匀。",
-            f"方法三 Moran's I: base组 {base_spatial['morans_i']['mean']:.3f}±{base_spatial['morans_i']['std']:.3f}，实验组 {exp_spatial['morans_i']['mean']:.3f}±{exp_spatial['morans_i']['std']:.3f}。该值越大越聚集。",
-            "",
-            "统计检验:",
-            f"CNT数量 t检验 p={self._format_pvalue(count_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(count_tests['mw_pvalue'])}，显著性 {self._get_significance_marker(count_tests['t_pvalue'])}",
-            f"综合均匀性得分 t检验 p={self._format_pvalue(uniformity_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(uniformity_tests['mw_pvalue'])}，显著性 {self._get_significance_marker(uniformity_tests['t_pvalue'])}",
-            f"最近邻CV t检验 p={self._format_pvalue(nn_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(nn_tests['mw_pvalue'])}，显著性 {self._get_significance_marker(nn_tests['t_pvalue'])}",
-            f"网格CNT数CV t检验 p={self._format_pvalue(grid_tests['t_pvalue'])}，Mann-Whitney p={self._format_pvalue(grid_tests['mw_pvalue'])}，显著性 {self._get_significance_marker(grid_tests['t_pvalue'])}",
-            "",
-        ])
-
-        if exp_count['mean'] > base_count['mean'] and exp_more_uniform:
-            conclusion = "结论: 在多图同参数统计下，实验组平均识别CNT数量更多，且整体分布更均匀。"
-            if base_more_clustered:
-                conclusion += " base组的空间自相关更高，CNT团聚更明显。"
-        elif exp_count['mean'] < base_count['mean'] and not exp_more_uniform:
-            conclusion = "结论: 在多图同参数统计下，base组平均识别CNT数量更多，且整体分布更均匀。"
-            if not base_more_clustered:
-                conclusion += " 实验组的空间自相关更高，CNT团聚更明显。"
-        else:
-            conclusion = "结论: 当前这组参数下，两组在数量和均匀性上的差异未完全同向拉开，可继续微调识别条件。"
-        lines.append(conclusion)
-        lines.append("")
-
-        lines.extend(self._format_group_detail_lines(base_group))
-        lines.append("")
-        lines.extend(self._format_group_detail_lines(exp_group))
-
-        if failures:
-            lines.append("")
-            lines.append("未成功分析的文件:")
-            lines.extend([f"  - {item}" for item in failures])
-
-        return "\n".join(lines)
 
     def _get_comparison_image_aspect(self, image: Optional[np.ndarray]) -> float:
         """返回对比图像的宽高比。"""
@@ -4158,6 +4291,58 @@ class CNTAnalyzerGUI:
         if test_result is not None:
             line += f" | {self._format_compact_significance(test_result)}"
         return line
+
+    def _format_hybrid_score_comparison(self,
+                                        left_label: str,
+                                        left_framework: dict,
+                                        right_label: str,
+                                        right_framework: dict,
+                                        *,
+                                        left_std: Optional[float] = None,
+                                        right_std: Optional[float] = None,
+                                        test_result: Optional[dict] = None) -> List[str]:
+        """Format a compact mixed-score summary line plus its four component scores."""
+        left_hybrid = float(left_framework.get('hybrid_score', 0.0) or 0.0)
+        right_hybrid = float(right_framework.get('hybrid_score', 0.0) or 0.0)
+
+        lines = [
+            self._format_metric_comparison(
+                '混合评分',
+                left_label,
+                left_hybrid,
+                right_label,
+                right_hybrid,
+                direction='up',
+                qualifier='0-100，越高越优',
+                precision=1,
+                left_std=left_std,
+                right_std=right_std,
+                test_result=test_result,
+            )
+        ]
+
+        component_defs = [
+            ('A', '均匀性', 'uniformity'),
+            ('B', '粗管/束化', 'thick_bundle'),
+            ('C', '长管', 'long_cnt'),
+            ('D', '团聚', 'agglomeration'),
+        ]
+        for prefix, label, key in component_defs:
+            left_value = float((left_framework.get(key) or {}).get('score', 0.0) or 0.0)
+            right_value = float((right_framework.get(key) or {}).get('score', 0.0) or 0.0)
+            lines.append(
+                self._format_metric_comparison(
+                    f"{prefix}.{label}",
+                    left_label,
+                    left_value,
+                    right_label,
+                    right_value,
+                    direction='up',
+                    qualifier='分项分数',
+                    precision=1,
+                )
+            )
+        return lines
 
     def _summarize_spatial_hotspots_for_caption(self, spatial: Optional[dict]) -> str:
         """为代表图标题补充热点摘要。"""
@@ -4540,37 +4725,40 @@ class CNTAnalyzerGUI:
         stack_images = self._should_stack_comparison_images(left_display_image, right_display_image, threshold=1.65)
         layout = self._build_comparison_layout(left_display_image, right_display_image, stacked=stack_images, variant='pair')
         figure_width, figure_height = layout['figsize']
-        figure = Figure(figsize=(min(13.4, figure_width), min(11.2, figure_height)), dpi=92)
+        figure = Figure(figsize=(min(13.4, figure_width), min(11.2, figure_height)), dpi=getattr(self, '_chart_dpi', 100))
         figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
 
         if stack_images:
             grid_spec = figure.add_gridspec(
-                3,
+                4,
                 2,
-                height_ratios=layout['height_ratios'],
+                height_ratios=[layout['height_ratios'][0], 0.72, layout['height_ratios'][1], layout['height_ratios'][2]],
                 hspace=layout['hspace'],
                 wspace=layout['wspace'],
             )
             ax_dispersed_count = figure.add_subplot(grid_spec[0, 0])
             ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 1])
-            ax_left = figure.add_subplot(grid_spec[1, :])
-            ax_right = figure.add_subplot(grid_spec[2, :])
+            ax_hybrid = figure.add_subplot(grid_spec[1, :])
+            ax_left = figure.add_subplot(grid_spec[2, :])
+            ax_right = figure.add_subplot(grid_spec[3, :])
         else:
             grid_spec = figure.add_gridspec(
+                3,
                 2,
-                2,
-                height_ratios=layout['height_ratios'],
+                height_ratios=[layout['height_ratios'][0], 0.78, layout['height_ratios'][1]],
                 hspace=layout['hspace'],
                 wspace=layout['wspace'],
             )
             ax_dispersed_count = figure.add_subplot(grid_spec[0, 0])
             ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 1])
-            ax_left = figure.add_subplot(grid_spec[1, 0])
-            ax_right = figure.add_subplot(grid_spec[1, 1])
+            ax_hybrid = figure.add_subplot(grid_spec[1, :])
+            ax_left = figure.add_subplot(grid_spec[2, 0])
+            ax_right = figure.add_subplot(grid_spec[2, 1])
         figure.subplots_adjust(**layout['adjust'])
 
         dispersed_count_test = tests.get('dispersed_count') if tests else None
         dispersed_ratio_test = tests.get('dispersed_ratio') if tests else None
+        hybrid_score_test = tests.get('hybrid_score') if tests else None
 
         self._plot_dispersion_bar_chart(
             ax_dispersed_count,
@@ -4592,6 +4780,16 @@ class CNTAnalyzerGUI:
             "{:.1f}%",
             scale=100.0,
             test_result=dispersed_ratio_test,
+        )
+        self._plot_dispersion_bar_chart(
+            ax_hybrid,
+            left_group,
+            right_group,
+            'hybrid_score_stats',
+            '混合评分对比',
+            '评分 (0-100)',
+            "{:.1f}",
+            test_result=hybrid_score_test,
         )
 
         self._configure_comparison_image_axis(
@@ -4662,6 +4860,18 @@ class CNTAnalyzerGUI:
             )
         return lines
 
+    @staticmethod
+    def _build_group_framework_summary(group_summary: dict) -> dict:
+        """Build a lightweight framework snapshot from aggregated group means."""
+        component_stats = group_summary.get('hybrid_component_stats') or {}
+        return {
+            'hybrid_score': float((group_summary.get('hybrid_score_stats') or {}).get('mean', 0.0) or 0.0),
+            'uniformity': {'score': float((component_stats.get('uniformity') or {}).get('mean', 0.0) or 0.0)},
+            'thick_bundle': {'score': float((component_stats.get('thick_bundle') or {}).get('mean', 0.0) or 0.0)},
+            'long_cnt': {'score': float((component_stats.get('long_cnt') or {}).get('mean', 0.0) or 0.0)},
+            'agglomeration': {'score': float((component_stats.get('agglomeration') or {}).get('mean', 0.0) or 0.0)},
+        }
+
     def _format_group_comparison_summary(self,
                                          base_group: dict,
                                          exp_group: dict,
@@ -4680,6 +4890,8 @@ class CNTAnalyzerGUI:
         exp_dispersed_length = exp_group.get('dispersed_length_mean_stats', self._summarize_numeric_series([]))
         base_spatial = base_group['spatial_stats']
         exp_spatial = exp_group['spatial_stats']
+        base_framework = self._build_group_framework_summary(base_group)
+        exp_framework = self._build_group_framework_summary(exp_group)
         compare_context = self._get_compare_display_context(
             *(base_group.get('results') or []),
             *(exp_group.get('results') or []),
@@ -4687,6 +4899,7 @@ class CNTAnalyzerGUI:
         tests = self._compute_group_comparison_tests(base_group, exp_group)
 
         count_tests = tests['count']
+        hybrid_tests = tests['hybrid_score']
         shadow_tests = tests['shadow_aggregation_score']
         uniformity_tests = tests['uniformity_score']
         shadow_diff = base_spatial['shadow_aggregation_score']['mean'] - exp_spatial['shadow_aggregation_score']['mean']
@@ -4812,6 +5025,8 @@ class CNTAnalyzerGUI:
         right_count = int(right_result['stats'].get('count', 0))
         left_dispersed = left_result.get('dispersed_stats') or {}
         right_dispersed = right_result.get('dispersed_stats') or {}
+        left_framework = self._get_result_evaluation_framework(left_result)
+        right_framework = self._get_result_evaluation_framework(right_result)
         count_diff = left_count - right_count
         count_ratio = (count_diff / right_count * 100.0) if right_count > 0 else 0.0
         left_uniformity_score = left_metrics['uniformity_score']
@@ -4928,14 +5143,14 @@ class CNTAnalyzerGUI:
         tk.Label(
             header,
             text="选择对比模式",
-            font=('Segoe UI', 13, 'bold'),
+            font=(self._ui_font, 13, 'bold'),
             bg=self.MODERN_COLORS['bg_secondary'],
             fg=self.MODERN_COLORS['accent_primary'],
         ).pack(anchor='w')
         tk.Label(
             header,
             text="对比分析会沿用当前界面的预处理和识别参数，并仅分析中部 75% 区域；分析会在后台执行，便于重复对比而不把界面卡死。",
-            font=('Segoe UI', 9),
+            font=(self._ui_font, 9),
             bg=self.MODERN_COLORS['bg_secondary'],
             fg=self.MODERN_COLORS['text_secondary'],
             justify='left',
@@ -4980,14 +5195,14 @@ class CNTAnalyzerGUI:
             tk.Label(
                 text_frame,
                 text=title,
-                font=('Segoe UI', 10, 'bold'),
+                font=(self._ui_font, 10, 'bold'),
                 bg=self.MODERN_COLORS['bg_secondary'],
                 fg=self.MODERN_COLORS['text_primary'],
             ).pack(anchor='w')
             tk.Label(
                 text_frame,
                 text=description,
-                font=('Segoe UI', 9),
+                font=(self._ui_font, 9),
                 bg=self.MODERN_COLORS['bg_secondary'],
                 fg=self.MODERN_COLORS['text_secondary'],
                 justify='left',
@@ -5313,6 +5528,12 @@ class CNTAnalyzerGUI:
         if file_path:
             try:
                 stats = self.analyzer.get_statistics(self.current_roi)
+                dispersed_stats = None
+                try:
+                    dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
+                except Exception:
+                    dispersed_stats = None
+                framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
 
                 if file_path.endswith('.json'):
                     spatial = stats.get('spatial_distribution') or {}
@@ -5336,6 +5557,7 @@ class CNTAnalyzerGUI:
                                 'uniformity_scores': spatial.get('uniformity_scores', {}),
                                 'density_grid': spatial.get('density_grid', []),
                             },
+                            'evaluation_framework': framework,
                         },
                     'measurements': [
                             {
@@ -5392,6 +5614,12 @@ class CNTAnalyzerGUI:
             try:
                 stats = self.analyzer.get_statistics(self.current_roi)
                 spatial = stats.get('spatial_distribution') or {}
+                dispersed_stats = None
+                try:
+                    dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
+                except Exception:
+                    dispersed_stats = None
+                framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
 
                 report = f"""
 ========================================
@@ -5443,6 +5671,13 @@ class CNTAnalyzerGUI:
 ID      长度(μm)    宽度(μm)    长宽比
 ----------------------------------------
 """
+                framework_block = self._build_evaluation_framework_report_text(framework)
+                if framework_block:
+                    report += f"""
+
+{framework_block}
+"""
+
                 for m in measurements:
                     width_str = f"{m.width_mean_um:.2f}" if m.width_mean_um else "N/A"
                     slenderness_str = f"{m.slenderness:.2f}" if m.slenderness else "N/A"

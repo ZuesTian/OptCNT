@@ -34,13 +34,21 @@ from .utils import (
     SKELETON_WALK_ANGLE_DEG,
     CNT_MERGE_MAX_ANGLE_DIFF_DEG, CNT_MERGE_MAX_ALIGNMENT_DEG,
     LENGTH_DISTRIBUTION_BINS_UM, LENGTH_DISTRIBUTION_LABELS,
+    UNIFORMITY_SIGMOID_STEEPNESS, UNIFORMITY_SIGMOID_MIDPOINT,
+    UNIFORMITY_WEIGHT_NN, UNIFORMITY_WEIGHT_GRID, UNIFORMITY_WEIGHT_MORAN,
+    UNIFORMITY_LOW_CONFIDENCE_THRESHOLD, UNIFORMITY_VERY_LOW_CONFIDENCE_THRESHOLD,
+    SPATIAL_GRID_MIN_SIZE, SPATIAL_GRID_MAX_SIZE,
+    UNIFORMITY_LONG_TUBE_THRESHOLD_UM,
+    EVALUATION_WEIGHT_UNIFORMITY, EVALUATION_WEIGHT_THICK_BUNDLE,
+    EVALUATION_WEIGHT_LONG_CNT, EVALUATION_WEIGHT_AGGLOMERATION,
+    EVALUATION_ULTRA_LONG_THRESHOLD_UM, EVALUATION_LONG_CNT_RATIO_EXPONENT,
     SPATIAL_HOTSPOT_POINT_PERCENTILE, SPATIAL_HOTSPOT_COVERAGE_PERCENTILE,
     SPATIAL_HOTSPOT_SHADOW_PERCENTILE, SPATIAL_HOTSPOT_POINT_WEIGHT,
     SPATIAL_HOTSPOT_COVERAGE_WEIGHT, SPATIAL_HOTSPOT_SHADOW_WEIGHT,
     SPATIAL_HOTSPOT_ACTIVE_SCORE_RANGE_MIN, SPATIAL_HOTSPOT_MASK_PERCENTILE_LARGE,
     SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL, SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE,
     SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL, SPATIAL_HOTSPOT_OVERLAP_RATIO_THRESHOLD,
-    SPATIAL_HOTSPOT_MASK_UPSAMPLE,
+    SPATIAL_HOTSPOT_MASK_UPSAMPLE, SPATIAL_HOTSPOT_ABSOLUTE_SCORE_MIN,
 )
 
 logger = logging.getLogger(__name__)
@@ -1081,22 +1089,12 @@ class CNTAnalyzer:
             return 0.0
 
         path_array = np.asarray(path, dtype=np.float64)
+        if NUMBA_AVAILABLE:
+            return _calculate_path_length_fast(path_array)
+
         deltas = np.diff(path_array, axis=0)
         segment_lengths = np.hypot(deltas[:, 0], deltas[:, 1])
         return float(np.sum(segment_lengths))
-
-        # 使用优化版本（如果可用）
-        if NUMBA_AVAILABLE:
-            path_array = np.array(path, dtype=np.float64)
-            return _calculate_path_length_fast(path_array)
-        
-        # 回退到原始实现
-        length = 0.0
-        for index in range(1, len(path)):
-            prev_y, prev_x = path[index - 1]
-            curr_y, curr_x = path[index]
-            length += float(np.hypot(curr_y - prev_y, curr_x - prev_x))
-        return length
 
     @staticmethod
     def _build_path_neighbors(path: List[Tuple[int, int]]) -> dict:
@@ -2196,7 +2194,7 @@ class CNTAnalyzer:
         }
 
     def _calculate_grid_morans_i(self, grid: np.ndarray) -> float:
-        """基于网格计数计算 Moran's I。"""
+        """基于网格计数计算 Moran's I（使用 Queen 8-邻接权重矩阵）。"""
         flat_grid = np.asarray(grid, dtype=float).ravel()
         if flat_grid.size == 0:
             return 0.0
@@ -2212,41 +2210,116 @@ class CNTAnalyzer:
         for row in range(grid_size):
             for col in range(grid_size):
                 index = row * grid_size + col
-                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    n_row = row + dy
-                    n_col = col + dx
-                    if 0 <= n_row < grid_size and 0 <= n_col < grid_size:
-                        neighbor_index = n_row * grid_size + n_col
-                        weights += 1.0
-                        numerator += (flat_grid[index] - mean_value) * (flat_grid[neighbor_index] - mean_value)
+                # Queen邻接: 8个方向（包括对角线）
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dy == 0 and dx == 0:
+                            continue
+                        n_row = row + dy
+                        n_col = col + dx
+                        if 0 <= n_row < grid_size and 0 <= n_col < grid_size:
+                            neighbor_index = n_row * grid_size + n_col
+                            weights += 1.0
+                            numerator += (flat_grid[index] - mean_value) * (flat_grid[neighbor_index] - mean_value)
 
         if weights <= 0:
             return 0.0
         return float((len(flat_grid) / weights) * (numerator / denominator))
 
+    @staticmethod
+    def _sigmoid_score(value: float,
+                       midpoint: float = UNIFORMITY_SIGMOID_MIDPOINT,
+                       steepness: float = UNIFORMITY_SIGMOID_STEEPNESS) -> float:
+        """将 'smaller is better' 的指标通过 sigmoid 映射到 0-100。
+
+        当 value == midpoint 时得分 50；value → 0 时趋近 100；value → ∞ 时趋近 0。
+        相比旧的 100/(1+x) 反比例映射，在常见 CV 范围（0.2~1.5）内区分度更好。
+        """
+        safe_value = max(float(value), 0.0)
+        safe_midpoint = max(float(midpoint), 1e-6)
+        safe_steepness = max(float(steepness), 0.5)
+        exponent = safe_steepness * (safe_value - safe_midpoint) / safe_midpoint
+        return float(100.0 / (1.0 + np.exp(exponent)))
+
+    @staticmethod
+    def _moran_score(morans_i: float) -> float:
+        """将 Moran's I 映射到 0-100 均匀性得分。
+
+        使用拉伸的 sigmoid 使得在实际常见范围（-0.3~0.5）内有更好的区分度。
+        I = -0.3（分散） → ~90, I = 0（随机） → ~65, I = 0.3 → ~35, I = 0.7 → ~10
+        """
+        clamped = float(np.clip(float(morans_i), -1.0, 1.0))
+        # 将 [-1, 1] 映射到 [100, 0]，中心点偏移到 0.1（略高于随机）
+        exponent = 5.0 * (clamped - 0.1)
+        return float(100.0 / (1.0 + np.exp(exponent)))
+
+    @staticmethod
+    def _get_uniformity_confidence(centroid_count: int) -> str:
+        """根据样本量返回均匀性得分的置信等级。"""
+        if centroid_count < UNIFORMITY_VERY_LOW_CONFIDENCE_THRESHOLD:
+            return 'very_low'
+        if centroid_count < UNIFORMITY_LOW_CONFIDENCE_THRESHOLD:
+            return 'low'
+        return 'high'
+
+    @staticmethod
+    def _resolve_spatial_grid_size(centroid_count: int,
+                                   requested_grid_size: Optional[int] = None) -> int:
+        """Resolve the grid size used by spatial statistics.
+
+        When callers do not provide an explicit grid size, use a simple
+        sample-count heuristic so sparse images are not dominated by empty cells.
+        """
+        if requested_grid_size is not None:
+            return max(int(SPATIAL_GRID_MIN_SIZE), int(requested_grid_size))
+
+        if centroid_count <= 0:
+            return int(SPATIAL_GRID_MIN_SIZE)
+
+        adaptive_grid_size = int(round(np.sqrt(float(centroid_count))))
+        return int(np.clip(adaptive_grid_size, SPATIAL_GRID_MIN_SIZE, SPATIAL_GRID_MAX_SIZE))
+
     def _calculate_uniformity_scores(self,
                                      nearest_neighbor_cv: float,
                                      grid_density_cv: float,
                                      morans_i: float,
-                                     centroid_count: int) -> Dict[str, float]:
-        """将不同方向的原始指标转换为统一方向的均匀性得分。"""
+                                     centroid_count: int,
+                                     long_tube_ratio: float = 0.0) -> Dict[str, float]:
+        """将不同方向的原始指标通过 sigmoid 映射转换为统一方向的均匀性得分。
+
+        改进:
+            - 使用 sigmoid 映射替代旧的 100/(1+x)，在常见 CV 范围内区分度更好
+            - 使用不等权加权平均（NN 0.25, Grid 0.35, Moran 0.40），减少 NN/Grid 信息冗余
+            - 增加样本量置信度标注
+            - 长管比例仅保留为诊断信息，不再混入空间均匀性总分
+        """
         if centroid_count < 2:
             return {
                 'nearest_neighbor': 0.0,
                 'grid_density': 0.0,
                 'moran': 0.0,
+                'long_tube_ratio': 0.0,
                 'overall': 0.0,
+                'confidence': self._get_uniformity_confidence(centroid_count),
             }
 
-        nn_score = float(100.0 / (1.0 + max(nearest_neighbor_cv, 0.0)))
-        grid_score = float(100.0 / (1.0 + max(grid_density_cv, 0.0)))
-        moran_score = float(100.0 * np.clip((1.0 - float(morans_i)) / 2.0, 0.0, 1.0))
-        overall_score = float(np.mean([nn_score, grid_score, moran_score]))
+        nn_score = self._sigmoid_score(nearest_neighbor_cv)
+        grid_score = self._sigmoid_score(grid_density_cv)
+        moran_score_val = self._moran_score(morans_i)
+
+        base_score = float(
+            nn_score * UNIFORMITY_WEIGHT_NN +
+            grid_score * UNIFORMITY_WEIGHT_GRID +
+            moran_score_val * UNIFORMITY_WEIGHT_MORAN
+        )
+
         return {
             'nearest_neighbor': nn_score,
             'grid_density': grid_score,
-            'moran': moran_score,
-            'overall': overall_score,
+            'moran': moran_score_val,
+            'long_tube_ratio': float(long_tube_ratio),
+            'overall': float(np.clip(base_score, 0.0, 100.0)),
+            'confidence': self._get_uniformity_confidence(centroid_count),
         }
 
     def _calculate_aggregation_scores(self, uniformity_scores: Dict[str, float]) -> Dict[str, float]:
@@ -2260,7 +2333,7 @@ class CNTAnalyzer:
 
     def analyze_spatial_distribution(self,
                                      roi: Optional[ROIRegion] = None,
-                                     grid_size: int = 10) -> Dict[str, object]:
+                                     grid_size: Optional[int] = None) -> Dict[str, object]:
         """分析 CNT 空间分布均匀性。
 
         说明:
@@ -2278,7 +2351,7 @@ class CNTAnalyzer:
         )
         centroid_array = np.array(centroids, dtype=float)
 
-        grid_size = max(2, int(grid_size))
+        grid_size = self._resolve_spatial_grid_size(len(centroids), grid_size)
         nn_stats = self._calculate_nearest_neighbor_stats(centroid_array, width, height)
         point_density_grid = self._build_centroid_count_grid(centroids, width, height, grid_size)
         coverage_density_grid = self._build_coverage_ratio_grid(local_contours, width, height, grid_size)
@@ -2287,11 +2360,22 @@ class CNTAnalyzer:
         coverage_grid_stats = self._summarize_density_grid(coverage_density_grid)
         shadow_grid_stats = self._summarize_density_grid(shadow_density_grid)
         morans_i = self._calculate_grid_morans_i(point_density_grid)
+
+        # 计算长管比例用于均匀性惩罚
+        long_tube_ratio = 0.0
+        if measurements and len(centroids) >= 2:
+            lengths_um = [float(m.length_um) for m in measurements
+                          if m.length_um is not None and np.isfinite(float(m.length_um))]
+            if lengths_um:
+                long_count = sum(1 for l in lengths_um if l >= UNIFORMITY_LONG_TUBE_THRESHOLD_UM)
+                long_tube_ratio = float(long_count / len(lengths_um))
+
         uniformity_scores = self._calculate_uniformity_scores(
             nn_stats['nearest_neighbor_cv'],
             point_grid_stats['cv'],
             morans_i,
             len(centroids),
+            long_tube_ratio=long_tube_ratio,
         )
         aggregation_scores = self._calculate_aggregation_scores(uniformity_scores)
 
@@ -2325,6 +2409,8 @@ class CNTAnalyzer:
             'shadow_occupancy_ratio': shadow_grid_stats['occupancy_ratio'],
             'shadow_dispersion_index': shadow_grid_stats['dispersion_index'],
             'morans_i': morans_i,
+            'long_tube_ratio': float(long_tube_ratio),
+            'long_tube_threshold_um': float(UNIFORMITY_LONG_TUBE_THRESHOLD_UM),
             'density_grid': point_density_grid.tolist(),
             'point_density_grid': point_density_grid.tolist(),
             'coverage_density_grid': coverage_density_grid.tolist(),
@@ -2546,8 +2632,14 @@ class CNTAnalyzer:
                 if active_scores.size >= 8 else
                 SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL
             )
-            hotspot_threshold = float(np.percentile(active_scores, hotspot_percentile))
-            severe_threshold = float(np.percentile(active_scores, severe_percentile))
+            hotspot_threshold = max(
+                float(np.percentile(active_scores, hotspot_percentile)),
+                float(SPATIAL_HOTSPOT_ABSOLUTE_SCORE_MIN),
+            )
+            severe_threshold = max(
+                float(np.percentile(active_scores, severe_percentile)),
+                float(SPATIAL_HOTSPOT_ABSOLUTE_SCORE_MIN),
+            )
             hotspot_mask = active_mask & (hotspot_grid >= hotspot_threshold) & (hotspot_grid > 0)
             severe_mask = active_mask & (hotspot_grid >= severe_threshold) & (hotspot_grid > 0)
 
@@ -2590,6 +2682,214 @@ class CNTAnalyzer:
             'length_max': float(np.max(lengths)),
             'lengths': lengths,
             'length_distribution': length_dist,
+        }
+
+    @staticmethod
+    def _collect_measurement_metric_values(measurements: List[CNTMeasurement], *attribute_names: str) -> List[float]:
+        """Collect the first finite positive metric value found on each measurement."""
+        values: List[float] = []
+        for measurement in measurements:
+            for attr_name in attribute_names:
+                raw_value = getattr(measurement, attr_name, None)
+                if raw_value is None:
+                    continue
+                value = float(raw_value)
+                if np.isfinite(value) and value > 0:
+                    values.append(value)
+                    break
+        return values
+
+    def _summarize_hotspot_area_metrics(self,
+                                        hotspot_mask: Optional[np.ndarray],
+                                        roi: Optional[ROIRegion] = None) -> Dict[str, float]:
+        """Summarize hotspot area coverage and the largest connected agglomerate area."""
+        _, _, _, width, height = self._get_local_measurements(roi)
+        roi_area_px = float(max(width, 0) * max(height, 0))
+        roi_area_um2 = roi_area_px * float(self.scale_um_per_pixel ** 2) if roi_area_px > 0 else 0.0
+
+        if hotspot_mask is None:
+            return {
+                'area_ratio': 0.0,
+                'largest_area_ratio': 0.0,
+                'largest_area_um2': 0.0,
+                'roi_area_um2': roi_area_um2,
+            }
+
+        mask = np.asarray(hotspot_mask, dtype=np.uint8)
+        if mask.size == 0:
+            return {
+                'area_ratio': 0.0,
+                'largest_area_ratio': 0.0,
+                'largest_area_um2': 0.0,
+                'roi_area_um2': roi_area_um2,
+            }
+
+        mask = (mask > 0).astype(np.uint8)
+        active_cells = int(np.count_nonzero(mask))
+        total_cells = int(mask.size)
+        area_ratio = float(active_cells / total_cells) if total_cells > 0 else 0.0
+
+        largest_component_cells = 0
+        if active_cells > 0:
+            component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            if component_count > 1:
+                largest_component_cells = int(np.max(component_stats[1:, cv2.CC_STAT_AREA]))
+
+        largest_area_ratio = float(largest_component_cells / total_cells) if total_cells > 0 else 0.0
+        largest_area_um2 = roi_area_um2 * largest_area_ratio if roi_area_um2 > 0 else 0.0
+
+        return {
+            'area_ratio': area_ratio,
+            'largest_area_ratio': largest_area_ratio,
+            'largest_area_um2': float(largest_area_um2),
+            'roi_area_um2': float(roi_area_um2),
+        }
+
+    @staticmethod
+    def _score_inverse_metric(value: float, reference: float = 1.0) -> float:
+        """Map a 'smaller is better' metric to a 0-100 score."""
+        safe_reference = max(float(reference), 1e-6)
+        safe_value = max(float(value), 0.0)
+        return float(100.0 / (1.0 + safe_value / safe_reference))
+
+    @staticmethod
+    def _score_direct_metric(value: float, reference: float) -> float:
+        """Map a 'larger is better' metric to a 0-100 score with saturation."""
+        safe_reference = max(float(reference), 1e-6)
+        safe_value = max(float(value), 0.0)
+        return float(np.clip(safe_value / safe_reference, 0.0, 1.0) * 100.0)
+
+    @staticmethod
+    def _resolve_evaluation_weights(custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        """Resolve hybrid-score weights from defaults + optional overrides."""
+        resolved = {
+            'uniformity': float(EVALUATION_WEIGHT_UNIFORMITY),
+            'thick_bundle': float(EVALUATION_WEIGHT_THICK_BUNDLE),
+            'long_cnt': float(EVALUATION_WEIGHT_LONG_CNT),
+            'agglomeration': float(EVALUATION_WEIGHT_AGGLOMERATION),
+        }
+        if isinstance(custom_weights, dict):
+            for key in resolved.keys():
+                if key not in custom_weights:
+                    continue
+                try:
+                    resolved[key] = max(0.0, float(custom_weights[key]))
+                except (TypeError, ValueError):
+                    continue
+
+        total = float(sum(resolved.values()))
+        if total <= 0:
+            return {
+                'uniformity': float(EVALUATION_WEIGHT_UNIFORMITY),
+                'thick_bundle': float(EVALUATION_WEIGHT_THICK_BUNDLE),
+                'long_cnt': float(EVALUATION_WEIGHT_LONG_CNT),
+                'agglomeration': float(EVALUATION_WEIGHT_AGGLOMERATION),
+            }
+        return {key: float(value / total) for key, value in resolved.items()}
+
+    def get_evaluation_framework(self,
+                                 roi: Optional[ROIRegion] = None,
+                                 *,
+                                 stats: Optional[Dict[str, object]] = None,
+                                 dispersed_stats: Optional[Dict[str, object]] = None,
+                                 score_weights: Optional[Dict[str, float]] = None,
+                                 ultra_long_threshold_um: Optional[float] = None,
+                                 ultra_long_ratio_exponent: Optional[float] = None) -> Dict[str, object]:
+        """Build a clear four-part evaluation framework for the current result set."""
+        measurements = roi.measurements if roi else self.measurements
+        stats = stats or self.get_statistics(roi)
+        dispersed_stats = dispersed_stats or self.get_dispersed_statistics(roi)
+        spatial = (stats or {}).get('spatial_distribution') or {}
+
+        finite_length_edges = [float(edge) for edge in LENGTH_DISTRIBUTION_BINS_UM if np.isfinite(edge)]
+        default_threshold = (
+            finite_length_edges[-1]
+            if finite_length_edges else
+            float(EVALUATION_ULTRA_LONG_THRESHOLD_UM)
+        )
+        if ultra_long_threshold_um is None:
+            resolved_ultra_long_threshold_um = float(default_threshold)
+        else:
+            resolved_ultra_long_threshold_um = max(0.1, float(ultra_long_threshold_um))
+        resolved_ratio_exponent = (
+            float(EVALUATION_LONG_CNT_RATIO_EXPONENT)
+            if ultra_long_ratio_exponent is None else
+            float(ultra_long_ratio_exponent)
+        )
+        resolved_ratio_exponent = float(np.clip(resolved_ratio_exponent, 0.1, 3.0))
+
+        widths = self._collect_measurement_metric_values(measurements, 'width_mean_um', 'width_median_um')
+        lengths = [float(m.length_um) for m in measurements if m.length_um is not None and np.isfinite(float(m.length_um))]
+        hotspot_area_metrics = self._summarize_hotspot_area_metrics(dispersed_stats.get('hotspot_mask'), roi=roi)
+
+        apparent_width_mean_um = float(np.mean(widths)) if widths else 0.0
+        width_p90_um = float(np.percentile(widths, 90)) if widths else 0.0
+        skeleton_length_mean_um = float((stats or {}).get('length_mean', 0.0) or 0.0)
+        ultra_long_count = int(sum(1 for length in lengths if length >= resolved_ultra_long_threshold_um))
+        ultra_long_ratio = float(ultra_long_count / len(lengths)) if lengths else 0.0
+        width_mean_score = self._score_inverse_metric(apparent_width_mean_um, reference=1.0)
+        width_p90_score = self._score_inverse_metric(width_p90_um, reference=1.0)
+        thick_bundle_score = float(np.mean([width_mean_score, width_p90_score]))
+        # 使用综合均匀性得分（融合 NN-CV、Grid-CV、Moran's I），而非仅 grid_density_cv
+        uniformity_scores_dict = spatial.get('uniformity_scores') or {}
+        uniformity_score = float(uniformity_scores_dict.get('overall', 0.0) or 0.0)
+        if uniformity_score <= 0.0:
+            # 回退：如果综合得分不可用，使用旧的反比例映射
+            uniformity_score = self._score_inverse_metric(float(spatial.get('grid_density_cv', 0.0) or 0.0), reference=1.0)
+        length_mean_score = self._score_direct_metric(
+            skeleton_length_mean_um,
+            reference=max(resolved_ultra_long_threshold_um * 2.0, 1.0),
+        )
+        # 非线性放大: ratio^exponent 使长管比例差异获得更高分辨率
+        amplified_ratio = float(np.clip(ultra_long_ratio, 0.0, 1.0) ** resolved_ratio_exponent)
+        ultra_long_score = float(amplified_ratio * 100.0)
+        long_cnt_score = float(np.mean([length_mean_score, ultra_long_score]))
+        agglomerated_area_score = float(np.clip((1.0 - hotspot_area_metrics['area_ratio']) * 100.0, 0.0, 100.0))
+        largest_agglomerate_score = float(np.clip((1.0 - hotspot_area_metrics['largest_area_ratio']) * 100.0, 0.0, 100.0))
+        agglomeration_score = float(np.mean([agglomerated_area_score, largest_agglomerate_score]))
+        score_weights = self._resolve_evaluation_weights(score_weights)
+        hybrid_score = float(
+            uniformity_score * score_weights['uniformity'] +
+            thick_bundle_score * score_weights['thick_bundle'] +
+            long_cnt_score * score_weights['long_cnt'] +
+            agglomeration_score * score_weights['agglomeration']
+        )
+
+        return {
+            'uniformity': {
+                'title': 'A. 均匀性主指标',
+                'direction': '越小越均匀',
+                'grid_density_cv': float(spatial.get('grid_density_cv', 0.0) or 0.0),
+                'score': uniformity_score,
+            },
+            'thick_bundle': {
+                'title': 'B. 粗管/束化指标',
+                'direction': '越大说明粗管/束化越明显',
+                'apparent_width_mean_um': apparent_width_mean_um,
+                'width_p90_um': width_p90_um,
+                'score': thick_bundle_score,
+            },
+            'long_cnt': {
+                'title': 'C. 长管指标',
+                'direction': '越大说明长管更多',
+                'skeleton_length_mean_um': skeleton_length_mean_um,
+                'ultra_long_threshold_um': float(resolved_ultra_long_threshold_um),
+                'ultra_long_count': ultra_long_count,
+                'ultra_long_ratio': ultra_long_ratio,
+                'ultra_long_ratio_exponent': float(resolved_ratio_exponent),
+                'score': long_cnt_score,
+            },
+            'agglomeration': {
+                'title': 'D. 团聚指标',
+                'direction': '越大说明团聚越明显',
+                'agglomerated_area_ratio': float(hotspot_area_metrics['area_ratio']),
+                'largest_agglomerate_area_um2': float(hotspot_area_metrics['largest_area_um2']),
+                'largest_agglomerate_area_ratio': float(hotspot_area_metrics['largest_area_ratio']),
+                'roi_area_um2': float(hotspot_area_metrics['roi_area_um2']),
+                'score': agglomeration_score,
+            },
+            'score_weights': score_weights,
+            'hybrid_score': hybrid_score,
         }
 
     def get_dispersed_statistics(self,

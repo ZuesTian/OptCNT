@@ -1,7 +1,12 @@
 """
 GUI样式模块 - 负责定义颜色方案和应用ttk样式
+
+跨平台注意事项:
+- 字体名称通过 get_platform_font() 在运行时检测，而非硬编码
+- 字号使用相对值，配合 Tkinter DPI scaling 自动适应不同缩放比例
 """
 import logging
+import sys
 import tkinter as tk
 from tkinter import ttk
 
@@ -42,6 +47,30 @@ MODERN_COLORS = {
 }
 
 
+def get_platform_font(root: tk.Tk = None) -> str:
+    """获取当前平台最佳 UI 字体名称。
+
+    优先从 root._platform_font（由 main.py 设置）读取，
+    否则根据操作系统返回合理默认值。
+    """
+    if root is not None and hasattr(root, '_platform_font'):
+        return root._platform_font
+    if sys.platform == 'win32':
+        return 'Segoe UI'
+    elif sys.platform == 'darwin':
+        return 'Helvetica Neue'
+    return 'sans-serif'
+
+
+def get_cjk_font(root: tk.Tk = None) -> str:
+    """获取用于中文内容的字体名称（如 Treeview 数据列）。"""
+    if sys.platform == 'win32':
+        return 'Microsoft YaHei'
+    elif sys.platform == 'darwin':
+        return 'PingFang SC'
+    return get_platform_font(root)
+
+
 def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
     """
     应用Modern风格样式到tkinter根窗口
@@ -62,8 +91,11 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
     except tk.TclError:
         logger.debug("clam主题不可用，使用默认主题")
 
-    default_font = ('Segoe UI', 9)
-    heading_font = ('Segoe UI', 10, 'bold')
+    # 使用平台自适应字体
+    ui_font = get_platform_font(root)
+    cjk_font = get_cjk_font(root)
+    default_font = (ui_font, 9)
+    heading_font = (ui_font, 10, 'bold')
 
     style.configure('.',
                     background=c['bg_primary'],
@@ -75,15 +107,15 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
 
     style.configure('TLabel', background=c['bg_primary'], foreground=c['text_primary'], font=default_font)
     style.configure('Card.TLabel', background=c['bg_secondary'], foreground=c['text_primary'], font=default_font)
-    style.configure('Header.TLabel', background=c['bg_secondary'], foreground=c['accent_primary'], font=('Segoe UI', 11, 'bold'))
-    style.configure('Secondary.TLabel', background=c['bg_primary'], foreground=c['text_secondary'], font=('Segoe UI', 9, 'italic'))
+    style.configure('Header.TLabel', background=c['bg_secondary'], foreground=c['accent_primary'], font=(ui_font, 11, 'bold'))
+    style.configure('Secondary.TLabel', background=c['bg_primary'], foreground=c['text_secondary'], font=(ui_font, 9, 'italic'))
 
     style.configure('TButton',
                     background=c['button_bg'],
                     foreground=c['accent_primary'],
                     borderwidth=1,
                     relief='flat',
-                    font=('Segoe UI', 9, 'bold'),
+                    font=(ui_font, 9, 'bold'),
                     padding=5)
 
     style.map('TButton',
@@ -98,7 +130,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground='#FFFFFF',
                     borderwidth=0,
                     relief='flat',
-                    font=('Segoe UI', 9, 'bold'),
+                    font=(ui_font, 9, 'bold'),
                     padding=6)
 
     style.map('Accent.TButton',
@@ -112,7 +144,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground='#FFFFFF',
                     borderwidth=0,
                     relief='flat',
-                    font=('Segoe UI', 9, 'bold'),
+                    font=(ui_font, 9, 'bold'),
                     padding=6)
 
     style.map('Success.TButton',
@@ -124,7 +156,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground='#FFFFFF',
                     borderwidth=0,
                     relief='flat',
-                    font=('Segoe UI', 9, 'bold'),
+                    font=(ui_font, 9, 'bold'),
                     padding=6)
 
     style.map('Warning.TButton',
@@ -136,7 +168,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground='#FFFFFF',
                     borderwidth=0,
                     relief='flat',
-                    font=('Segoe UI', 9, 'bold'),
+                    font=(ui_font, 9, 'bold'),
                     padding=6)
 
     style.map('Danger.TButton',
@@ -166,7 +198,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     background=c['bg_tertiary'],
                     foreground=c['text_secondary'],
                     padding=[15, 8],
-                    font=('Segoe UI', 9),
+                    font=(ui_font, 9),
                     borderwidth=0)
 
     style.map('TNotebook.Tab',
@@ -198,13 +230,13 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground=c['text_primary'],
                     fieldbackground=c['bg_secondary'],
                     borderwidth=0,
-                    font=default_font,
+                    font=(cjk_font, 9),
                     rowheight=28)
 
     style.configure('Treeview.Heading',
                     background=c['bg_tertiary'],
                     foreground=c['text_secondary'],
-                    font=('Segoe UI', 9, 'bold'),
+                    font=(cjk_font, 9, 'bold'),
                     borderwidth=0,
                     relief='flat')
 

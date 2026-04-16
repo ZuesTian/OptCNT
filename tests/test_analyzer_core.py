@@ -106,7 +106,8 @@ def test_get_statistics_uses_shared_length_distribution_bins():
         "<5μm": 1,
         "5-15μm": 2,
         "15-30μm": 2,
-        ">30μm": 1,
+        "30-40μm": 1,
+        ">40μm": 0,
     }
     assert stats["spatial_distribution"] == {"mock": True}
 
@@ -249,6 +250,25 @@ def test_find_graph_diameter_path_prefers_longest_branch_to_branch_path():
     assert analyzer._calculate_path_length(path) == pytest.approx(5.0)
 
 
+def test_calculate_path_length_uses_numba_helper_when_available(monkeypatch):
+    analyzer = CNTAnalyzer()
+    calls = {}
+
+    def fake_fast(path_array):
+        calls["shape"] = path_array.shape
+        calls["dtype"] = path_array.dtype
+        return 12.5
+
+    monkeypatch.setattr(analyzer_core_module, "NUMBA_AVAILABLE", True)
+    monkeypatch.setattr(analyzer_core_module, "_calculate_path_length_fast", fake_fast)
+
+    result = analyzer._calculate_path_length([(0, 0), (3, 4)])
+
+    assert result == pytest.approx(12.5)
+    assert calls["shape"] == (2, 2)
+    assert calls["dtype"] == np.float64
+
+
 def test_detect_cnts_hybrid_skips_candidates_whose_upper_bound_is_below_min_length(monkeypatch):
     analyzer = CNTAnalyzer()
     analyzer.image = np.zeros((16, 16, 3), dtype=np.uint8)
@@ -357,6 +377,78 @@ def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
         assert aggregation_scores[key] == pytest.approx(100.0 - uniformity_scores[key])
 
 
+def test_analyze_spatial_distribution_uses_adaptive_grid_size_by_default(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurements = [_make_measurement(index, 10.0) for index in range(25)]
+    captured = {}
+
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 120, 80),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_extract_spatial_distribution_inputs",
+        lambda measurements, offset_x, offset_y: (
+            [(float(index), float(index)) for index in range(len(measurements))],
+            [np.array([[[0, 0]], [[1, 0]], [[1, 1]]], dtype=np.int32)],
+        ),
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_calculate_nearest_neighbor_stats",
+        lambda centroid_array, width, height: {
+            "nearest_neighbor_mean_px": 4.0,
+            "nearest_neighbor_std_px": 1.0,
+            "nearest_neighbor_cv": 0.25,
+            "nearest_neighbor_expected_mean_px": 4.3,
+            "nearest_neighbor_index": 0.92,
+        },
+    )
+
+    def _capture_grid(*args, **kwargs):
+        grid_size = args[-1]
+        captured["grid_size"] = grid_size
+        return np.ones((grid_size, grid_size), dtype=float)
+
+    monkeypatch.setattr(analyzer, "_build_centroid_count_grid", _capture_grid)
+    monkeypatch.setattr(analyzer, "_build_coverage_ratio_grid", _capture_grid)
+    monkeypatch.setattr(analyzer, "_build_shadow_density_grid", lambda *args, **kwargs: _capture_grid(*args))
+    monkeypatch.setattr(
+        analyzer,
+        "_summarize_density_grid",
+        lambda grid: {"mean": 1.0, "std": 0.2, "cv": 0.2, "entropy": 0.9, "occupancy_ratio": 1.0, "dispersion_index": 0.04},
+    )
+    monkeypatch.setattr(analyzer, "_calculate_grid_morans_i", lambda grid: 0.1)
+
+    result = analyzer.analyze_spatial_distribution()
+
+    assert captured["grid_size"] == 5
+    assert result["grid_size"] == 5
+
+
+def test_calculate_uniformity_scores_keeps_long_tube_ratio_out_of_overall_score():
+    analyzer = CNTAnalyzer()
+
+    scores = analyzer._calculate_uniformity_scores(
+        nearest_neighbor_cv=0.4,
+        grid_density_cv=0.5,
+        morans_i=0.1,
+        centroid_count=30,
+        long_tube_ratio=1.0,
+    )
+
+    expected = (
+        scores["nearest_neighbor"] * analyzer_core_module.UNIFORMITY_WEIGHT_NN +
+        scores["grid_density"] * analyzer_core_module.UNIFORMITY_WEIGHT_GRID +
+        scores["moran"] * analyzer_core_module.UNIFORMITY_WEIGHT_MORAN
+    )
+
+    assert scores["overall"] == pytest.approx(expected)
+    assert scores["long_tube_ratio"] == pytest.approx(1.0)
+
+
 def test_get_dispersed_statistics_filters_hotspots_and_supports_strictness(monkeypatch):
     analyzer = CNTAnalyzer()
     measurements = [
@@ -460,3 +552,105 @@ def test_get_dispersed_statistics_returns_all_dispersed_when_masks_have_no_hotsp
     assert stats["dispersed_count"] == 2
     assert stats["agglomerated_count"] == 0
     assert [m.id for m in stats["dispersed_measurements"]] == [0, 1]
+
+
+def test_get_evaluation_framework_returns_clear_four_part_metrics(monkeypatch):
+    analyzer = CNTAnalyzer()
+    analyzer.scale_um_per_pixel = 1.0
+    measurements = [
+        CNTMeasurement(
+            id=0,
+            length_pixels=10.0,
+            length_um=10.0,
+            contour=np.array([[[0, 0]], [[1, 0]], [[1, 1]]], dtype=np.int32),
+            width_mean_um=0.8,
+            width_median_um=0.7,
+        ),
+        CNTMeasurement(
+            id=1,
+            length_pixels=35.0,
+            length_um=35.0,
+            contour=np.array([[[0, 0]], [[1, 0]], [[1, 1]]], dtype=np.int32),
+            width_mean_um=1.2,
+            width_median_um=1.1,
+        ),
+        CNTMeasurement(
+            id=2,
+            length_pixels=40.0,
+            length_um=40.0,
+            contour=np.array([[[0, 0]], [[1, 0]], [[1, 1]]], dtype=np.int32),
+            width_mean_um=2.0,
+            width_median_um=1.8,
+        ),
+    ]
+    analyzer.measurements = measurements
+
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 100, 50),
+    )
+
+    framework = analyzer.get_evaluation_framework(
+        stats={
+            "count": 3,
+            "length_mean": 28.3333333333,
+            "spatial_distribution": {"grid_density_cv": 0.42},
+        },
+        dispersed_stats={
+            "hotspot_mask": np.array([[1, 1], [0, 1]], dtype=bool),
+        },
+    )
+
+    assert framework["uniformity"]["grid_density_cv"] == pytest.approx(0.42)
+    assert framework["thick_bundle"]["apparent_width_mean_um"] == pytest.approx((0.8 + 1.2 + 2.0) / 3.0)
+    assert framework["thick_bundle"]["width_p90_um"] == pytest.approx(np.percentile([0.8, 1.2, 2.0], 90))
+    assert framework["long_cnt"]["skeleton_length_mean_um"] == pytest.approx(28.3333333333)
+    assert framework["long_cnt"]["ultra_long_threshold_um"] == pytest.approx(40.0)
+    assert framework["long_cnt"]["ultra_long_ratio"] == pytest.approx(1 / 3)
+    assert framework["score_weights"] == pytest.approx({
+        "uniformity": 0.30,
+        "thick_bundle": 0.20,
+        "long_cnt": 0.30,
+        "agglomeration": 0.20,
+    })
+    assert framework["agglomeration"]["agglomerated_area_ratio"] == pytest.approx(0.75)
+    assert framework["agglomeration"]["largest_agglomerate_area_um2"] == pytest.approx(3750.0)
+
+
+def test_get_evaluation_framework_supports_configurable_long_tube_and_weights(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurements = [
+        _make_measurement(0, 10.0),
+        _make_measurement(1, 35.0),
+        _make_measurement(2, 40.0),
+    ]
+    analyzer.measurements = measurements
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 100, 50),
+    )
+
+    framework = analyzer.get_evaluation_framework(
+        stats={"count": 3, "length_mean": 28.3333333333, "spatial_distribution": {"uniformity_scores": {"overall": 80.0}}},
+        dispersed_stats={"hotspot_mask": np.array([[0, 0], [0, 0]], dtype=bool)},
+        ultra_long_threshold_um=30.0,
+        ultra_long_ratio_exponent=0.7,
+        score_weights={
+            "uniformity": 0.2,
+            "thick_bundle": 0.2,
+            "long_cnt": 0.4,
+            "agglomeration": 0.2,
+        },
+    )
+
+    assert framework["long_cnt"]["ultra_long_threshold_um"] == pytest.approx(30.0)
+    assert framework["long_cnt"]["ultra_long_ratio"] == pytest.approx(2 / 3)
+    assert framework["long_cnt"]["ultra_long_ratio_exponent"] == pytest.approx(0.7)
+    assert framework["score_weights"] == pytest.approx({
+        "uniformity": 0.2,
+        "thick_bundle": 0.2,
+        "long_cnt": 0.4,
+        "agglomeration": 0.2,
+    })
