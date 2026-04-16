@@ -2331,8 +2331,12 @@ class CNTAnalyzerGUI:
         if spatial:
             text_widget.insert(tk.END, "\n===== 空间分布均匀性 =====\n", 'header')
             uniformity_scores = spatial.get('uniformity_scores') or {}
+            uniformity_grade = str(uniformity_scores.get('grade', '') or '')
             text_widget.insert(tk.END, "综合均匀性得分: ", 'header')
             text_widget.insert(tk.END, f"{uniformity_scores.get('overall', 0.0):.1f} / 100（越大越均匀）\n", 'value')
+            if uniformity_grade:
+                text_widget.insert(tk.END, "均匀性等级: ", 'header')
+                text_widget.insert(tk.END, f"{uniformity_grade}\n", 'value')
             long_tube_ratio = float(
                 spatial.get('long_tube_ratio', uniformity_scores.get('long_tube_ratio', 0.0)) or 0.0
             )

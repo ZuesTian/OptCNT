@@ -34,8 +34,7 @@ from .utils import (
     SKELETON_WALK_ANGLE_DEG,
     CNT_MERGE_MAX_ANGLE_DIFF_DEG, CNT_MERGE_MAX_ALIGNMENT_DEG,
     LENGTH_DISTRIBUTION_BINS_UM, LENGTH_DISTRIBUTION_LABELS,
-    UNIFORMITY_SIGMOID_STEEPNESS, UNIFORMITY_SIGMOID_MIDPOINT,
-    UNIFORMITY_WEIGHT_NN, UNIFORMITY_WEIGHT_GRID, UNIFORMITY_WEIGHT_MORAN,
+    UNIFORMITY_WEIGHT_CV, UNIFORMITY_WEIGHT_AGGLOM, UNIFORMITY_WEIGHT_RANGE,
     UNIFORMITY_LOW_CONFIDENCE_THRESHOLD, UNIFORMITY_VERY_LOW_CONFIDENCE_THRESHOLD,
     SPATIAL_GRID_MIN_SIZE, SPATIAL_GRID_MAX_SIZE,
     UNIFORMITY_LONG_TUBE_THRESHOLD_UM,
@@ -2228,8 +2227,8 @@ class CNTAnalyzer:
 
     @staticmethod
     def _sigmoid_score(value: float,
-                       midpoint: float = UNIFORMITY_SIGMOID_MIDPOINT,
-                       steepness: float = UNIFORMITY_SIGMOID_STEEPNESS) -> float:
+                       midpoint: float = 0.6,
+                       steepness: float = 4.0) -> float:
         """将 'smaller is better' 的指标通过 sigmoid 映射到 0-100。
 
         当 value == midpoint 时得分 50；value → 0 时趋近 100；value → ∞ 时趋近 0。
@@ -2279,46 +2278,93 @@ class CNTAnalyzer:
         adaptive_grid_size = int(round(np.sqrt(float(centroid_count))))
         return int(np.clip(adaptive_grid_size, SPATIAL_GRID_MIN_SIZE, SPATIAL_GRID_MAX_SIZE))
 
+    @staticmethod
+    def _calculate_density_range_ratio(grid: np.ndarray) -> float:
+        """Calculate the normalized density range term R_v for a density grid."""
+        flat_grid = np.asarray(grid, dtype=float).ravel()
+        if flat_grid.size == 0:
+            return 0.0
+
+        finite_values = flat_grid[np.isfinite(flat_grid)]
+        if finite_values.size == 0:
+            return 0.0
+
+        d_min = float(np.min(finite_values))
+        d_max = float(np.max(finite_values))
+        epsilon = 1e-9
+        return float((d_max - d_min) / (d_max + d_min + epsilon))
+
+    @staticmethod
+    def _get_uniformity_grade(score: float) -> str:
+        """Map a numeric uniformity score to a readable grade label."""
+        value = float(score)
+        if value >= 90.0:
+            return '极均匀'
+        if value >= 80.0:
+            return '均匀'
+        if value >= 70.0:
+            return '较均匀'
+        if value >= 60.0:
+            return '一般'
+        if value >= 50.0:
+            return '较不均匀'
+        return '明显不均匀'
+
     def _calculate_uniformity_scores(self,
                                      nearest_neighbor_cv: float,
-                                     grid_density_cv: float,
+                                     density_cv: float,
                                      morans_i: float,
                                      centroid_count: int,
+                                     agglomeration_area_ratio: float = 0.0,
+                                     density_range_ratio: float = 0.0,
                                      long_tube_ratio: float = 0.0) -> Dict[str, float]:
-        """将不同方向的原始指标通过 sigmoid 映射转换为统一方向的均匀性得分。
+        """Calculate the main uniformity score with a simple weighted formula.
 
-        改进:
-            - 使用 sigmoid 映射替代旧的 100/(1+x)，在常见 CV 范围内区分度更好
-            - 使用不等权加权平均（NN 0.25, Grid 0.35, Moran 0.40），减少 NN/Grid 信息冗余
-            - 增加样本量置信度标注
-            - 长管比例仅保留为诊断信息，不再混入空间均匀性总分
+        overall = 100 * (1 - 0.5 * CV_d - 0.3 * A_c - 0.2 * R_v)
+
+        Legacy NN / grid / Moran component scores are retained as diagnostics so
+        existing UI summaries can keep showing them beside the new main score.
         """
         if centroid_count < 2:
             return {
                 'nearest_neighbor': 0.0,
                 'grid_density': 0.0,
                 'moran': 0.0,
+                'cv_component': 0.0,
+                'agglomeration_component': 0.0,
+                'range_component': 0.0,
                 'long_tube_ratio': 0.0,
                 'overall': 0.0,
+                'grade': self._get_uniformity_grade(0.0),
                 'confidence': self._get_uniformity_confidence(centroid_count),
             }
 
         nn_score = self._sigmoid_score(nearest_neighbor_cv)
-        grid_score = self._sigmoid_score(grid_density_cv)
+        grid_score = self._sigmoid_score(density_cv)
         moran_score_val = self._moran_score(morans_i)
-
-        base_score = float(
-            nn_score * UNIFORMITY_WEIGHT_NN +
-            grid_score * UNIFORMITY_WEIGHT_GRID +
-            moran_score_val * UNIFORMITY_WEIGHT_MORAN
+        density_cv_value = max(float(density_cv), 0.0)
+        agglomeration_area_ratio = float(np.clip(agglomeration_area_ratio, 0.0, 1.0))
+        density_range_ratio = float(np.clip(density_range_ratio, 0.0, 1.0))
+        cv_component = float(np.clip(density_cv_value, 0.0, 2.0) / 2.0)
+        raw_score = 100.0 * (
+            1.0 -
+            UNIFORMITY_WEIGHT_CV * density_cv_value -
+            UNIFORMITY_WEIGHT_AGGLOM * agglomeration_area_ratio -
+            UNIFORMITY_WEIGHT_RANGE * density_range_ratio
         )
+        overall_score = float(np.clip(raw_score, 0.0, 100.0))
+        grade = self._get_uniformity_grade(overall_score)
 
         return {
             'nearest_neighbor': nn_score,
             'grid_density': grid_score,
             'moran': moran_score_val,
+            'cv_component': cv_component,
+            'agglomeration_component': agglomeration_area_ratio,
+            'range_component': density_range_ratio,
             'long_tube_ratio': float(long_tube_ratio),
-            'overall': float(np.clip(base_score, 0.0, 100.0)),
+            'overall': overall_score,
+            'grade': grade,
             'confidence': self._get_uniformity_confidence(centroid_count),
         }
 
@@ -2329,6 +2375,9 @@ class CNTAnalyzer:
         for key in keys:
             score = float(uniformity_scores.get(key, 0.0))
             aggregation_scores[key] = float(np.clip(100.0 - score, 0.0, 100.0))
+        aggregation_scores['cv_component'] = float(np.clip(float(uniformity_scores.get('cv_component', 0.0)) * 100.0, 0.0, 100.0))
+        aggregation_scores['agglomeration_component'] = float(np.clip(float(uniformity_scores.get('agglomeration_component', 0.0)) * 100.0, 0.0, 100.0))
+        aggregation_scores['range_component'] = float(np.clip(float(uniformity_scores.get('range_component', 0.0)) * 100.0, 0.0, 100.0))
         return aggregation_scores
 
     def analyze_spatial_distribution(self,
@@ -2337,9 +2386,9 @@ class CNTAnalyzer:
         """分析 CNT 空间分布均匀性。
 
         说明:
-            - 主要网格指标默认基于“每格 CNT 中心点数量”，更适合跨参数、跨图比较。
-            - 像素覆盖率网格作为辅助参考，用于观察局部团聚和大块覆盖。
-            - 额外返回统一方向的均匀性得分，便于在对比图中稳定展示。
+            - 中心点网格与 Moran's I 保留作为诊断参考。
+            - 主均匀性得分基于像素覆盖率 CV、热点面积占比与密度极差项。
+            - 额外返回统一方向的主分与等级标签，便于在对比图中稳定展示。
         """
         measurements, offset_x, offset_y, width, height = self._get_local_measurements(roi)
 
@@ -2361,7 +2410,7 @@ class CNTAnalyzer:
         shadow_grid_stats = self._summarize_density_grid(shadow_density_grid)
         morans_i = self._calculate_grid_morans_i(point_density_grid)
 
-        # 计算长管比例用于均匀性惩罚
+        # 计算长管比例作为诊断信息
         long_tube_ratio = 0.0
         if measurements and len(centroids) >= 2:
             lengths_um = [float(m.length_um) for m in measurements
@@ -2370,16 +2419,7 @@ class CNTAnalyzer:
                 long_count = sum(1 for l in lengths_um if l >= UNIFORMITY_LONG_TUBE_THRESHOLD_UM)
                 long_tube_ratio = float(long_count / len(lengths_um))
 
-        uniformity_scores = self._calculate_uniformity_scores(
-            nn_stats['nearest_neighbor_cv'],
-            point_grid_stats['cv'],
-            morans_i,
-            len(centroids),
-            long_tube_ratio=long_tube_ratio,
-        )
-        aggregation_scores = self._calculate_aggregation_scores(uniformity_scores)
-
-        return {
+        spatial_distribution = {
             'grid_size': int(grid_size),
             'centroid_count': int(len(centroids)),
             'centroids': [tuple(point) for point in centroids],
@@ -2415,9 +2455,29 @@ class CNTAnalyzer:
             'point_density_grid': point_density_grid.tolist(),
             'coverage_density_grid': coverage_density_grid.tolist(),
             'shadow_density_grid': shadow_density_grid.tolist(),
+        }
+        hotspot_masks = self._build_spatial_hotspot_masks(spatial_distribution)
+        hotspot_area_metrics = self._summarize_hotspot_area_metrics(hotspot_masks.get('hotspot_mask'), roi=roi)
+        density_range_ratio = self._calculate_density_range_ratio(coverage_density_grid)
+        uniformity_scores = self._calculate_uniformity_scores(
+            nn_stats['nearest_neighbor_cv'],
+            coverage_grid_stats['cv'],
+            morans_i,
+            len(centroids),
+            agglomeration_area_ratio=hotspot_area_metrics['area_ratio'],
+            density_range_ratio=density_range_ratio,
+            long_tube_ratio=long_tube_ratio,
+        )
+        aggregation_scores = self._calculate_aggregation_scores(uniformity_scores)
+        spatial_distribution.update({
             'uniformity_scores': uniformity_scores,
             'aggregation_scores': aggregation_scores,
-        }
+            'hotspot_area_ratio': float(hotspot_area_metrics['area_ratio']),
+            'largest_hotspot_area_ratio': float(hotspot_area_metrics['largest_area_ratio']),
+            'largest_hotspot_area_um2': float(hotspot_area_metrics['largest_area_um2']),
+            'density_range_ratio': float(density_range_ratio),
+        })
+        return spatial_distribution
 
     def _is_cnt_in_hotspot(self, measurement: CNTMeasurement, hotspot_mask: np.ndarray, 
                            offset_x: int, offset_y: int, width: int, height: int, 
@@ -2830,7 +2890,7 @@ class CNTAnalyzer:
         width_mean_score = self._score_inverse_metric(apparent_width_mean_um, reference=1.0)
         width_p90_score = self._score_inverse_metric(width_p90_um, reference=1.0)
         thick_bundle_score = float(np.mean([width_mean_score, width_p90_score]))
-        # 使用综合均匀性得分（融合 NN-CV、Grid-CV、Moran's I），而非仅 grid_density_cv
+        # 使用综合均匀性主分；若缺失则回退到旧的 grid-density 近似。
         uniformity_scores_dict = spatial.get('uniformity_scores') or {}
         uniformity_score = float(uniformity_scores_dict.get('overall', 0.0) or 0.0)
         if uniformity_score <= 0.0:
@@ -2858,8 +2918,12 @@ class CNTAnalyzer:
         return {
             'uniformity': {
                 'title': 'A. 均匀性主指标',
-                'direction': '越小越均匀',
+                'direction': '越大越均匀',
                 'grid_density_cv': float(spatial.get('grid_density_cv', 0.0) or 0.0),
+                'coverage_density_cv': float(spatial.get('coverage_density_cv', 0.0) or 0.0),
+                'hotspot_area_ratio': float(spatial.get('hotspot_area_ratio', 0.0) or 0.0),
+                'density_range_ratio': float(spatial.get('density_range_ratio', 0.0) or 0.0),
+                'grade': str(uniformity_scores_dict.get('grade', self._get_uniformity_grade(uniformity_score))),
                 'score': uniformity_score,
             },
             'thick_bundle': {

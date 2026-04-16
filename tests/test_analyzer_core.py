@@ -373,6 +373,10 @@ def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
     assert np.allclose(np.array(result["shadow_density_grid"], dtype=float), np.full((4, 4), 0.4))
     uniformity_scores = result["uniformity_scores"]
     aggregation_scores = result["aggregation_scores"]
+    assert uniformity_scores["overall"] == pytest.approx(80.0)
+    assert uniformity_scores["grade"] == "均匀"
+    assert result["hotspot_area_ratio"] == pytest.approx(0.0)
+    assert result["density_range_ratio"] == pytest.approx(0.0)
     for key in ("nearest_neighbor", "grid_density", "moran", "overall"):
         assert aggregation_scores[key] == pytest.approx(100.0 - uniformity_scores[key])
 
@@ -433,20 +437,24 @@ def test_calculate_uniformity_scores_keeps_long_tube_ratio_out_of_overall_score(
 
     scores = analyzer._calculate_uniformity_scores(
         nearest_neighbor_cv=0.4,
-        grid_density_cv=0.5,
+        density_cv=0.5,
         morans_i=0.1,
         centroid_count=30,
+        agglomeration_area_ratio=0.2,
+        density_range_ratio=0.3,
         long_tube_ratio=1.0,
     )
 
-    expected = (
-        scores["nearest_neighbor"] * analyzer_core_module.UNIFORMITY_WEIGHT_NN +
-        scores["grid_density"] * analyzer_core_module.UNIFORMITY_WEIGHT_GRID +
-        scores["moran"] * analyzer_core_module.UNIFORMITY_WEIGHT_MORAN
+    expected = 100.0 * (
+        1.0 -
+        analyzer_core_module.UNIFORMITY_WEIGHT_CV * 0.5 -
+        analyzer_core_module.UNIFORMITY_WEIGHT_AGGLOM * 0.2 -
+        analyzer_core_module.UNIFORMITY_WEIGHT_RANGE * 0.3
     )
 
     assert scores["overall"] == pytest.approx(expected)
     assert scores["long_tube_ratio"] == pytest.approx(1.0)
+    assert scores["grade"] == "一般"
 
 
 def test_get_dispersed_statistics_filters_hotspots_and_supports_strictness(monkeypatch):
