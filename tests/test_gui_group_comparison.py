@@ -34,6 +34,40 @@ class _DummyWidget:
         return self._width
 
 
+class _DummyChartTkWidget:
+    def __init__(self):
+        self.destroy_calls = 0
+        self.pack_calls = []
+
+    def destroy(self):
+        self.destroy_calls += 1
+
+    def pack(self, **kwargs):
+        self.pack_calls.append(kwargs)
+
+
+class _DummyChartCanvas:
+    def __init__(self, figure, master=None):
+        self.figure = figure
+        self.master = master
+        self.widget = _DummyChartTkWidget()
+        self.draw_calls = 0
+
+    def draw(self):
+        self.draw_calls += 1
+
+    def get_tk_widget(self):
+        return self.widget
+
+
+class _DummyChartFrame:
+    def __init__(self):
+        self.children = []
+
+    def winfo_children(self):
+        return list(self.children)
+
+
 class _DummyNotebook:
     def __init__(self, selected="image_tab"):
         self.selected = selected
@@ -118,6 +152,38 @@ class _DummyRoot:
 
     def after_cancel(self, token):
         self.after_cancel_calls.append(token)
+
+
+class _DummyPanedWindow:
+    def __init__(self, width: int, panes=None):
+        self._width = width
+        self._panes = panes or ["left", "center", "right"]
+        self.paneconfigure_calls = []
+        self.sash_place_calls = []
+
+    def winfo_exists(self):
+        return True
+
+    def winfo_width(self):
+        return self._width
+
+    def panes(self):
+        return list(self._panes)
+
+    def paneconfigure(self, pane, **kwargs):
+        self.paneconfigure_calls.append((pane, kwargs))
+
+    def sash_place(self, index, x, y):
+        self.sash_place_calls.append((index, x, y))
+
+
+class _DummyLayoutRoot(_DummyRoot):
+    def __init__(self, width: int):
+        super().__init__()
+        self._width = width
+
+    def winfo_width(self):
+        return self._width
 
 
 class _DummyControlPanelState:
@@ -255,7 +321,12 @@ def _make_result(name: str,
                  uniformity_moran: float,
                  nn_cv: float,
                  grid_cv: float,
-                 morans_i: float) -> dict:
+                 morans_i: float,
+                 *,
+                 long_cnt_score: float | None = None,
+                 long_thick_count: float | None = None,
+                 long_thick_ratio: float | None = None,
+                 long_thick_score: float | None = None) -> dict:
     aggregation_scores = {
         "nearest_neighbor": 100.0 - uniformity_nn,
         "grid_density": 100.0 - uniformity_grid,
@@ -264,10 +335,31 @@ def _make_result(name: str,
     }
     dispersed_count = max(0.0, round(count * 0.7))
     agglomerated_count = max(0.0, count - dispersed_count)
+    resolved_long_thick_count = max(0.0, float(long_thick_count if long_thick_count is not None else round(count * 0.18)))
+    resolved_long_thick_ratio = float(
+        long_thick_ratio
+        if long_thick_ratio is not None else
+        (resolved_long_thick_count / count if count else 0.0)
+    )
+    resolved_long_thick_score = float(
+        long_thick_score
+        if long_thick_score is not None else
+        min(100.0, resolved_long_thick_ratio * 120.0)
+    )
+    resolved_long_cnt_score = float(long_cnt_score if long_cnt_score is not None else min(100.0, 35.0 + count))
     framework = {
         "uniformity": {"score": float(uniformity_grid)},
         "thick_bundle": {"score": float(max(20.0, 88.0 - count * 0.6))},
-        "long_cnt": {"score": float(min(100.0, 35.0 + count))},
+        "long_cnt": {
+            "score": resolved_long_cnt_score,
+            "skeleton_length_mean_um": 12.5,
+            "ultra_long_threshold_um": 40.0,
+            "ultra_long_ratio": min(1.0, count / 100.0),
+            "long_thick_width_threshold_um": 1.0,
+            "long_thick_count": resolved_long_thick_count,
+            "long_thick_ratio": resolved_long_thick_ratio,
+            "long_thick_score": resolved_long_thick_score,
+        },
         "agglomeration": {"score": float(uniformity_overall)},
     }
     framework["hybrid_score"] = (
@@ -345,7 +437,16 @@ def _make_batch_analysis_result(image_path: str, count: float) -> dict:
         "evaluation_framework": {
             "uniformity": {"score": 60.0},
             "thick_bundle": {"score": 70.0},
-            "long_cnt": {"score": 65.0},
+            "long_cnt": {
+                "score": 65.0,
+                "skeleton_length_mean_um": 18.0,
+                "ultra_long_threshold_um": 40.0,
+                "ultra_long_ratio": 0.25,
+                "long_thick_width_threshold_um": 1.0,
+                "long_thick_count": 2.0,
+                "long_thick_ratio": 2.0 / count if count else 0.0,
+                "long_thick_score": 24.0,
+            },
             "agglomeration": {"score": 62.0},
             "hybrid_score": 63.9,
         },
@@ -370,12 +471,44 @@ def test_summarize_group_results_includes_aggregation_statistics():
     assert summary["file_details"][0]["aggregation_score"] == pytest.approx(45.0)
     assert summary["file_details"][0]["shadow_aggregation_score"] == pytest.approx(45.0)
     assert summary["file_details"][0]["dispersed_count"] > 0
+    assert summary["file_details"][0]["long_cnt_score"] > 0
+    assert summary["file_details"][0]["long_thick_count"] > 0
+    assert summary["file_details"][0]["long_thick_ratio"] > 0
     assert summary["dispersed_count_stats"]["mean"] > 0
     assert summary["agglomerated_count_stats"]["mean"] >= 0
     assert summary["dispersed_ratio_stats"]["mean"] > 0
+    assert summary["long_thick_count_stats"]["mean"] > 0
+    assert summary["long_thick_ratio_stats"]["mean"] > 0
     assert summary["spatial_stats"]["aggregation_score"]["mean"] == pytest.approx(42.5)
     assert summary["spatial_stats"]["shadow_aggregation_score"]["mean"] == pytest.approx(42.5)
     assert summary["spatial_stats"]["aggregation_moran_score"]["max"] == pytest.approx(45.0)
+
+
+def test_compute_group_comparison_tests_include_long_thick_metrics():
+    gui = _make_gui_stub()
+    base_group = gui._summarize_group_results(
+        "base组",
+        [
+            _make_result("base_1", 30.0, 55.0, 54.0, 56.0, 55.0, 0.46, 0.44, 0.22, long_thick_count=12, long_thick_ratio=0.40),
+            _make_result("base_2", 31.0, 56.0, 55.0, 57.0, 56.0, 0.45, 0.43, 0.21, long_thick_count=11, long_thick_ratio=0.35),
+            _make_result("base_3", 32.0, 57.0, 56.0, 58.0, 57.0, 0.44, 0.42, 0.20, long_thick_count=13, long_thick_ratio=0.39),
+        ],
+    )
+    exp_group = gui._summarize_group_results(
+        "实验组",
+        [
+            _make_result("exp_1", 30.0, 54.0, 53.0, 55.0, 54.0, 0.47, 0.45, 0.24, long_thick_count=2, long_thick_ratio=0.07),
+            _make_result("exp_2", 31.0, 55.0, 54.0, 56.0, 55.0, 0.46, 0.44, 0.23, long_thick_count=3, long_thick_ratio=0.10),
+            _make_result("exp_3", 32.0, 56.0, 55.0, 57.0, 56.0, 0.45, 0.43, 0.22, long_thick_count=1, long_thick_ratio=0.03),
+        ],
+    )
+
+    tests = gui._compute_group_comparison_tests(base_group, exp_group)
+
+    assert "long_thick_count" in tests
+    assert "long_thick_ratio" in tests
+    assert tests["long_thick_count"]["t_pvalue"] is not None
+    assert tests["long_thick_ratio"]["mw_pvalue"] is not None
 
 
 def test_get_preprocess_signature_changes_when_scale_exclusion_rect_changes():
@@ -730,10 +863,14 @@ def test_format_group_comparison_summary_uses_strong_clustering_conclusion():
     assert "分散CNT长度统计" in summary
     assert "空间分布均匀性" in summary
     assert "base: 均值" in summary
+    assert "长粗管数量" in summary
+    assert "长粗管占比" in summary
+    assert "混合评分分项" in summary
     assert "核心指标" in summary
     assert "结论: 实验组更优" in summary
     assert "阴影团聚(0-100，越低越好)" in summary
     assert "均匀度(0-100，越高越好)" in summary
+    assert "C.长管(分项分数，已包含长粗管占比)" in summary
     assert "base组逐图明细" in summary
     assert "总CNT=" in summary
     assert "Mann-Whitney" not in summary
@@ -989,11 +1126,25 @@ def test_calculate_pane_widths_prefers_center_column():
 
     left_w, center_w, right_w = gui._calculate_pane_widths(2156)
 
-    assert left_w == 431
-    assert center_w == 1294
-    assert right_w == 431
+    assert left_w == 367
+    assert center_w == 1315
+    assert right_w == 474
     assert center_w > left_w
     assert center_w > right_w
+
+
+def test_calculate_pane_widths_keeps_right_pane_near_target_when_window_is_wide():
+    gui = _make_gui_stub()
+
+    initial_widths = gui._calculate_pane_widths(1496)
+    left_w, center_w, right_w = gui._calculate_pane_widths(2800)
+
+    assert left_w == 476
+    assert right_w == 616
+    assert center_w == 1708
+    assert (left_w / 2800) == pytest.approx(initial_widths[0] / 1496, abs=0.01)
+    assert (right_w / 2800) == pytest.approx(initial_widths[2] / 1496, abs=0.01)
+    assert (center_w / 2800) == pytest.approx(initial_widths[1] / 1496, abs=0.01)
 
 
 def test_calculate_pane_widths_gives_comparison_tab_more_center_space():
@@ -1007,6 +1158,70 @@ def test_calculate_pane_widths_gives_comparison_tab_more_center_space():
     assert comparison_widths[2] < image_widths[2]
 
 
+def test_calculate_pane_widths_keeps_same_image_ratio_across_window_sizes():
+    gui = _make_gui_stub()
+
+    compact_widths = gui._calculate_pane_widths(1496, 'image')
+    wide_widths = gui._calculate_pane_widths(2156, 'image')
+
+    for compact, wide in zip(compact_widths, wide_widths):
+        assert (wide / 2156) == pytest.approx(compact / 1496, abs=0.01)
+
+
+def test_optimize_window_distribution_waits_for_second_stable_pass():
+    gui = _make_gui_stub()
+    gui.root = _DummyLayoutRoot(width=1200)
+    gui.main_paned = _DummyPanedWindow(width=1176)
+    gui._layout_job = None
+    gui._layout_retry_count = 0
+    gui._layout_stable_snapshot = None
+    scheduled = []
+    gui._schedule_window_distribution = lambda delay_ms=120: scheduled.append(delay_ms)
+    gui._schedule_comparison_layout_refresh = lambda delay_ms=120: None
+    gui._get_pane_layout_profile = lambda tab_key=None: {
+        'left_floor': 240,
+        'left_target': 300,
+        'right_floor': 320,
+        'right_target': 380,
+        'center_min': 620,
+    }
+    gui._calculate_pane_widths = lambda total_w, tab_key=None: (300, total_w - 680, 380)
+
+    gui._optimize_window_distribution()
+
+    assert gui._layout_stable_snapshot == (1200, 1176)
+    assert scheduled == [90]
+    assert gui.main_paned.sash_place_calls == []
+
+
+def test_optimize_window_distribution_places_sashes_after_stable_pass():
+    gui = _make_gui_stub()
+    gui.root = _DummyLayoutRoot(width=1200)
+    gui.main_paned = _DummyPanedWindow(width=1176)
+    gui._layout_job = None
+    gui._layout_retry_count = 1
+    gui._layout_stable_snapshot = (1200, 1176)
+    refreshes = []
+    gui._schedule_window_distribution = lambda delay_ms=120: None
+    gui._schedule_comparison_layout_refresh = lambda delay_ms=120: refreshes.append(delay_ms)
+    gui._get_pane_layout_profile = lambda tab_key=None: {
+        'left_floor': 240,
+        'left_target': 300,
+        'right_floor': 320,
+        'right_target': 380,
+        'center_min': 620,
+    }
+    gui._calculate_pane_widths = lambda total_w, tab_key=None: (300, total_w - 680, 380)
+
+    gui._optimize_window_distribution()
+
+    assert gui._layout_retry_count == 0
+    assert len(gui.main_paned.paneconfigure_calls) == 3
+    assert gui.main_paned.sash_place_calls == [(0, 300, 0), (1, 796, 0)]
+    assert refreshes == [120]
+
+
+
 def test_build_comparison_layout_uses_stable_presets():
     gui = _make_gui_stub()
 
@@ -1017,6 +1232,42 @@ def test_build_comparison_layout_uses_stable_presets():
     assert pair_stacked['height_ratios'] == [0.75, 1.6, 1.6]
     assert group_side_by_side['figsize'] == (14.5, 11.8)
     assert group_side_by_side['height_ratios'] == [0.90, 0.80, 1.5]
+
+
+def test_render_comparison_figure_keeps_cached_chart_for_layout_refresh(monkeypatch):
+    gui = _make_gui_stub()
+    gui.comparison_panel = _DummyComparisonPanel()
+    chart_frame = _DummyChartFrame()
+    stale_widget = _DummyChartTkWidget()
+    chart_frame.children.append(stale_widget)
+    gui.comparison_panel.frames['comparison'] = chart_frame
+    gui.MODERN_COLORS = {'bg_secondary': '#111827'}
+    gui._charts = {
+        'comparison': {'fig': Figure(), 'ax': None, 'canvas': _DummyChartCanvas(Figure()), 'colorbar': None, 'draw_count': 2},
+    }
+
+    selected_tabs = []
+    scheduled = []
+    gui._select_center_tab = lambda key: selected_tabs.append(key)
+    gui._fit_comparison_figure_to_frame = lambda figure, frame, allow_expand=True: None
+    gui._estimate_comparison_summary_height = lambda text: 180
+    gui._schedule_comparison_layout_refresh = lambda delay_ms=60: scheduled.append(delay_ms)
+
+    figure = Figure(figsize=(8, 6))
+    monkeypatch.setattr("src.gui.chart_manager.FigureCanvasTkAgg", _DummyChartCanvas)
+
+    gui._render_comparison_figure('summary', figure)
+
+    chart = gui._charts['comparison']
+    assert selected_tabs == ['comparison']
+    assert chart['fig'] is figure
+    assert chart['canvas'].figure is figure
+    assert chart['draw_count'] == 1
+    assert chart['colorbar'] is None
+    assert stale_widget.destroy_calls == 1
+    assert gui.comparison_panel.section_heights['comparison_summary'] == 180
+    assert gui.comparison_panel.text_content['comparison_summary'] == 'summary'
+    assert scheduled == [60, 180]
 
 
 def test_show_comparison_window_renders_only_dispersion_charts():
@@ -1033,8 +1284,8 @@ def test_show_comparison_window_renders_only_dispersion_charts():
     gui._show_comparison_window(left_result, right_result, "图像A", "图像B")
 
     titles = [ax.get_title() for ax in captured["figure"].axes]
-    assert titles[:3] == ["分散CNT数量对比", "分散比例对比", "混合评分对比"]
-    assert len(captured["figure"].axes) == 5
+    assert titles[:4] == ["分散CNT数量对比", "分散比例对比", "长粗管占比对比", "混合评分对比"]
+    assert len(captured["figure"].axes) == 6
 
 
 def test_show_group_comparison_window_reuses_dispersion_dashboard():
@@ -1069,8 +1320,8 @@ def test_show_group_comparison_window_reuses_dispersion_dashboard():
     gui._show_group_comparison_window(base_group, exp_group)
 
     titles = [ax.get_title() for ax in captured["figure"].axes]
-    assert titles[:3] == ["分散CNT数量对比", "分散比例对比", "混合评分对比"]
-    assert len(captured["figure"].axes) == 5
+    assert titles[:4] == ["分散CNT数量对比", "分散比例对比", "长粗管占比对比", "混合评分对比"]
+    assert len(captured["figure"].axes) == 6
 
 
 def test_plot_dispersion_bar_chart_ylim_includes_error_bars_and_pvalue_annotation():
@@ -1477,7 +1728,14 @@ def test_update_results_appends_evaluation_framework_when_available():
         get_evaluation_framework=lambda roi=None, stats=None, dispersed_stats=None: {
             "uniformity": {"grid_density_cv": 0.31},
             "thick_bundle": {"apparent_width_mean_um": 0.72, "width_p90_um": 0.95},
-            "long_cnt": {"skeleton_length_mean_um": 22.5, "ultra_long_threshold_um": 30.0, "ultra_long_ratio": 0.5},
+            "long_cnt": {
+                "skeleton_length_mean_um": 22.5,
+                "ultra_long_threshold_um": 30.0,
+                "ultra_long_ratio": 0.5,
+                "long_thick_width_threshold_um": 1.0,
+                "long_thick_count": 1,
+                "long_thick_ratio": 0.5,
+            },
             "agglomeration": {"agglomerated_area_ratio": 0.18, "largest_agglomerate_area_um2": 14.2},
         },
     )
@@ -1488,7 +1746,31 @@ def test_update_results_appends_evaluation_framework_when_available():
     assert "评判框架" in text
     assert "A. 均匀性主指标" in text
     assert "P90 宽度" in text
+    assert "长粗管数量" in text
+    assert "长粗管占比" in text
     assert "最大团聚体面积" in text
+
+
+def test_build_evaluation_framework_report_text_includes_long_thick_fields():
+    gui = _make_gui_stub()
+
+    report_text = gui._build_evaluation_framework_report_text({
+        "uniformity": {"grid_density_cv": 0.31},
+        "thick_bundle": {"apparent_width_mean_um": 0.72, "width_p90_um": 0.95},
+        "long_cnt": {
+            "skeleton_length_mean_um": 22.5,
+            "ultra_long_threshold_um": 40.0,
+            "ultra_long_ratio": 0.5,
+            "long_thick_width_threshold_um": 1.0,
+            "long_thick_count": 2,
+            "long_thick_ratio": 0.25,
+        },
+        "agglomeration": {"agglomerated_area_ratio": 0.18, "largest_agglomerate_area_um2": 14.2},
+    })
+
+    assert "长粗管阈值" in report_text
+    assert "长粗管数量" in report_text
+    assert "长粗管占比" in report_text
 
 
 def test_analyze_image_files_reuses_cache_and_dispatches_only_uncached_tasks():

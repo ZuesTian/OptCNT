@@ -34,13 +34,16 @@ from .utils import (
     SKELETON_WALK_ANGLE_DEG,
     CNT_MERGE_MAX_ANGLE_DIFF_DEG, CNT_MERGE_MAX_ALIGNMENT_DEG,
     LENGTH_DISTRIBUTION_BINS_UM, LENGTH_DISTRIBUTION_LABELS,
-    UNIFORMITY_WEIGHT_CV, UNIFORMITY_WEIGHT_AGGLOM, UNIFORMITY_WEIGHT_RANGE,
+    UNIFORMITY_WEIGHT_CV, UNIFORMITY_WEIGHT_AGGLOM,
+    UNIFORMITY_WEIGHT_ENTROPY, UNIFORMITY_WEIGHT_MORAN,
     UNIFORMITY_LOW_CONFIDENCE_THRESHOLD, UNIFORMITY_VERY_LOW_CONFIDENCE_THRESHOLD,
+    UNIFORMITY_SMALL_SAMPLE_FLOOR,
     SPATIAL_GRID_MIN_SIZE, SPATIAL_GRID_MAX_SIZE,
     UNIFORMITY_LONG_TUBE_THRESHOLD_UM,
     EVALUATION_WEIGHT_UNIFORMITY, EVALUATION_WEIGHT_THICK_BUNDLE,
     EVALUATION_WEIGHT_LONG_CNT, EVALUATION_WEIGHT_AGGLOMERATION,
-    EVALUATION_ULTRA_LONG_THRESHOLD_UM, EVALUATION_LONG_CNT_RATIO_EXPONENT,
+    EVALUATION_ULTRA_LONG_THRESHOLD_UM, EVALUATION_LONG_THICK_WIDTH_THRESHOLD_UM,
+    EVALUATION_LONG_CNT_RATIO_EXPONENT,
     SPATIAL_HOTSPOT_POINT_PERCENTILE, SPATIAL_HOTSPOT_COVERAGE_PERCENTILE,
     SPATIAL_HOTSPOT_SHADOW_PERCENTILE, SPATIAL_HOTSPOT_POINT_WEIGHT,
     SPATIAL_HOTSPOT_COVERAGE_WEIGHT, SPATIAL_HOTSPOT_SHADOW_WEIGHT,
@@ -2086,12 +2089,13 @@ class CNTAnalyzer:
         mask = np.zeros((height, width), dtype=np.uint8)
         cv2.drawContours(mask, local_contours, -1, 255, -1)
 
+        # Use linspace for equal-size cell boundaries
+        row_edges = np.linspace(0, height, grid_size + 1).astype(int)
+        col_edges = np.linspace(0, width, grid_size + 1).astype(int)
         for row in range(grid_size):
-            y1 = int(row * height / grid_size)
-            y2 = int((row + 1) * height / grid_size)
+            y1, y2 = row_edges[row], row_edges[row + 1]
             for col in range(grid_size):
-                x1 = int(col * width / grid_size)
-                x2 = int((col + 1) * width / grid_size)
+                x1, x2 = col_edges[col], col_edges[col + 1]
                 cell = mask[y1:y2, x1:x2]
                 grid[row, col] = float(np.count_nonzero(cell) / max(1, cell.size))
         return grid
@@ -2145,12 +2149,12 @@ class CNTAnalyzer:
         shadow_response = np.clip((darkness - low) / (high - low), 0.0, 1.0)
 
         local_height, local_width = shadow_response.shape[:2]
+        row_edges = np.linspace(0, local_height, grid_size + 1).astype(int)
+        col_edges = np.linspace(0, local_width, grid_size + 1).astype(int)
         for row in range(grid_size):
-            cell_y1 = int(row * local_height / grid_size)
-            cell_y2 = int((row + 1) * local_height / grid_size)
+            cell_y1, cell_y2 = row_edges[row], row_edges[row + 1]
             for col in range(grid_size):
-                cell_x1 = int(col * local_width / grid_size)
-                cell_x2 = int((col + 1) * local_width / grid_size)
+                cell_x1, cell_x2 = col_edges[col], col_edges[col + 1]
                 cell = shadow_response[cell_y1:cell_y2, cell_x1:cell_x2]
                 if cell.size == 0:
                     continue
@@ -2317,10 +2321,21 @@ class CNTAnalyzer:
                                      centroid_count: int,
                                      agglomeration_area_ratio: float = 0.0,
                                      density_range_ratio: float = 0.0,
-                                     long_tube_ratio: float = 0.0) -> Dict[str, float]:
-        """Calculate the main uniformity score with a simple weighted formula.
+                                     long_tube_ratio: float = 0.0,
+                                     coverage_entropy: float = 1.0) -> Dict[str, float]:
+        """Calculate the main uniformity score with an improved weighted formula.
 
-        overall = 100 * (1 - 0.5 * CV_d - 0.3 * A_c - 0.2 * R_v)
+        New formula (v2):
+        overall = 100 * (1 - w_cv * CV_d - w_agglom * A_c - w_entropy * (1-H) - w_moran * M_penalty)
+
+        Changes from v1:
+        - R_v (density range ratio) replaced by (1 - normalized entropy) to reduce
+          redundancy with CV_d.  Both CV and range are dispersion measures of the
+          same grid; entropy captures a complementary aspect (occupancy evenness).
+        - Moran's I now contributes directly via a sigmoid penalty term, capturing
+          spatial autocorrelation that CV alone cannot detect.
+        - Small-sample attenuation: when centroid_count < UNIFORMITY_SMALL_SAMPLE_FLOOR,
+          the score is linearly dampened toward 50 to avoid extreme scores on sparse data.
 
         Legacy NN / grid / Moran component scores are retained as diagnostics so
         existing UI summaries can keep showing them beside the new main score.
@@ -2332,7 +2347,9 @@ class CNTAnalyzer:
                 'moran': 0.0,
                 'cv_component': 0.0,
                 'agglomeration_component': 0.0,
-                'range_component': 0.0,
+                'entropy_component': 0.0,
+                'moran_component': 0.0,
+                'range_component': density_range_ratio,
                 'long_tube_ratio': 0.0,
                 'overall': 0.0,
                 'grade': self._get_uniformity_grade(0.0),
@@ -2342,17 +2359,37 @@ class CNTAnalyzer:
         nn_score = self._sigmoid_score(nearest_neighbor_cv)
         grid_score = self._sigmoid_score(density_cv)
         moran_score_val = self._moran_score(morans_i)
-        density_cv_value = max(float(density_cv), 0.0)
+
+        # --- CV term (coverage density CV, capped at 2.0) ---
+        density_cv_value = float(np.clip(float(density_cv), 0.0, 2.0))
+        cv_component = float(density_cv_value / 2.0)
+
+        # --- Agglomeration area ratio term ---
         agglomeration_area_ratio = float(np.clip(agglomeration_area_ratio, 0.0, 1.0))
-        density_range_ratio = float(np.clip(density_range_ratio, 0.0, 1.0))
-        cv_component = float(np.clip(density_cv_value, 0.0, 2.0) / 2.0)
+
+        # --- Entropy term: 1 - H (higher entropy = more uniform → lower penalty) ---
+        entropy_value = float(np.clip(float(coverage_entropy), 0.0, 1.0))
+        entropy_penalty = 1.0 - entropy_value
+
+        # --- Moran's I penalty: positive I means clustering (bad for uniformity) ---
+        clamped_moran = float(np.clip(float(morans_i), -1.0, 1.0))
+        # Map: I <= 0 → 0 penalty; I > 0 → linear penalty up to 1.0 at I=1
+        moran_penalty = float(np.clip(clamped_moran, 0.0, 1.0))
+
         raw_score = 100.0 * (
             1.0 -
             UNIFORMITY_WEIGHT_CV * density_cv_value -
             UNIFORMITY_WEIGHT_AGGLOM * agglomeration_area_ratio -
-            UNIFORMITY_WEIGHT_RANGE * density_range_ratio
+            UNIFORMITY_WEIGHT_ENTROPY * entropy_penalty -
+            UNIFORMITY_WEIGHT_MORAN * moran_penalty
         )
         overall_score = float(np.clip(raw_score, 0.0, 100.0))
+
+        # Small-sample attenuation: dampen toward 50 to signal unreliability
+        if centroid_count < UNIFORMITY_SMALL_SAMPLE_FLOOR:
+            dampening = float(centroid_count) / float(UNIFORMITY_SMALL_SAMPLE_FLOOR)
+            overall_score = 50.0 + (overall_score - 50.0) * dampening
+
         grade = self._get_uniformity_grade(overall_score)
 
         return {
@@ -2361,7 +2398,9 @@ class CNTAnalyzer:
             'moran': moran_score_val,
             'cv_component': cv_component,
             'agglomeration_component': agglomeration_area_ratio,
-            'range_component': density_range_ratio,
+            'entropy_component': entropy_penalty,
+            'moran_component': moran_penalty,
+            'range_component': float(np.clip(density_range_ratio, 0.0, 1.0)),
             'long_tube_ratio': float(long_tube_ratio),
             'overall': overall_score,
             'grade': grade,
@@ -2467,6 +2506,7 @@ class CNTAnalyzer:
             agglomeration_area_ratio=hotspot_area_metrics['area_ratio'],
             density_range_ratio=density_range_ratio,
             long_tube_ratio=long_tube_ratio,
+            coverage_entropy=coverage_grid_stats['entropy'],
         )
         aggregation_scores = self._calculate_aggregation_scores(uniformity_scores)
         spatial_distribution.update({
@@ -2682,15 +2722,16 @@ class CNTAnalyzer:
         severe_mask = np.zeros_like(hotspot_grid, dtype=bool)
 
         if active_scores.size > 0 and float(np.max(active_scores) - np.min(active_scores)) >= SPATIAL_HOTSPOT_ACTIVE_SCORE_RANGE_MIN:
+            # Smooth interpolation based on active cell count instead of hard cutoffs
+            # Lerp between small and large percentiles over range [4, 10]
+            lerp_t = float(np.clip((active_scores.size - 4) / 6.0, 0.0, 1.0))
             hotspot_percentile = (
-                SPATIAL_HOTSPOT_MASK_PERCENTILE_LARGE
-                if active_scores.size >= 6 else
-                SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL
+                SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL +
+                lerp_t * (SPATIAL_HOTSPOT_MASK_PERCENTILE_LARGE - SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL)
             )
             severe_percentile = (
-                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE
-                if active_scores.size >= 8 else
-                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL
+                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL +
+                lerp_t * (SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE - SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL)
             )
             hotspot_threshold = max(
                 float(np.percentile(active_scores, hotspot_percentile)),
@@ -2854,7 +2895,8 @@ class CNTAnalyzer:
                                  dispersed_stats: Optional[Dict[str, object]] = None,
                                  score_weights: Optional[Dict[str, float]] = None,
                                  ultra_long_threshold_um: Optional[float] = None,
-                                 ultra_long_ratio_exponent: Optional[float] = None) -> Dict[str, object]:
+                                 ultra_long_ratio_exponent: Optional[float] = None,
+                                 long_thick_width_threshold_um: Optional[float] = None) -> Dict[str, object]:
         """Build a clear four-part evaluation framework for the current result set."""
         measurements = roi.measurements if roi else self.measurements
         stats = stats or self.get_statistics(roi)
@@ -2877,9 +2919,15 @@ class CNTAnalyzer:
             float(ultra_long_ratio_exponent)
         )
         resolved_ratio_exponent = float(np.clip(resolved_ratio_exponent, 0.1, 3.0))
+        resolved_long_thick_width_threshold_um = (
+            float(EVALUATION_LONG_THICK_WIDTH_THRESHOLD_UM)
+            if long_thick_width_threshold_um is None else
+            max(0.0, float(long_thick_width_threshold_um))
+        )
 
         widths = self._collect_measurement_metric_values(measurements, 'width_mean_um', 'width_median_um')
         lengths = [float(m.length_um) for m in measurements if m.length_um is not None and np.isfinite(float(m.length_um))]
+        total_measurement_count = len(measurements)
         hotspot_area_metrics = self._summarize_hotspot_area_metrics(dispersed_stats.get('hotspot_mask'), roi=roi)
 
         apparent_width_mean_um = float(np.mean(widths)) if widths else 0.0
@@ -2887,6 +2935,25 @@ class CNTAnalyzer:
         skeleton_length_mean_um = float((stats or {}).get('length_mean', 0.0) or 0.0)
         ultra_long_count = int(sum(1 for length in lengths if length >= resolved_ultra_long_threshold_um))
         ultra_long_ratio = float(ultra_long_count / len(lengths)) if lengths else 0.0
+        long_thick_count = 0
+        for measurement in measurements:
+            length_um = getattr(measurement, 'length_um', None)
+            width_median_um = getattr(measurement, 'width_median_um', None)
+            if length_um is None or width_median_um is None:
+                continue
+            try:
+                length_value = float(length_um)
+                width_value = float(width_median_um)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(length_value) or not np.isfinite(width_value):
+                continue
+            if (
+                length_value >= resolved_ultra_long_threshold_um and
+                width_value >= resolved_long_thick_width_threshold_um
+            ):
+                long_thick_count += 1
+        long_thick_ratio = float(long_thick_count / total_measurement_count) if total_measurement_count else 0.0
         width_mean_score = self._score_inverse_metric(apparent_width_mean_um, reference=1.0)
         width_p90_score = self._score_inverse_metric(width_p90_um, reference=1.0)
         thick_bundle_score = float(np.mean([width_mean_score, width_p90_score]))
@@ -2903,7 +2970,9 @@ class CNTAnalyzer:
         # 非线性放大: ratio^exponent 使长管比例差异获得更高分辨率
         amplified_ratio = float(np.clip(ultra_long_ratio, 0.0, 1.0) ** resolved_ratio_exponent)
         ultra_long_score = float(amplified_ratio * 100.0)
-        long_cnt_score = float(np.mean([length_mean_score, ultra_long_score]))
+        amplified_long_thick_ratio = float(np.clip(long_thick_ratio, 0.0, 1.0) ** resolved_ratio_exponent)
+        long_thick_score = float(amplified_long_thick_ratio * 100.0)
+        long_cnt_score = float(np.mean([length_mean_score, ultra_long_score, long_thick_score]))
         agglomerated_area_score = float(np.clip((1.0 - hotspot_area_metrics['area_ratio']) * 100.0, 0.0, 100.0))
         largest_agglomerate_score = float(np.clip((1.0 - hotspot_area_metrics['largest_area_ratio']) * 100.0, 0.0, 100.0))
         agglomeration_score = float(np.mean([agglomerated_area_score, largest_agglomerate_score]))
@@ -2941,6 +3010,10 @@ class CNTAnalyzer:
                 'ultra_long_count': ultra_long_count,
                 'ultra_long_ratio': ultra_long_ratio,
                 'ultra_long_ratio_exponent': float(resolved_ratio_exponent),
+                'long_thick_width_threshold_um': float(resolved_long_thick_width_threshold_um),
+                'long_thick_count': int(long_thick_count),
+                'long_thick_ratio': long_thick_ratio,
+                'long_thick_score': long_thick_score,
                 'score': long_cnt_score,
             },
             'agglomeration': {

@@ -71,6 +71,25 @@ def get_cjk_font(root: tk.Tk = None) -> str:
     return get_platform_font(root)
 
 
+def get_ui_scale(root: tk.Tk = None) -> float:
+    """获取当前界面的像素缩放因子。"""
+    if root is not None:
+        for attr in ('_ui_scale', '_dpi_scale'):
+            value = getattr(root, attr, None)
+            try:
+                scale = float(value)
+            except (TypeError, ValueError):
+                continue
+            if scale > 0:
+                return max(1.0, scale)
+    return 1.0
+
+
+def scale_ui_value(root: tk.Tk, value: float, minimum: int = 1) -> int:
+    """按 UI scale 将逻辑像素换算为当前窗口使用的像素值。"""
+    return max(int(minimum), int(round(float(value) * get_ui_scale(root))))
+
+
 def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
     """
     应用Modern风格样式到tkinter根窗口
@@ -94,6 +113,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
     # 使用平台自适应字体
     ui_font = get_platform_font(root)
     cjk_font = get_cjk_font(root)
+    px = lambda value, minimum=1: scale_ui_value(root, value, minimum)
     default_font = (ui_font, 9)
     heading_font = (ui_font, 10, 'bold')
 
@@ -116,7 +136,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     borderwidth=1,
                     relief='flat',
                     font=(ui_font, 9, 'bold'),
-                    padding=5)
+                    padding=px(5))
 
     style.map('TButton',
               background=[('active', c['button_active']),
@@ -131,7 +151,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     borderwidth=0,
                     relief='flat',
                     font=(ui_font, 9, 'bold'),
-                    padding=6)
+                    padding=px(6))
 
     style.map('Accent.TButton',
               background=[('active', c['accent_primary_light']),
@@ -145,7 +165,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     borderwidth=0,
                     relief='flat',
                     font=(ui_font, 9, 'bold'),
-                    padding=6)
+                    padding=px(6))
 
     style.map('Success.TButton',
               background=[('active', '#059669'),
@@ -157,7 +177,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     borderwidth=0,
                     relief='flat',
                     font=(ui_font, 9, 'bold'),
-                    padding=6)
+                    padding=px(6))
 
     style.map('Warning.TButton',
               background=[('active', '#D97706'),
@@ -169,7 +189,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     borderwidth=0,
                     relief='flat',
                     font=(ui_font, 9, 'bold'),
-                    padding=6)
+                    padding=px(6))
 
     style.map('Danger.TButton',
               background=[('active', '#DC2626'),
@@ -180,7 +200,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground=c['text_primary'],
                     borderwidth=1,
                     relief='solid',
-                    padding=5)
+                    padding=px(5))
 
     style.configure('TLabelframe',
                     background=c['bg_primary'],
@@ -193,11 +213,11 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     foreground=c['accent_secondary'],
                     font=heading_font)
 
-    style.configure('TNotebook', background=c['bg_primary'], tabmargins=[2, 5, 2, 0], borderwidth=0)
+    style.configure('TNotebook', background=c['bg_primary'], tabmargins=[px(2), px(5), px(2), 0], borderwidth=0)
     style.configure('TNotebook.Tab',
                     background=c['bg_tertiary'],
                     foreground=c['text_secondary'],
-                    padding=[15, 8],
+                    padding=[px(15), px(8)],
                     font=(ui_font, 9),
                     borderwidth=0)
 
@@ -208,13 +228,13 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                           ('active', c['text_primary'])],
               expand=[('selected', [1, 1, 1, 0])])
 
-    style.configure('TScale', background=c['bg_primary'], troughcolor=c['border'], sliderlength=20)
+    style.configure('TScale', background=c['bg_primary'], troughcolor=c['border'], sliderlength=px(20))
 
     style.configure('TScrollbar',
                     background=c['bg_tertiary'],
                     troughcolor=c['bg_primary'],
                     borderwidth=0,
-                    arrowsize=12)
+                    arrowsize=px(12))
     style.map('TScrollbar',
               background=[('active', c['accent_teal']),
                           ('pressed', c['accent_primary'])])
@@ -231,7 +251,7 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
                     fieldbackground=c['bg_secondary'],
                     borderwidth=0,
                     font=(cjk_font, 9),
-                    rowheight=28)
+                    rowheight=px(28))
 
     style.configure('Treeview.Heading',
                     background=c['bg_tertiary'],
@@ -246,11 +266,12 @@ def apply_modern_style(root: tk.Tk, colors: dict = None) -> None:
 
     style.configure('Horizontal.TProgressbar',
                     background=c['accent_primary'],
-                    troughcolor=c['bg_tertiary'])
+                    troughcolor=c['bg_tertiary'],
+                    thickness=px(12))
     style.configure('Comparison.Horizontal.TProgressbar',
                     background=c['accent_amber'],
                     troughcolor='#FEF3C7',
                     lightcolor='#FBBF24',
                     darkcolor='#D97706',
                     bordercolor=c['accent_amber'],
-                    thickness=20)
+                    thickness=px(20))

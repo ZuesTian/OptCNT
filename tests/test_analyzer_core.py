@@ -8,13 +8,21 @@ from src.core.analyzer_core import CNTAnalyzer
 from src.core.models import CNTMeasurement
 
 
-def _make_measurement(measurement_id: int, length_um: float) -> CNTMeasurement:
+def _make_measurement(
+    measurement_id: int,
+    length_um: float,
+    *,
+    width_mean_um: float | None = None,
+    width_median_um: float | None = None,
+) -> CNTMeasurement:
     contour = np.array([[[0, 0]], [[1, 0]], [[1, 1]]], dtype=np.int32)
     return CNTMeasurement(
         id=measurement_id,
         length_pixels=length_um,
         length_um=length_um,
         contour=contour,
+        width_mean_um=width_mean_um,
+        width_median_um=width_median_um,
     )
 
 
@@ -373,8 +381,8 @@ def test_analyze_spatial_distribution_returns_aggregation_scores(monkeypatch):
     assert np.allclose(np.array(result["shadow_density_grid"], dtype=float), np.full((4, 4), 0.4))
     uniformity_scores = result["uniformity_scores"]
     aggregation_scores = result["aggregation_scores"]
-    assert uniformity_scores["overall"] == pytest.approx(80.0)
-    assert uniformity_scores["grade"] == "均匀"
+    assert uniformity_scores["overall"] == pytest.approx(60.4)
+    assert uniformity_scores["grade"] == "一般"
     assert result["hotspot_area_ratio"] == pytest.approx(0.0)
     assert result["density_range_ratio"] == pytest.approx(0.0)
     for key in ("nearest_neighbor", "grid_density", "moran", "overall"):
@@ -443,18 +451,76 @@ def test_calculate_uniformity_scores_keeps_long_tube_ratio_out_of_overall_score(
         agglomeration_area_ratio=0.2,
         density_range_ratio=0.3,
         long_tube_ratio=1.0,
+        coverage_entropy=0.8,
     )
 
+    # New formula v2: 100 * (1 - 0.35*CV - 0.25*Ac - 0.20*(1-H) - 0.20*max(0,I))
+    # CV_d capped at 2.0: min(0.5, 2.0) = 0.5
+    # entropy_penalty = 1 - 0.8 = 0.2
+    # moran_penalty = max(0, 0.1) = 0.1
     expected = 100.0 * (
         1.0 -
         analyzer_core_module.UNIFORMITY_WEIGHT_CV * 0.5 -
         analyzer_core_module.UNIFORMITY_WEIGHT_AGGLOM * 0.2 -
-        analyzer_core_module.UNIFORMITY_WEIGHT_RANGE * 0.3
+        analyzer_core_module.UNIFORMITY_WEIGHT_ENTROPY * 0.2 -
+        analyzer_core_module.UNIFORMITY_WEIGHT_MORAN * 0.1
     )
 
     assert scores["overall"] == pytest.approx(expected)
     assert scores["long_tube_ratio"] == pytest.approx(1.0)
-    assert scores["grade"] == "一般"
+    assert scores["entropy_component"] == pytest.approx(0.2)
+    assert scores["moran_component"] == pytest.approx(0.1)
+
+
+def test_uniformity_scores_small_sample_attenuation():
+    """Small samples (< 5 CNTs) should be dampened toward 50."""
+    analyzer = CNTAnalyzer()
+
+    scores = analyzer._calculate_uniformity_scores(
+        nearest_neighbor_cv=0.1,
+        density_cv=0.1,
+        morans_i=-0.3,
+        centroid_count=3,
+        agglomeration_area_ratio=0.0,
+        density_range_ratio=0.0,
+        long_tube_ratio=0.0,
+        coverage_entropy=0.95,
+    )
+
+    # With these inputs the raw score is very high, but dampening should pull toward 50
+    assert scores["confidence"] == "very_low"
+    assert scores["overall"] < 90.0  # dampened from near-100
+    assert scores["overall"] > 50.0  # but still above 50
+
+
+def test_uniformity_scores_negative_morans_i_no_penalty():
+    """Negative Moran's I (dispersed) should not penalize uniformity."""
+    analyzer = CNTAnalyzer()
+
+    scores = analyzer._calculate_uniformity_scores(
+        nearest_neighbor_cv=0.3,
+        density_cv=0.3,
+        morans_i=-0.5,
+        centroid_count=30,
+        agglomeration_area_ratio=0.1,
+        density_range_ratio=0.2,
+        long_tube_ratio=0.0,
+        coverage_entropy=0.9,
+    )
+
+    assert scores["moran_component"] == pytest.approx(0.0)
+    # Without Moran penalty, score should be higher than with positive I
+    scores_positive_i = analyzer._calculate_uniformity_scores(
+        nearest_neighbor_cv=0.3,
+        density_cv=0.3,
+        morans_i=0.5,
+        centroid_count=30,
+        agglomeration_area_ratio=0.1,
+        density_range_ratio=0.2,
+        long_tube_ratio=0.0,
+        coverage_entropy=0.9,
+    )
+    assert scores["overall"] > scores_positive_i["overall"]
 
 
 def test_get_dispersed_statistics_filters_hotspots_and_supports_strictness(monkeypatch):
@@ -616,6 +682,10 @@ def test_get_evaluation_framework_returns_clear_four_part_metrics(monkeypatch):
     assert framework["long_cnt"]["skeleton_length_mean_um"] == pytest.approx(28.3333333333)
     assert framework["long_cnt"]["ultra_long_threshold_um"] == pytest.approx(40.0)
     assert framework["long_cnt"]["ultra_long_ratio"] == pytest.approx(1 / 3)
+    assert framework["long_cnt"]["long_thick_width_threshold_um"] == pytest.approx(1.0)
+    assert framework["long_cnt"]["long_thick_count"] == 1
+    assert framework["long_cnt"]["long_thick_ratio"] == pytest.approx(1 / 3)
+    assert framework["long_cnt"]["long_thick_score"] == pytest.approx((1 / 3) ** 0.6 * 100.0)
     assert framework["score_weights"] == pytest.approx({
         "uniformity": 0.30,
         "thick_bundle": 0.20,
@@ -629,9 +699,9 @@ def test_get_evaluation_framework_returns_clear_four_part_metrics(monkeypatch):
 def test_get_evaluation_framework_supports_configurable_long_tube_and_weights(monkeypatch):
     analyzer = CNTAnalyzer()
     measurements = [
-        _make_measurement(0, 10.0),
-        _make_measurement(1, 35.0),
-        _make_measurement(2, 40.0),
+        _make_measurement(0, 10.0, width_mean_um=0.6, width_median_um=0.5),
+        _make_measurement(1, 35.0, width_mean_um=1.3, width_median_um=1.1),
+        _make_measurement(2, 40.0, width_mean_um=1.8, width_median_um=1.6),
     ]
     analyzer.measurements = measurements
     monkeypatch.setattr(
@@ -645,6 +715,7 @@ def test_get_evaluation_framework_supports_configurable_long_tube_and_weights(mo
         dispersed_stats={"hotspot_mask": np.array([[0, 0], [0, 0]], dtype=bool)},
         ultra_long_threshold_um=30.0,
         ultra_long_ratio_exponent=0.7,
+        long_thick_width_threshold_um=1.2,
         score_weights={
             "uniformity": 0.2,
             "thick_bundle": 0.2,
@@ -656,9 +727,65 @@ def test_get_evaluation_framework_supports_configurable_long_tube_and_weights(mo
     assert framework["long_cnt"]["ultra_long_threshold_um"] == pytest.approx(30.0)
     assert framework["long_cnt"]["ultra_long_ratio"] == pytest.approx(2 / 3)
     assert framework["long_cnt"]["ultra_long_ratio_exponent"] == pytest.approx(0.7)
+    assert framework["long_cnt"]["long_thick_width_threshold_um"] == pytest.approx(1.2)
+    assert framework["long_cnt"]["long_thick_count"] == 1
+    assert framework["long_cnt"]["long_thick_ratio"] == pytest.approx(1 / 3)
     assert framework["score_weights"] == pytest.approx({
         "uniformity": 0.2,
         "thick_bundle": 0.2,
         "long_cnt": 0.4,
         "agglomeration": 0.2,
     })
+
+
+def test_get_evaluation_framework_uses_width_median_for_long_thick_and_updates_long_cnt_score(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurements = [
+        _make_measurement(0, 50.0, width_mean_um=2.2, width_median_um=0.6),
+        _make_measurement(1, 50.0, width_mean_um=0.7, width_median_um=1.2),
+    ]
+    analyzer.measurements = measurements
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 100, 50),
+    )
+
+    framework = analyzer.get_evaluation_framework(
+        stats={"count": 2, "length_mean": 50.0, "spatial_distribution": {"uniformity_scores": {"overall": 82.0}}},
+        dispersed_stats={"hotspot_mask": np.array([[0, 0], [0, 0]], dtype=bool)},
+    )
+
+    expected_long_thick_score = float((0.5 ** 0.6) * 100.0)
+    expected_length_mean_score = 62.5
+    expected_ultra_long_score = 100.0
+
+    assert framework["long_cnt"]["long_thick_count"] == 1
+    assert framework["long_cnt"]["long_thick_ratio"] == pytest.approx(0.5)
+    assert framework["long_cnt"]["long_thick_score"] == pytest.approx(expected_long_thick_score)
+    assert framework["long_cnt"]["score"] == pytest.approx(
+        np.mean([expected_length_mean_score, expected_ultra_long_score, expected_long_thick_score])
+    )
+
+
+def test_get_evaluation_framework_long_thick_defaults_to_zero_when_width_missing(monkeypatch):
+    analyzer = CNTAnalyzer()
+    measurements = [
+        _make_measurement(0, 55.0),
+        _make_measurement(1, 42.0),
+    ]
+    analyzer.measurements = measurements
+    monkeypatch.setattr(
+        analyzer,
+        "_get_local_measurements",
+        lambda roi=None: (measurements, 0, 0, 100, 50),
+    )
+
+    framework = analyzer.get_evaluation_framework(
+        stats={"count": 2, "length_mean": 48.5, "spatial_distribution": {"uniformity_scores": {"overall": 78.0}}},
+        dispersed_stats={"hotspot_mask": np.array([[0, 0], [0, 0]], dtype=bool)},
+    )
+
+    assert framework["long_cnt"]["long_thick_count"] == 0
+    assert framework["long_cnt"]["long_thick_ratio"] == pytest.approx(0.0)
+    assert framework["long_cnt"]["long_thick_score"] == pytest.approx(0.0)

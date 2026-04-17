@@ -7,7 +7,7 @@ from typing import Optional, Callable, List
 from datetime import datetime
 
 from .widgets import SortableTreeview, ScrollableFrame
-from .gui_styles import get_platform_font, get_cjk_font
+from .gui_styles import get_platform_font, get_cjk_font, scale_ui_value
 from ..core.utils import (
     SCALE_BAR_DEFAULT_UM,
     CNT_BRIDGE_STRENGTH_DEFAULT,
@@ -19,6 +19,42 @@ from ..core.utils import (
 # 常量定义
 MIN_ROI_SIZE = 10  # ROI最小尺寸 (像素)
 MIN_SCALE_LENGTH = 5  # 比例尺最小长度 (像素)
+
+
+def _scale_px(widget: tk.Widget, value: float, minimum: int = 1) -> int:
+    """按当前顶层窗口 DPI 将逻辑尺寸换算为实际像素。"""
+    return scale_ui_value(widget.winfo_toplevel(), value, minimum)
+
+
+def _calculate_result_split_height(widget: tk.Widget, total_height: int) -> int:
+    """按面板高度返回更稳定的统计区目标高度。
+
+    策略：
+    - 小窗口保持统计区可读，避免摘要被压扁。
+    - 中等窗口适度按比例增长。
+    - 大窗口/最大化时给统计区设置封顶，让列表继续占主导。
+    """
+    total_height = max(1, int(total_height))
+    min_stats_height = _scale_px(widget, 220)
+    preferred_stats_height = _scale_px(widget, 280)
+    min_list_height = _scale_px(widget, 300)
+
+    medium_threshold = _scale_px(widget, 760)
+    large_threshold = _scale_px(widget, 980)
+
+    if total_height >= large_threshold:
+        target_ratio = 0.31
+        max_stats_cap = _scale_px(widget, 360)
+    elif total_height >= medium_threshold:
+        target_ratio = 0.34
+        max_stats_cap = _scale_px(widget, 330)
+    else:
+        target_ratio = 0.38
+        max_stats_cap = _scale_px(widget, 320)
+
+    desired_height = max(preferred_stats_height, int(round(total_height * target_ratio)))
+    available_cap = max(min_stats_height, total_height - min_list_height)
+    return max(min_stats_height, min(desired_height, max_stats_cap, available_cap))
 
 
 class ControlPanel(ttk.Frame):
@@ -105,7 +141,7 @@ class ControlPanel(ttk.Frame):
             text="比例尺状态: 待检测",
             foreground=self.colors['text_secondary'],
             font=(self._ui_font, 9),
-            wraplength=230,
+            wraplength=_scale_px(self, 230),
             justify=tk.LEFT,
         )
         self.scale_status_label.pack(anchor=tk.W, padx=8, pady=(0, 6))
@@ -340,7 +376,7 @@ class ControlPanel(ttk.Frame):
             text="检测输入状态: 待加载图像",
             foreground=self.colors['text_secondary'],
             font=(self._ui_font, 9),
-            wraplength=260,
+            wraplength=_scale_px(self, 260),
             justify=tk.LEFT,
         )
         self.analysis_status_label.pack(anchor=tk.W, padx=8, pady=(0, 8))
@@ -772,6 +808,7 @@ class ResultPanel(ttk.Frame):
         self.tree: Optional[SortableTreeview] = None
         self.stats_text: Optional[tk.Text] = None
         self._result_paned: Optional[tk.PanedWindow] = None
+        self._result_layout_job: Optional[str] = None
         self._tree_columns = ('ID', '长度(μm)', '分散CNT', '团聚CNT')
 
         self._setup_ui()
@@ -781,18 +818,22 @@ class ResultPanel(ttk.Frame):
         result_paned = tk.PanedWindow(
             self,
             orient=tk.VERTICAL,
-            sashwidth=6,
+            sashwidth=_scale_px(self, 6),
             bd=0,
             bg=self.colors.get('bg_primary', '#FAFBFC'),
         )
-        result_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        result_paned.pack(fill=tk.BOTH, expand=True, padx=_scale_px(self, 5), pady=_scale_px(self, 5))
         self._result_paned = result_paned
 
         stats_frame = ttk.LabelFrame(result_paned, text="统计信息")
-        result_paned.add(stats_frame, minsize=150, height=240)
+        result_paned.add(
+            stats_frame,
+            minsize=_scale_px(self, 200),
+            height=_scale_px(self, 280),
+        )
 
         stats_text_frame = ttk.Frame(stats_frame)
-        stats_text_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
+        stats_text_frame.pack(fill=tk.BOTH, expand=True, padx=_scale_px(self, 8), pady=_scale_px(self, 5))
 
         _ui_font = get_platform_font(self.winfo_toplevel())
         self.stats_text = tk.Text(stats_text_frame,
@@ -818,14 +859,14 @@ class ResultPanel(ttk.Frame):
         self.stats_text.tag_configure('error', foreground=self.colors['error'])
 
         list_frame = ttk.LabelFrame(result_paned, text="测量列表 (点击列标题排序)")
-        result_paned.add(list_frame, minsize=220)
+        result_paned.add(list_frame, minsize=_scale_px(self, 300))
 
         self.tree = SortableTreeview(list_frame, columns=self._tree_columns, show='headings')
 
         # 配置列标题和列属性，统一居中对齐
         for col in self._tree_columns:
             self.tree.heading(col, text=col)
-            default_width = 80 if col == 'ID' else 110
+            default_width = _scale_px(self, 80 if col == 'ID' else 110)
             self.tree.column(col, width=default_width, anchor='center')
 
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
@@ -843,7 +884,32 @@ class ResultPanel(ttk.Frame):
 
         self.tree.bind('<<TreeviewSelect>>', self.callbacks.get('on_select_cnt'))
         self.tree.bind('<Configure>', self._on_tree_resize, add='+')
+        self.bind('<Configure>', self._on_result_panel_resize, add='+')
+        self.after_idle(self._apply_balanced_result_split)
 
+    def _on_result_panel_resize(self, event=None) -> None:
+        """窗口高度变化后延迟重排结果区上下比例。"""
+        if event is not None and event.widget is not self:
+            return
+        if self._result_layout_job is not None:
+            self.after_cancel(self._result_layout_job)
+        self._result_layout_job = self.after(80, self._apply_balanced_result_split)
+
+    def _apply_balanced_result_split(self) -> None:
+        """按照当前结果面板高度重设统计区默认占比。"""
+        self._result_layout_job = None
+        if self._result_paned is None or not self._result_paned.winfo_exists():
+            return
+        if len(self._result_paned.panes()) < 2:
+            return
+
+        total_height = max(1, self._result_paned.winfo_height())
+        stats_height = _calculate_result_split_height(self, total_height)
+
+        try:
+            self._result_paned.sash_place(0, 0, stats_height)
+        except tk.TclError:
+            return
 
     def _on_tree_resize(self, event=None) -> None:
         """根据可用宽度自适应结果列表列宽。"""
@@ -851,17 +917,21 @@ class ResultPanel(ttk.Frame):
             return
 
         total_width = int(event.width) if event is not None else self.tree.winfo_width()
-        total_width = max(320, total_width)
+        total_width = max(_scale_px(self, 360), total_width)
 
-        id_width = max(56, int(total_width * 0.16))
-        length_width = max(104, int(total_width * 0.34))
-        dispersed_width = max(88, int(total_width * 0.25))
-        agglomerated_width = max(88, total_width - id_width - length_width - dispersed_width - 8)
+        id_min = _scale_px(self, 56)
+        length_min = _scale_px(self, 104)
+        status_min = _scale_px(self, 88)
 
-        self.tree.column(self._tree_columns[0], width=id_width, minwidth=56, stretch=False, anchor='center')
-        self.tree.column(self._tree_columns[1], width=length_width, minwidth=104, stretch=True, anchor='center')
-        self.tree.column(self._tree_columns[2], width=dispersed_width, minwidth=88, stretch=True, anchor='center')
-        self.tree.column(self._tree_columns[3], width=agglomerated_width, minwidth=88, stretch=True, anchor='center')
+        id_width = max(id_min, int(total_width * 0.16))
+        length_width = max(length_min, int(total_width * 0.34))
+        dispersed_width = max(status_min, int(total_width * 0.25))
+        agglomerated_width = max(status_min, total_width - id_width - length_width - dispersed_width - _scale_px(self, 8))
+
+        self.tree.column(self._tree_columns[0], width=id_width, minwidth=id_min, stretch=False, anchor='center')
+        self.tree.column(self._tree_columns[1], width=length_width, minwidth=length_min, stretch=True, anchor='center')
+        self.tree.column(self._tree_columns[2], width=dispersed_width, minwidth=status_min, stretch=True, anchor='center')
+        self.tree.column(self._tree_columns[3], width=agglomerated_width, minwidth=status_min, stretch=True, anchor='center')
 
     def clear_stats(self) -> None:
         """清空统计信息"""
@@ -918,8 +988,8 @@ class ScrollableDashboardPanel(ttk.Frame):
             return
 
         container = ttk.Frame(self.inner_frame, style='Card.TFrame')
-        container.pack(fill=tk.X, expand=False, padx=10, pady=10)
-        container.configure(height=height)
+        container.pack(fill=tk.X, expand=False, padx=_scale_px(self, 10), pady=_scale_px(self, 10))
+        container.configure(height=_scale_px(self, height))
         container.pack_propagate(False)
 
         _ui_font = get_platform_font(self.winfo_toplevel())
@@ -928,7 +998,7 @@ class ScrollableDashboardPanel(ttk.Frame):
             text=title,
             font=(_ui_font, 10, 'bold'),
             foreground=title_color or self.colors['text_primary'],
-        ).pack(anchor=tk.W, padx=5, pady=5)
+        ).pack(anchor=tk.W, padx=_scale_px(self, 5), pady=_scale_px(self, 5))
 
         chart_area = ttk.Frame(container, style='Card.TFrame')
         chart_area.pack(fill=tk.BOTH, expand=True)
@@ -960,8 +1030,8 @@ class ScrollableDashboardPanel(ttk.Frame):
             return
 
         container = ttk.Frame(self.inner_frame, style='Card.TFrame')
-        container.pack(fill=tk.X, expand=False, padx=10, pady=10)
-        container.configure(height=height)
+        container.pack(fill=tk.X, expand=False, padx=_scale_px(self, 10), pady=_scale_px(self, 10))
+        container.configure(height=_scale_px(self, height))
         container.pack_propagate(False)
 
         _ui_font = get_platform_font(self.winfo_toplevel())
@@ -970,10 +1040,10 @@ class ScrollableDashboardPanel(ttk.Frame):
             text=title,
             font=(_ui_font, 10, 'bold'),
             foreground=title_color or self.colors['text_primary'],
-        ).pack(anchor=tk.W, padx=5, pady=5)
+        ).pack(anchor=tk.W, padx=_scale_px(self, 5), pady=_scale_px(self, 5))
 
         text_frame = ttk.Frame(container, style='Card.TFrame')
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=_scale_px(self, 4), pady=(0, _scale_px(self, 4)))
 
         text_widget = tk.Text(
             text_frame,
@@ -982,8 +1052,8 @@ class ScrollableDashboardPanel(ttk.Frame):
             fg=self.colors['text_primary'],
             relief='flat',
             font=(get_cjk_font(), 10),
-            padx=8,
-            pady=8,
+            padx=_scale_px(self, 8),
+            pady=_scale_px(self, 8),
         )
         scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
         text_widget.configure(yscrollcommand=scrollbar.set)
@@ -1016,8 +1086,8 @@ class ScrollableDashboardPanel(ttk.Frame):
                 style='Card.TLabel',
                 foreground=self.colors['text_secondary'],
                 justify=tk.CENTER,
-                wraplength=560,
-            ).pack(expand=True, padx=14, pady=14)
+                wraplength=_scale_px(self, 560),
+            ).pack(expand=True, padx=_scale_px(self, 14), pady=_scale_px(self, 14))
 
     def set_section_height(self, key: str, height: int) -> None:
         """调整指定区域的高度"""
@@ -1132,7 +1202,7 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
             return
 
         container = ttk.Frame(self.inner_frame, style='Card.TFrame')
-        container.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        container.pack(fill=tk.X, expand=False, padx=_scale_px(self, 10), pady=_scale_px(self, 10))
         container.pack_forget()  # 初始隐藏
 
         _ui_font = get_platform_font(self.winfo_toplevel())
@@ -1141,15 +1211,15 @@ class ComparisonAnalysisPanel(ScrollableDashboardPanel):
             text="正在分析图像...",
             font=(_ui_font, 10, 'bold'),
             foreground=self.colors['accent_amber'],
-        ).pack(anchor=tk.W, padx=5, pady=5)
+        ).pack(anchor=tk.W, padx=_scale_px(self, 5), pady=_scale_px(self, 5))
 
         progress_frame = ttk.Frame(container, style='Card.TFrame')
-        progress_frame.pack(fill=tk.X, padx=12, pady=12)
+        progress_frame.pack(fill=tk.X, padx=_scale_px(self, 12), pady=_scale_px(self, 12))
 
         self.progress_bar = ttk.Progressbar(
             progress_frame,
             mode='determinate',
-            length=400,
+            length=_scale_px(self, 400),
             maximum=100,
             style='Comparison.Horizontal.TProgressbar'
         )

@@ -105,20 +105,33 @@ def _detect_platform_font() -> str:
 CHART_DPI = 100
 
 
-def main():
-    """主函数"""
-    # Windows DPI 感知，确保高分辨率屏幕下 UI 清晰
+def _enable_high_dpi_awareness() -> float:
+    """启用高 DPI 感知并返回系统缩放因子。"""
     dpi_scale = 1.0
-    if sys.platform == 'win32':
+    if sys.platform != 'win32':
+        return dpi_scale
+
+    try:
+        per_monitor_v2 = ctypes.c_void_p(-4)
+        if not ctypes.windll.user32.SetProcessDpiAwarenessContext(per_monitor_v2):
+            raise OSError("SetProcessDpiAwarenessContext returned 0")
+    except Exception:
         try:
-            # Per-Monitor DPI Aware V1 - 兼容 Windows 8.1+
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            # PROCESS_PER_MONITOR_DPI_AWARE = 2
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
-        dpi_scale = _get_system_dpi_scale()
+
+    return _get_system_dpi_scale()
+
+
+def main():
+    """主函数"""
+    # Windows DPI 感知，确保高分辨率屏幕下 UI 清晰
+    dpi_scale = _enable_high_dpi_awareness()
 
     # 配置 Matplotlib 字体（在创建 Figure 之前）
     _configure_matplotlib_fonts()
@@ -142,6 +155,7 @@ def main():
 
     # 将 DPI 信息存储在 root 上，供 GUI 模块读取
     root._dpi_scale = dpi_scale
+    root._ui_scale = dpi_scale
     root._chart_dpi = CHART_DPI
     root._platform_font = _detect_platform_font()
 
