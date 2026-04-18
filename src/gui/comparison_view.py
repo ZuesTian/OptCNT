@@ -135,15 +135,15 @@ def _build_comparison_layout(
     if variant == 'pair':
         if stacked:
             return {
-                'figsize': (13.4, 11.5),
-                'height_ratios': [0.75, 1.6, 1.6],
-                'hspace': 0.40,
+                'figsize': (13.4, 12.2),
+                'height_ratios': [0.82, 0.82, 1.55, 1.55],
+                'hspace': 0.38,
                 'wspace': 0.25,
                 'adjust': {'left': 0.06, 'right': 0.97, 'top': 0.96, 'bottom': 0.05},
             }
         return {
-            'figsize': (13.2, 9.5),
-            'height_ratios': [0.85, 1.4],
+            'figsize': (13.2, 10.4),
+            'height_ratios': [0.84, 0.84, 1.45],
             'hspace': 0.32,
             'wspace': 0.25,
             'adjust': {'left': 0.06, 'right': 0.97, 'top': 0.96, 'bottom': 0.06},
@@ -151,16 +151,16 @@ def _build_comparison_layout(
 
     if stacked:
         return {
-            'figsize': (14.5, 14.2),
-            'height_ratios': [0.80, 0.70, 0.75, 1.5, 1.5],
-            'hspace': 0.44,
+            'figsize': (14.5, 14.4),
+            'height_ratios': [0.84, 0.84, 1.48, 1.48],
+            'hspace': 0.40,
             'wspace': 0.32,
             'adjust': {'left': 0.055, 'right': 0.97, 'top': 0.97, 'bottom': 0.04},
         }
     return {
-        'figsize': (14.5, 11.8),
-        'height_ratios': [0.90, 0.80, 1.5],
-        'hspace': 0.36,
+        'figsize': (14.5, 12.4),
+        'height_ratios': [0.90, 0.84, 1.52],
+        'hspace': 0.34,
         'wspace': 0.35,
         'adjust': {'left': 0.055, 'right': 0.97, 'top': 0.96, 'bottom': 0.045},
     }
@@ -236,21 +236,98 @@ def _estimate_comparison_summary_height(self, summary_text: str) -> int:
 
 
 def _format_representative_caption(self, group_summary: dict, representative_result: dict) -> str:
-    """生成代表图标题，聚焦分散数量与分散比例。"""
-    dispersed_stats = representative_result.get('dispersed_stats') or {}
-    total_count = int(round(float(representative_result.get('stats', {}).get('count', 0.0))))
-    dispersed_count = int(round(float(dispersed_stats.get('dispersed_count', total_count))))
-    dispersed_ratio = float(
-        dispersed_stats.get(
-            'dispersed_ratio',
-            1.0 if total_count > 0 and dispersed_count == total_count else 0.0,
-        )
+    """生成代表图标题，统一到五指标口径。"""
+    framework = self._get_result_evaluation_framework(representative_result)
+    core_metrics = self._build_core_metric_snapshot(
+        representative_result.get('stats'),
+        representative_result.get('dispersed_stats'),
+        framework,
     )
     return (
-        f"{group_summary.get('label', '对象')}典型分布\n"
+        f"{group_summary.get('label', '对象')}典型结果\n"
         f"{representative_result.get('name', '未命名图像')}\n"
-        f"分散CNT={dispersed_count} | 分散比例={dispersed_ratio:.1%}"
+        f"总CNT={core_metrics['total_count']} | 分散比例={core_metrics['dispersed_ratio']:.1%} | "
+        f"网格CV={core_metrics['grid_density_cv']:.2f}"
     )
+
+
+def _extract_group_core_metrics(self, group_summary: dict) -> dict:
+    """从组汇总中提取统一的五指标均值。"""
+    return {
+        'total_count': float((group_summary.get('count_stats') or {}).get('mean', 0.0) or 0.0),
+        'dispersed_count': float((group_summary.get('dispersed_count_stats') or {}).get('mean', 0.0) or 0.0),
+        'agglomerated_count': float((group_summary.get('agglomerated_count_stats') or {}).get('mean', 0.0) or 0.0),
+        'dispersed_ratio': float((group_summary.get('dispersed_ratio_stats') or {}).get('mean', 0.0) or 0.0),
+        'grid_density_cv': float((group_summary.get('grid_density_cv_stats') or {}).get('mean', 0.0) or 0.0),
+        'agglomerated_area_ratio': float((group_summary.get('agglomerated_area_ratio_stats') or {}).get('mean', 0.0) or 0.0),
+        'width_p90_um': float((group_summary.get('width_p90_um_stats') or {}).get('mean', 0.0) or 0.0),
+        'uniformity_score': float((group_summary.get('uniformity_score_stats') or {}).get('mean', 0.0) or 0.0),
+        'skeleton_length_mean_um': float((group_summary.get('skeleton_length_mean_stats') or {}).get('mean', 0.0) or 0.0),
+    }
+
+
+def _build_core_metric_conclusion(
+    self,
+    left_label: str,
+    left_metrics: dict,
+    right_label: str,
+    right_metrics: dict,
+    tests: Optional[dict] = None,
+) -> str:
+    """根据五指标生成结论，明确区分数量维度与空间维度。"""
+    ratio_gap = float(left_metrics.get('dispersed_ratio', 0.0)) - float(right_metrics.get('dispersed_ratio', 0.0))
+    grid_gap = float(left_metrics.get('grid_density_cv', 0.0)) - float(right_metrics.get('grid_density_cv', 0.0))
+    area_gap = float(left_metrics.get('agglomerated_area_ratio', 0.0)) - float(right_metrics.get('agglomerated_area_ratio', 0.0))
+    width_gap = float(left_metrics.get('width_p90_um', 0.0)) - float(right_metrics.get('width_p90_um', 0.0))
+
+    left_spatial_better = (
+        (grid_gap <= -0.05 and area_gap <= -0.03) or
+        grid_gap <= -0.10 or
+        area_gap <= -0.05
+    )
+    right_spatial_better = (
+        (grid_gap >= 0.05 and area_gap >= 0.03) or
+        grid_gap >= 0.10 or
+        area_gap >= 0.05
+    )
+    left_dispersion_better = ratio_gap >= 0.05
+    right_dispersion_better = ratio_gap <= -0.05
+    left_bundle_better = width_gap <= -0.12
+    right_bundle_better = width_gap >= 0.12
+    significant_spatial = bool(tests) and (
+        self._is_test_significant((tests or {}).get('grid_density_cv')) or
+        self._is_test_significant((tests or {}).get('agglomerated_area_ratio'))
+    )
+
+    if left_spatial_better:
+        conclusion = f"结论: {left_label}在空间维度更优，网格CV更低且团聚面积占比更小。"
+        if left_dispersion_better:
+            conclusion += f" 同时 {left_label} 的分散比例也更高。"
+        if left_bundle_better:
+            conclusion += " P90宽度更低，束化尾部更轻。"
+        if tests and not significant_spatial:
+            conclusion += " 当前更适合作为趋势判断。"
+        return conclusion
+
+    if right_spatial_better:
+        conclusion = f"结论: {right_label}在空间维度更优，网格CV更低且团聚面积占比更小。"
+        if right_dispersion_better:
+            conclusion += f" 同时 {right_label} 的分散比例也更高。"
+        if right_bundle_better:
+            conclusion += " P90宽度更低，束化尾部更轻。"
+        if tests and not significant_spatial:
+            conclusion += " 当前更适合作为趋势判断。"
+        return conclusion
+
+    if left_dispersion_better:
+        return f"结论: {left_label}分散比例更高，但空间维度差异有限；数量多，不等于分布均匀。"
+    if right_dispersion_better:
+        return f"结论: {right_label}分散比例更高，但空间维度差异有限；数量多，不等于分布均匀。"
+    if left_bundle_better:
+        return f"结论: 两者空间维度接近，但 {left_label} 的P90宽度更低，束化尾部略轻。"
+    if right_bundle_better:
+        return f"结论: 两者空间维度接近，但 {right_label} 的P90宽度更低，束化尾部略轻。"
+    return "结论: 两者在五个固定指标上接近，建议继续以网格CV和团聚面积占比作为主判断。"
 
 
 def _format_group_comparison_summary(
@@ -260,59 +337,17 @@ def _format_group_comparison_summary(
     note: Optional[str] = None,
     failures: Optional[List[str]] = None,
 ) -> str:
-    """生成精简版组别对比摘要。"""
+    """生成按五指标统一口径的组别对比摘要。"""
     base_count = base_group['count_stats']
     exp_count = exp_group['count_stats']
-    base_dispersed = base_group.get('dispersed_count_stats', self._summarize_numeric_series([]))
-    exp_dispersed = exp_group.get('dispersed_count_stats', self._summarize_numeric_series([]))
-    base_agglomerated = base_group.get('agglomerated_count_stats', self._summarize_numeric_series([]))
-    exp_agglomerated = exp_group.get('agglomerated_count_stats', self._summarize_numeric_series([]))
-    base_ratio = base_group.get('dispersed_ratio_stats', self._summarize_numeric_series([]))
-    exp_ratio = exp_group.get('dispersed_ratio_stats', self._summarize_numeric_series([]))
-    base_dispersed_length = base_group.get('dispersed_length_mean_stats', self._summarize_numeric_series([]))
-    exp_dispersed_length = exp_group.get('dispersed_length_mean_stats', self._summarize_numeric_series([]))
-    base_long_thick_count = base_group.get('long_thick_count_stats', self._summarize_numeric_series([]))
-    exp_long_thick_count = exp_group.get('long_thick_count_stats', self._summarize_numeric_series([]))
-    base_long_thick_ratio = base_group.get('long_thick_ratio_stats', self._summarize_numeric_series([]))
-    exp_long_thick_ratio = exp_group.get('long_thick_ratio_stats', self._summarize_numeric_series([]))
-    base_spatial = base_group['spatial_stats']
-    exp_spatial = exp_group['spatial_stats']
-    base_framework = self._build_group_framework_summary(base_group)
-    exp_framework = self._build_group_framework_summary(exp_group)
+    base_core = self._extract_group_core_metrics(base_group)
+    exp_core = self._extract_group_core_metrics(exp_group)
     compare_context = self._get_compare_display_context(
         *(base_group.get('results') or []),
         *(exp_group.get('results') or []),
     )
     tests = self._compute_group_comparison_tests(base_group, exp_group)
-
-    count_tests = tests['count']
-    hybrid_tests = tests['hybrid_score']
-    long_thick_count_tests = tests['long_thick_count']
-    long_thick_ratio_tests = tests['long_thick_ratio']
-    shadow_tests = tests['shadow_aggregation_score']
-    uniformity_tests = tests['uniformity_score']
-    shadow_diff = base_spatial['shadow_aggregation_score']['mean'] - exp_spatial['shadow_aggregation_score']['mean']
-    uniformity_diff = exp_spatial['uniformity_score']['mean'] - base_spatial['uniformity_score']['mean']
-    evidence_significant = (
-        self._is_test_significant(shadow_tests) or
-        self._is_test_significant(uniformity_tests)
-    )
-
-    strong_exp_advantage = shadow_diff >= 4.0 and uniformity_diff >= 4.0 and evidence_significant
-    trend_exp_advantage = shadow_diff > 0 and uniformity_diff > 0
-    strong_base_advantage = shadow_diff <= -4.0 and uniformity_diff <= -4.0 and evidence_significant
-    trend_base_advantage = shadow_diff < 0 and uniformity_diff < 0
-
-    if strong_exp_advantage:
-        conclusion = f"结论: 实验组更优，阴影团聚低 {shadow_diff:.1f} 分，均匀度高 {uniformity_diff:.1f} 分。"
-    elif trend_exp_advantage:
-        conclusion = "结论: 实验组趋势更优，阴影团聚更轻且均匀度更高，但统计证据仍偏弱。"
-    elif strong_base_advantage:
-        conclusion = f"结论: base组更优，阴影团聚低 {abs(shadow_diff):.1f} 分，均匀度高 {abs(uniformity_diff):.1f} 分。"
-    elif trend_base_advantage:
-        conclusion = "结论: base组趋势更优，阴影团聚更轻且均匀度更高，但统计证据仍偏弱。"
-    else:
-        conclusion = "结论: 两组在阴影团聚与均匀度上接近，当前更适合解读为趋势对比。"
+    conclusion = self._build_core_metric_conclusion('base组', base_core, '实验组', exp_core, tests=tests)
 
     lines: List[str] = []
     if note:
@@ -321,108 +356,128 @@ def _format_group_comparison_summary(
     lines.extend([
         self._format_compare_fixed_params(compare_context),
         "",
-        "CNT数量",
-        (
-            f"base: 均值{base_count['mean']:.1f}±{base_count['std']:.1f} | "
-            f"总计{int(round(base_count['total']))} | n={base_group['image_count']}"
-        ),
-        (
-            f"实验: 均值{exp_count['mean']:.1f}±{exp_count['std']:.1f} | "
-            f"总计{int(round(exp_count['total']))} | n={exp_group['image_count']} | "
-            f"{self._format_compact_significance(count_tests)}"
-        ),
-        "",
-        "分散 / 团聚统计",
-    ])
-    lines.extend(self._format_dispersion_summary_lines(
-        'base',
-        base_count['mean'],
-        base_dispersed['mean'],
-        base_agglomerated['mean'],
-        base_ratio['mean'],
-        base_dispersed_length['mean'],
-        base_spatial['uniformity_score']['mean'],
-        length_std=base_dispersed_length['std'],
-    ))
-    lines.extend(self._format_dispersion_summary_lines(
-        '实验',
-        exp_count['mean'],
-        exp_dispersed['mean'],
-        exp_agglomerated['mean'],
-        exp_ratio['mean'],
-        exp_dispersed_length['mean'],
-        exp_spatial['uniformity_score']['mean'],
-        length_std=exp_dispersed_length['std'],
-    ))
-    lines.extend([
-        "",
-        "长粗管对比",
+        "固定输出（5项）",
         self._format_metric_comparison(
-            '长粗管数量',
+            '总CNT数量',
             'base',
-            base_long_thick_count['mean'],
+            base_count['mean'],
             '实验',
-            exp_long_thick_count['mean'],
+            exp_count['mean'],
             direction='up',
-            qualifier='每图均值，长度≥40μm且宽度≥1.0μm',
+            qualifier='每图均值',
             precision=1,
-            left_std=base_long_thick_count['std'],
-            right_std=exp_long_thick_count['std'],
-            test_result=long_thick_count_tests,
+            left_std=base_count['std'],
+            right_std=exp_count['std'],
+            test_result=tests.get('count'),
         ),
         self._format_metric_comparison(
-            '长粗管占比',
+            '分散比例',
             'base',
-            base_long_thick_ratio['mean'] * 100.0,
+            base_core['dispersed_ratio'] * 100.0,
             '实验',
-            exp_long_thick_ratio['mean'] * 100.0,
+            exp_core['dispersed_ratio'] * 100.0,
             direction='up',
-            qualifier='全部 CNT 中占比(%)',
+            qualifier='数量维度(%)',
             precision=1,
-            left_std=base_long_thick_ratio['std'] * 100.0,
-            right_std=exp_long_thick_ratio['std'] * 100.0,
-            test_result=long_thick_ratio_tests,
+            left_std=(base_group.get('dispersed_ratio_stats') or {}).get('std', 0.0) * 100.0,
+            right_std=(exp_group.get('dispersed_ratio_stats') or {}).get('std', 0.0) * 100.0,
+            test_result=tests.get('dispersed_ratio'),
         ),
-        "",
-        "混合评分分项",
-    ])
-    lines.extend(self._format_hybrid_score_comparison(
-        'base',
-        base_framework,
-        '实验',
-        exp_framework,
-        left_std=(base_group.get('hybrid_score_stats') or {}).get('std'),
-        right_std=(exp_group.get('hybrid_score_stats') or {}).get('std'),
-        test_result=hybrid_tests,
-    ))
-    lines.extend([
-        "",
-        "核心指标",
         self._format_metric_comparison(
-            '阴影团聚',
+            '网格CV',
             'base',
-            base_spatial['shadow_aggregation_score']['mean'],
+            base_core['grid_density_cv'],
             '实验',
-            exp_spatial['shadow_aggregation_score']['mean'],
+            exp_core['grid_density_cv'],
             direction='down',
-            qualifier='0-100，越低越好',
-            precision=1,
-            left_std=base_spatial['shadow_aggregation_score']['std'],
-            right_std=exp_spatial['shadow_aggregation_score']['std'],
-            test_result=shadow_tests,
+            qualifier='空间维度，越小越均匀',
+            precision=2,
+            left_std=(base_group.get('grid_density_cv_stats') or {}).get('std'),
+            right_std=(exp_group.get('grid_density_cv_stats') or {}).get('std'),
+            test_result=tests.get('grid_density_cv'),
         ),
         self._format_metric_comparison(
-            '均匀度',
+            '团聚面积占比',
             'base',
-            base_spatial['uniformity_score']['mean'],
+            base_core['agglomerated_area_ratio'] * 100.0,
             '实验',
-            exp_spatial['uniformity_score']['mean'],
-            direction='up',
-            qualifier='0-100，越高越好',
+            exp_core['agglomerated_area_ratio'] * 100.0,
+            direction='down',
+            qualifier='空间维度(%)',
             precision=1,
-            left_std=base_spatial['uniformity_score']['std'],
-            right_std=exp_spatial['uniformity_score']['std'],
-            test_result=uniformity_tests,
+            left_std=(base_group.get('agglomerated_area_ratio_stats') or {}).get('std', 0.0) * 100.0,
+            right_std=(exp_group.get('agglomerated_area_ratio_stats') or {}).get('std', 0.0) * 100.0,
+            test_result=tests.get('agglomerated_area_ratio'),
+        ),
+        self._format_metric_comparison(
+            'P90宽度',
+            'base',
+            base_core['width_p90_um'],
+            '实验',
+            exp_core['width_p90_um'],
+            direction='down',
+            qualifier='束化尾部指标(μm)',
+            precision=2,
+            left_std=(base_group.get('width_p90_um_stats') or {}).get('std'),
+            right_std=(exp_group.get('width_p90_um_stats') or {}).get('std'),
+            test_result=tests.get('width_p90_um'),
+        ),
+        "",
+        "数量与空间分开解读",
+        "数量多，不等于分布均匀；因此分别用分散比例评价分散程度，用网格CV评价空间均匀性。",
+    ])
+    lines.extend(self._format_dispersion_summary_lines(
+        'base',
+        base_core['total_count'],
+        base_core['dispersed_count'],
+        base_core['agglomerated_count'],
+        base_core['dispersed_ratio'],
+        base_core['grid_density_cv'],
+        base_core['agglomerated_area_ratio'],
+        base_core['width_p90_um'],
+        skeleton_length_mean_um=base_core['skeleton_length_mean_um'],
+        uniformity_score=base_core['uniformity_score'],
+    ))
+    lines.extend(self._format_dispersion_summary_lines(
+        '实验',
+        exp_core['total_count'],
+        exp_core['dispersed_count'],
+        exp_core['agglomerated_count'],
+        exp_core['dispersed_ratio'],
+        exp_core['grid_density_cv'],
+        exp_core['agglomerated_area_ratio'],
+        exp_core['width_p90_um'],
+        skeleton_length_mean_um=exp_core['skeleton_length_mean_um'],
+        uniformity_score=exp_core['uniformity_score'],
+    ))
+    lines.extend([
+        "",
+        "补充指标",
+        self._format_metric_comparison(
+            '平均骨架长度',
+            'base',
+            base_core['skeleton_length_mean_um'],
+            '实验',
+            exp_core['skeleton_length_mean_um'],
+            direction='up',
+            qualifier='补充长度指标(μm)',
+            precision=1,
+            left_std=(base_group.get('skeleton_length_mean_stats') or {}).get('std'),
+            right_std=(exp_group.get('skeleton_length_mean_stats') or {}).get('std'),
+            test_result=tests.get('skeleton_length_mean_um'),
+        ),
+        self._format_metric_comparison(
+            '综合均匀性得分',
+            'base',
+            base_core['uniformity_score'],
+            '实验',
+            exp_core['uniformity_score'],
+            direction='up',
+            qualifier='仅展示层，不作为主结论',
+            precision=1,
+            left_std=(base_group.get('uniformity_score_stats') or {}).get('std'),
+            right_std=(exp_group.get('uniformity_score_stats') or {}).get('std'),
+            test_result=tests.get('uniformity_score'),
         ),
         "",
         conclusion,
@@ -448,41 +503,13 @@ def _format_comparison_summary(
     right_label: str,
     note: Optional[str] = None,
 ) -> str:
-    """生成精简版双图对比摘要。"""
+    """生成按五指标统一口径的双图对比摘要。"""
     compare_context = self._get_compare_display_context(left_result, right_result)
-    left_spatial = left_result['stats'].get('spatial_distribution') or {}
-    right_spatial = right_result['stats'].get('spatial_distribution') or {}
-    left_metrics = self._get_shadow_aggregation_metrics(left_spatial)
-    right_metrics = self._get_shadow_aggregation_metrics(right_spatial)
-    left_count = int(left_result['stats'].get('count', 0))
-    right_count = int(right_result['stats'].get('count', 0))
-    left_dispersed = left_result.get('dispersed_stats') or {}
-    right_dispersed = right_result.get('dispersed_stats') or {}
     left_framework = self._get_result_evaluation_framework(left_result)
     right_framework = self._get_result_evaluation_framework(right_result)
-    count_diff = left_count - right_count
-    count_ratio = (count_diff / right_count * 100.0) if right_count > 0 else 0.0
-    left_uniformity_score = left_metrics['uniformity_score']
-    right_uniformity_score = right_metrics['uniformity_score']
-    uniformity_diff = left_uniformity_score - right_uniformity_score
-    shadow_diff = right_metrics['score'] - left_metrics['score']
-
-    left_better = shadow_diff > 0 and uniformity_diff > 0
-    right_better = shadow_diff < 0 and uniformity_diff < 0
-
-    if left_better and shadow_diff >= 4.0 and uniformity_diff >= 4.0:
-        conclusion = f"结论: {left_label}更优，阴影团聚低 {shadow_diff:.1f} 分，均匀度高 {uniformity_diff:.1f} 分。"
-    elif right_better and abs(shadow_diff) >= 4.0 and abs(uniformity_diff) >= 4.0:
-        conclusion = f"结论: {right_label}更优，阴影团聚低 {abs(shadow_diff):.1f} 分，均匀度高 {abs(uniformity_diff):.1f} 分。"
-    elif left_better:
-        conclusion = f"结论: {left_label}趋势更优，阴影团聚更轻且均匀度更高。"
-    elif right_better:
-        conclusion = f"结论: {right_label}趋势更优，阴影团聚更轻且均匀度更高。"
-    else:
-        conclusion = "结论: 两张图在阴影团聚与均匀度上接近，当前更适合看作趋势对比。"
-
-    left_dispersed_length = (left_dispersed.get('dispersed_length_stats') or {}).get('length_mean', left_result['stats'].get('length_mean', 0.0))
-    right_dispersed_length = (right_dispersed.get('dispersed_length_stats') or {}).get('length_mean', right_result['stats'].get('length_mean', 0.0))
+    left_core = self._build_core_metric_snapshot(left_result.get('stats'), left_result.get('dispersed_stats'), left_framework)
+    right_core = self._build_core_metric_snapshot(right_result.get('stats'), right_result.get('dispersed_stats'), right_framework)
+    conclusion = self._build_core_metric_conclusion(left_label, left_core, right_label, right_core)
 
     lines: List[str] = []
     if note:
@@ -491,52 +518,106 @@ def _format_comparison_summary(
     lines.extend([
         self._format_compare_fixed_params(compare_context),
         "",
-        "CNT数量",
-        f"{left_label}: {left_result['name']} | CNT={left_count}",
-        f"{right_label}: {right_result['name']} | CNT={right_count}",
-        f"差异: {left_label if count_diff >= 0 else right_label} {abs(count_ratio):.1f}%",
-        "",
-        "分散 / 团聚统计",
-    ])
-    lines.extend(self._format_dispersion_summary_lines(
-        left_label,
-        left_count,
-        float(left_dispersed.get('dispersed_count', left_count)),
-        float(left_dispersed.get('agglomerated_count', 0.0)),
-        float(left_dispersed.get('dispersed_ratio', 1.0 if left_count > 0 else 0.0)),
-        float(left_dispersed_length),
-        left_uniformity_score,
-    ))
-    lines.extend(self._format_dispersion_summary_lines(
-        right_label,
-        right_count,
-        float(right_dispersed.get('dispersed_count', right_count)),
-        float(right_dispersed.get('agglomerated_count', 0.0)),
-        float(right_dispersed.get('dispersed_ratio', 1.0 if right_count > 0 else 0.0)),
-        float(right_dispersed_length),
-        right_uniformity_score,
-    ))
-    lines.extend([
-        "",
-        "核心指标",
+        "固定输出（5项）",
         self._format_metric_comparison(
-            '阴影团聚',
+            '总CNT数量',
             left_label,
-            left_metrics['score'],
+            left_core['total_count'],
             right_label,
-            right_metrics['score'],
-            direction='down',
-            qualifier='0-100，越低越好',
+            right_core['total_count'],
+            direction='up',
+            qualifier='绝对数量',
+            precision=0,
+        ),
+        self._format_metric_comparison(
+            '分散比例',
+            left_label,
+            left_core['dispersed_ratio'] * 100.0,
+            right_label,
+            right_core['dispersed_ratio'] * 100.0,
+            direction='up',
+            qualifier='数量维度(%)',
             precision=1,
         ),
         self._format_metric_comparison(
-            '均匀度',
+            '网格CV',
             left_label,
-            left_uniformity_score,
+            left_core['grid_density_cv'],
             right_label,
-            right_uniformity_score,
+            right_core['grid_density_cv'],
+            direction='down',
+            qualifier='空间维度，越小越均匀',
+            precision=2,
+        ),
+        self._format_metric_comparison(
+            '团聚面积占比',
+            left_label,
+            left_core['agglomerated_area_ratio'] * 100.0,
+            right_label,
+            right_core['agglomerated_area_ratio'] * 100.0,
+            direction='down',
+            qualifier='空间维度(%)',
+            precision=1,
+        ),
+        self._format_metric_comparison(
+            'P90宽度',
+            left_label,
+            left_core['width_p90_um'],
+            right_label,
+            right_core['width_p90_um'],
+            direction='down',
+            qualifier='束化尾部指标(μm)',
+            precision=2,
+        ),
+        "",
+        "数量与空间分开解读",
+        "数量多，不等于分布均匀；因此分别用分散比例评价分散程度，用网格CV评价空间均匀性。",
+    ])
+    lines.extend(self._format_dispersion_summary_lines(
+        left_label,
+        left_core['total_count'],
+        left_core['dispersed_count'],
+        left_core['agglomerated_count'],
+        left_core['dispersed_ratio'],
+        left_core['grid_density_cv'],
+        left_core['agglomerated_area_ratio'],
+        left_core['width_p90_um'],
+        skeleton_length_mean_um=left_core['skeleton_length_mean_um'],
+        uniformity_score=left_core['uniformity_score'],
+    ))
+    lines.extend(self._format_dispersion_summary_lines(
+        right_label,
+        right_core['total_count'],
+        right_core['dispersed_count'],
+        right_core['agglomerated_count'],
+        right_core['dispersed_ratio'],
+        right_core['grid_density_cv'],
+        right_core['agglomerated_area_ratio'],
+        right_core['width_p90_um'],
+        skeleton_length_mean_um=right_core['skeleton_length_mean_um'],
+        uniformity_score=right_core['uniformity_score'],
+    ))
+    lines.extend([
+        "",
+        "补充指标",
+        self._format_metric_comparison(
+            '平均骨架长度',
+            left_label,
+            left_core['skeleton_length_mean_um'],
+            right_label,
+            right_core['skeleton_length_mean_um'],
             direction='up',
-            qualifier='0-100，越高越好',
+            qualifier='补充长度指标(μm)',
+            precision=1,
+        ),
+        self._format_metric_comparison(
+            '综合均匀性得分',
+            left_label,
+            left_core['uniformity_score'],
+            right_label,
+            right_core['uniformity_score'],
+            direction='up',
+            qualifier='仅展示层，不作为主结论',
             precision=1,
         ),
         "",
@@ -556,59 +637,63 @@ def _render_dispersion_comparison_dashboard(
     """统一渲染双图/组别的分散对比面板。"""
     left_typical = self._select_representative_result(left_group)
     right_typical = self._select_representative_result(right_group)
+    variant = 'group' if max(left_group.get('image_count', 1), right_group.get('image_count', 1)) > 1 else 'pair'
 
     left_display_image = self._prepare_comparison_display_image(left_typical.get('visualization'), max_width=1100, max_height=650)
     right_display_image = self._prepare_comparison_display_image(right_typical.get('visualization'), max_width=1100, max_height=650)
     stack_images = self._should_stack_comparison_images(left_display_image, right_display_image, threshold=1.65)
-    layout = self._build_comparison_layout(left_display_image, right_display_image, stacked=stack_images, variant='pair')
+    layout = self._build_comparison_layout(left_display_image, right_display_image, stacked=stack_images, variant=variant)
     figure_width, figure_height = layout['figsize']
-    figure = Figure(figsize=(min(13.4, figure_width), min(11.2, figure_height)), dpi=getattr(self, '_chart_dpi', 100))
+    figure = Figure(figsize=(min(14.5, figure_width), min(12.8, figure_height)), dpi=getattr(self, '_chart_dpi', 100))
     figure.patch.set_facecolor(self.MODERN_COLORS['bg_secondary'])
 
     if stack_images:
         grid_spec = figure.add_gridspec(
             4,
-            3,
-            height_ratios=[layout['height_ratios'][0], 0.72, layout['height_ratios'][1], layout['height_ratios'][2]],
+            6,
+            height_ratios=layout['height_ratios'],
             hspace=layout['hspace'],
             wspace=layout['wspace'],
         )
-        ax_dispersed_count = figure.add_subplot(grid_spec[0, 0])
-        ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 1])
-        ax_long_thick_ratio = figure.add_subplot(grid_spec[0, 2])
-        ax_hybrid = figure.add_subplot(grid_spec[1, :])
+        ax_total_count = figure.add_subplot(grid_spec[0, 0:2])
+        ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 2:4])
+        ax_grid_cv = figure.add_subplot(grid_spec[0, 4:6])
+        ax_agglomerated_area = figure.add_subplot(grid_spec[1, 0:3])
+        ax_width_p90 = figure.add_subplot(grid_spec[1, 3:6])
         ax_left = figure.add_subplot(grid_spec[2, :])
         ax_right = figure.add_subplot(grid_spec[3, :])
     else:
         grid_spec = figure.add_gridspec(
             3,
-            3,
-            height_ratios=[layout['height_ratios'][0], 0.78, layout['height_ratios'][1]],
+            6,
+            height_ratios=layout['height_ratios'],
             hspace=layout['hspace'],
             wspace=layout['wspace'],
         )
-        ax_dispersed_count = figure.add_subplot(grid_spec[0, 0])
-        ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 1])
-        ax_long_thick_ratio = figure.add_subplot(grid_spec[0, 2])
-        ax_hybrid = figure.add_subplot(grid_spec[1, :])
-        ax_left = figure.add_subplot(grid_spec[2, 0])
-        ax_right = figure.add_subplot(grid_spec[2, 2])
+        ax_total_count = figure.add_subplot(grid_spec[0, 0:2])
+        ax_dispersed_ratio = figure.add_subplot(grid_spec[0, 2:4])
+        ax_grid_cv = figure.add_subplot(grid_spec[0, 4:6])
+        ax_agglomerated_area = figure.add_subplot(grid_spec[1, 0:3])
+        ax_width_p90 = figure.add_subplot(grid_spec[1, 3:6])
+        ax_left = figure.add_subplot(grid_spec[2, 0:3])
+        ax_right = figure.add_subplot(grid_spec[2, 3:6])
     figure.subplots_adjust(**layout['adjust'])
 
-    dispersed_count_test = tests.get('dispersed_count') if tests else None
+    count_test = tests.get('count') if tests else None
     dispersed_ratio_test = tests.get('dispersed_ratio') if tests else None
-    long_thick_ratio_test = tests.get('long_thick_ratio') if tests else None
-    hybrid_score_test = tests.get('hybrid_score') if tests else None
+    grid_density_test = tests.get('grid_density_cv') if tests else None
+    agglomerated_area_test = tests.get('agglomerated_area_ratio') if tests else None
+    width_p90_test = tests.get('width_p90_um') if tests else None
 
     self._plot_dispersion_bar_chart(
-        ax_dispersed_count,
+        ax_total_count,
         left_group,
         right_group,
-        'dispersed_count_stats',
-        '分散CNT数量对比',
+        'count_stats',
+        '总CNT数量对比',
         '数量',
         "{:.1f}",
-        test_result=dispersed_count_test,
+        test_result=count_test,
     )
     self._plot_dispersion_bar_chart(
         ax_dispersed_ratio,
@@ -622,25 +707,35 @@ def _render_dispersion_comparison_dashboard(
         test_result=dispersed_ratio_test,
     )
     self._plot_dispersion_bar_chart(
-        ax_long_thick_ratio,
+        ax_grid_cv,
         left_group,
         right_group,
-        'long_thick_ratio_stats',
-        '长粗管占比对比',
-        '比例 (%)',
-        "{:.1f}%",
-        scale=100.0,
-        test_result=long_thick_ratio_test,
+        'grid_density_cv_stats',
+        '网格CV对比',
+        'CV',
+        "{:.2f}",
+        test_result=grid_density_test,
     )
     self._plot_dispersion_bar_chart(
-        ax_hybrid,
+        ax_agglomerated_area,
         left_group,
         right_group,
-        'hybrid_score_stats',
-        '混合评分对比',
-        '评分 (0-100)',
-        "{:.1f}",
-        test_result=hybrid_score_test,
+        'agglomerated_area_ratio_stats',
+        '团聚面积占比对比',
+        '占比 (%)',
+        "{:.1f}%",
+        scale=100.0,
+        test_result=agglomerated_area_test,
+    )
+    self._plot_dispersion_bar_chart(
+        ax_width_p90,
+        left_group,
+        right_group,
+        'width_p90_um_stats',
+        'P90宽度对比',
+        '宽度 (μm)',
+        "{:.2f}",
+        test_result=width_p90_test,
     )
 
     self._configure_comparison_image_axis(
@@ -700,6 +795,8 @@ _COMPARISON_VIEW_METHODS = {
     '_configure_comparison_image_axis': _configure_comparison_image_axis,
     '_estimate_comparison_summary_height': _estimate_comparison_summary_height,
     '_format_representative_caption': _format_representative_caption,
+    '_extract_group_core_metrics': _extract_group_core_metrics,
+    '_build_core_metric_conclusion': _build_core_metric_conclusion,
     '_format_group_comparison_summary': _format_group_comparison_summary,
     '_format_comparison_summary': _format_comparison_summary,
     '_render_dispersion_comparison_dashboard': _render_dispersion_comparison_dashboard,

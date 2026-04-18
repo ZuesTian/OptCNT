@@ -155,9 +155,10 @@ class _DummyRoot:
 
 
 class _DummyPanedWindow:
-    def __init__(self, width: int, panes=None):
+    def __init__(self, width: int, panes=None, sashwidth: int = 6):
         self._width = width
         self._panes = panes or ["left", "center", "right"]
+        self._sashwidth = sashwidth
         self.paneconfigure_calls = []
         self.sash_place_calls = []
 
@@ -170,6 +171,11 @@ class _DummyPanedWindow:
     def panes(self):
         return list(self._panes)
 
+    def cget(self, key):
+        if key == "sashwidth":
+            return self._sashwidth
+        raise KeyError(key)
+
     def paneconfigure(self, pane, **kwargs):
         self.paneconfigure_calls.append((pane, kwargs))
 
@@ -177,13 +183,49 @@ class _DummyPanedWindow:
         self.sash_place_calls.append((index, x, y))
 
 
+class _DummyMainFrame:
+    def __init__(self):
+        self.pack_calls = []
+        self.configure_calls = []
+
+    def pack(self, **kwargs):
+        self.pack_calls.append(kwargs)
+
+    def configure(self, **kwargs):
+        self.configure_calls.append(kwargs)
+
+
 class _DummyLayoutRoot(_DummyRoot):
     def __init__(self, width: int):
         super().__init__()
         self._width = width
+        self.update_calls = 0
+        self.bind_calls = []
 
     def winfo_width(self):
         return self._width
+
+    def winfo_screenwidth(self):
+        return self._width
+
+    def winfo_screenheight(self):
+        return 1000
+
+    def update_idletasks(self):
+        self.update_calls += 1
+
+    def bind(self, event, callback, add=None):
+        self.bind_calls.append((event, callback, add))
+
+    def geometry(self, value):
+        self.geometry_value = value
+
+    def minsize(self, width, height):
+        self.minsize_value = (width, height)
+
+    def after_idle(self, callback, *args):
+        self.after_idle_calls = getattr(self, 'after_idle_calls', [])
+        self.after_idle_calls.append((callback, args))
 
 
 class _DummyControlPanelState:
@@ -335,6 +377,8 @@ def _make_result(name: str,
     }
     dispersed_count = max(0.0, round(count * 0.7))
     agglomerated_count = max(0.0, count - dispersed_count)
+    resolved_width_p90_um = max(0.55, 0.72 + grid_cv * 0.85)
+    resolved_agglomerated_area_ratio = min(0.95, max(0.03, grid_cv * 0.55))
     resolved_long_thick_count = max(0.0, float(long_thick_count if long_thick_count is not None else round(count * 0.18)))
     resolved_long_thick_ratio = float(
         long_thick_ratio
@@ -349,7 +393,10 @@ def _make_result(name: str,
     resolved_long_cnt_score = float(long_cnt_score if long_cnt_score is not None else min(100.0, 35.0 + count))
     framework = {
         "uniformity": {"score": float(uniformity_grid)},
-        "thick_bundle": {"score": float(max(20.0, 88.0 - count * 0.6))},
+        "thick_bundle": {
+            "score": float(max(20.0, 88.0 - count * 0.6)),
+            "width_p90_um": resolved_width_p90_um,
+        },
         "long_cnt": {
             "score": resolved_long_cnt_score,
             "skeleton_length_mean_um": 12.5,
@@ -360,7 +407,10 @@ def _make_result(name: str,
             "long_thick_ratio": resolved_long_thick_ratio,
             "long_thick_score": resolved_long_thick_score,
         },
-        "agglomeration": {"score": float(uniformity_overall)},
+        "agglomeration": {
+            "score": float(uniformity_overall),
+            "agglomerated_area_ratio": resolved_agglomerated_area_ratio,
+        },
     }
     framework["hybrid_score"] = (
         framework["uniformity"]["score"] * 0.35 +
@@ -381,6 +431,7 @@ def _make_result(name: str,
                 "morans_i": morans_i,
                 "grid_entropy": 0.9,
                 "occupancy_ratio": 0.55,
+                "hotspot_area_ratio": resolved_agglomerated_area_ratio,
                 "density_grid": [[1.0, 0.0], [0.0, 1.0]],
                 "uniformity_scores": {
                     "nearest_neighbor": uniformity_nn,
@@ -436,7 +487,7 @@ def _make_batch_analysis_result(image_path: str, count: float) -> dict:
         },
         "evaluation_framework": {
             "uniformity": {"score": 60.0},
-            "thick_bundle": {"score": 70.0},
+            "thick_bundle": {"score": 70.0, "width_p90_um": 1.08},
             "long_cnt": {
                 "score": 65.0,
                 "skeleton_length_mean_um": 18.0,
@@ -447,7 +498,7 @@ def _make_batch_analysis_result(image_path: str, count: float) -> dict:
                 "long_thick_ratio": 2.0 / count if count else 0.0,
                 "long_thick_score": 24.0,
             },
-            "agglomeration": {"score": 62.0},
+            "agglomeration": {"score": 62.0, "agglomerated_area_ratio": 0.24},
             "hybrid_score": 63.9,
         },
         "scale_info": None,
@@ -474,9 +525,13 @@ def test_summarize_group_results_includes_aggregation_statistics():
     assert summary["file_details"][0]["long_cnt_score"] > 0
     assert summary["file_details"][0]["long_thick_count"] > 0
     assert summary["file_details"][0]["long_thick_ratio"] > 0
+    assert summary["file_details"][0]["agglomerated_area_ratio"] > 0
+    assert summary["file_details"][0]["width_p90_um"] > 0
     assert summary["dispersed_count_stats"]["mean"] > 0
     assert summary["agglomerated_count_stats"]["mean"] >= 0
     assert summary["dispersed_ratio_stats"]["mean"] > 0
+    assert summary["agglomerated_area_ratio_stats"]["mean"] > 0
+    assert summary["width_p90_um_stats"]["mean"] > 0
     assert summary["long_thick_count_stats"]["mean"] > 0
     assert summary["long_thick_ratio_stats"]["mean"] > 0
     assert summary["spatial_stats"]["aggregation_score"]["mean"] == pytest.approx(42.5)
@@ -484,7 +539,36 @@ def test_summarize_group_results_includes_aggregation_statistics():
     assert summary["spatial_stats"]["aggregation_moran_score"]["max"] == pytest.approx(45.0)
 
 
-def test_compute_group_comparison_tests_include_long_thick_metrics():
+def test_summarize_group_results_resamples_mixed_density_grid_shapes():
+    gui = _make_gui_stub()
+    results = _make_group_results(
+        "mixed",
+        [
+            (32.0, 55.0, 54.0, 56.0, 55.0, 0.32),
+            (30.0, 60.0, 58.0, 61.0, 61.0, 0.28),
+        ],
+    )
+    results[0]["stats"]["spatial_distribution"]["density_grid"] = [
+        [1.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+    results[1]["stats"]["spatial_distribution"]["density_grid"] = [
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 3.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 2.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0],
+    ]
+
+    summary = gui._summarize_group_results("mixed组", results)
+
+    mean_grid = np.array(summary["mean_density_grid"], dtype=float)
+    assert mean_grid.shape == (5, 5)
+    assert float(mean_grid.max()) > 0.0
+
+
+def test_compute_group_comparison_tests_include_core_and_long_thick_metrics():
     gui = _make_gui_stub()
     base_group = gui._summarize_group_results(
         "base组",
@@ -507,8 +591,12 @@ def test_compute_group_comparison_tests_include_long_thick_metrics():
 
     assert "long_thick_count" in tests
     assert "long_thick_ratio" in tests
+    assert "agglomerated_area_ratio" in tests
+    assert "width_p90_um" in tests
     assert tests["long_thick_count"]["t_pvalue"] is not None
     assert tests["long_thick_ratio"]["mw_pvalue"] is not None
+    assert tests["agglomerated_area_ratio"]["t_pvalue"] is not None
+    assert tests["width_p90_um"]["mw_pvalue"] is not None
 
 
 def test_get_preprocess_signature_changes_when_scale_exclusion_rect_changes():
@@ -855,42 +943,19 @@ def test_format_group_comparison_summary_uses_strong_clustering_conclusion():
 
     summary = gui._format_group_comparison_summary(base_group, exp_group)
 
-    assert "CNT数量" in summary
-    assert "分散CNT数量" in summary
+    assert "固定输出（5项）" in summary
     assert "总CNT数量" in summary
-    assert "团聚区域CNT数量" in summary
     assert "分散比例" in summary
-    assert "分散CNT长度统计" in summary
-    assert "空间分布均匀性" in summary
-    assert "base: 均值" in summary
-    assert "长粗管数量" in summary
-    assert "长粗管占比" in summary
-    assert "混合评分分项" in summary
-    assert "核心指标" in summary
-    assert "结论: 实验组更优" in summary
-    assert "阴影团聚(0-100，越低越好)" in summary
-    assert "均匀度(0-100，越高越好)" in summary
-    assert "C.长管(分项分数，已包含长粗管占比)" in summary
+    assert "网格CV" in summary
+    assert "团聚面积占比" in summary
+    assert "P90宽度" in summary
+    assert "数量多，不等于分布均匀" in summary
+    assert "平均骨架长度" in summary
+    assert "综合均匀性得分" in summary
+    assert "结论: 实验组在空间维度更优" in summary
     assert "base组逐图明细" in summary
     assert "总CNT=" in summary
-    assert "Mann-Whitney" not in summary
-    return
-
-    assert "CNT???" in summary
-    assert "???CNT???" in summary
-    assert "??NT???" in summary
-    assert "??????CNT???" in summary
-    assert "??????" in summary
-    assert "???CNT??????" in summary
-    assert "???????????" in summary
-    assert "CNT数量" in summary
-    assert "base: 均值" in summary
-    assert "核心指标" in summary
-    assert "结论: 实验组更优" in summary
-    assert "阴影团聚(0-100，越低越好)" in summary
-    assert "均匀度(0-100，越高越好)" in summary
-    assert "base组逐图明细" in summary
-    assert "CNT=" in summary
+    assert "团聚面积占比=" in summary
     assert "Mann-Whitney" not in summary
 
 
@@ -921,9 +986,8 @@ def test_format_group_comparison_summary_uses_cautious_conclusion_when_gap_is_sm
 
     summary = gui._format_group_comparison_summary(base_group, exp_group)
 
-    assert "结论: 实验组趋势更优" in summary
-    assert "统计证据仍偏弱" in summary
-    assert "结论: 实验组更优" not in summary
+    assert "结论: 两者在五个固定指标上接近" in summary
+    assert "实验组在空间维度更优" not in summary
 
 
 def test_legacy_group_comparison_summary_delegates_to_current_formatter():
@@ -975,13 +1039,14 @@ def test_format_comparison_summary_uses_compact_text():
     summary = gui._format_comparison_summary(left_result, right_result, "样品A", "样品B")
 
     assert summary.startswith("对比预处理: 模糊9/块11/C3")
-    assert "CNT数量" in summary
-    assert "样品A: left | CNT=48" in summary
-    assert "样品B: right | CNT=41" in summary
-    assert "核心指标" in summary
-    assert "阴影团聚(0-100，越低越好)" in summary
-    assert "均匀度(0-100，越高越好)" in summary
-    assert "结论: 样品A更优" in summary
+    assert "固定输出（5项）" in summary
+    assert "总CNT数量" in summary
+    assert "分散比例" in summary
+    assert "网格CV" in summary
+    assert "团聚面积占比" in summary
+    assert "P90宽度" in summary
+    assert "数量多，不等于分布均匀" in summary
+    assert "结论: 样品A在空间维度更优" in summary
     assert "Mann-Whitney" not in summary
 
 
@@ -1127,24 +1192,108 @@ def test_calculate_pane_widths_prefers_center_column():
     left_w, center_w, right_w = gui._calculate_pane_widths(2156)
 
     assert left_w == 367
-    assert center_w == 1315
-    assert right_w == 474
+    assert center_w == 1142
+    assert right_w == 647
     assert center_w > left_w
     assert center_w > right_w
 
 
-def test_calculate_pane_widths_keeps_right_pane_near_target_when_window_is_wide():
+def test_calculate_pane_widths_uses_thirty_percent_right_pane_when_window_is_wide():
     gui = _make_gui_stub()
 
-    initial_widths = gui._calculate_pane_widths(1496)
     left_w, center_w, right_w = gui._calculate_pane_widths(2800)
 
     assert left_w == 476
-    assert right_w == 616
-    assert center_w == 1708
-    assert (left_w / 2800) == pytest.approx(initial_widths[0] / 1496, abs=0.01)
-    assert (right_w / 2800) == pytest.approx(initial_widths[2] / 1496, abs=0.01)
-    assert (center_w / 2800) == pytest.approx(initial_widths[1] / 1496, abs=0.01)
+    assert right_w == 840
+    assert center_w == 1484
+    assert right_w / 2800 == pytest.approx(0.30, abs=0.001)
+    assert center_w > right_w
+
+
+def test_calculate_pane_widths_keeps_thirty_percent_right_pane_on_ultra_wide_window():
+    gui = _make_gui_stub()
+
+    left_w, center_w, right_w = gui._calculate_pane_widths(4200)
+
+    assert left_w == 714
+    assert center_w == 2226
+    assert right_w == 1260
+    assert right_w / 4200 == pytest.approx(0.30, abs=0.001)
+    assert center_w > right_w
+    assert left_w >= 240
+
+
+def test_calculate_pane_widths_keeps_right_pane_below_half_on_compact_width():
+    gui = _make_gui_stub()
+
+    left_w, center_w, right_w = gui._calculate_pane_widths(600)
+
+    assert left_w + center_w + right_w == 600
+    assert right_w / 600 < 0.50
+    assert center_w > 0
+
+
+def test_setup_ui_seeds_pane_widths_from_real_paned_width(monkeypatch):
+    gui = CNTAnalyzerGUI.__new__(CNTAnalyzerGUI)
+    root = _DummyLayoutRoot(width=1800)
+    gui.root = root
+    gui._ui_scale = 1.0
+    gui.MODERN_COLORS = {'bg_primary': '#000', 'bg_secondary': '#111', 'accent_primary': '#222'}
+    gui._scale_px = lambda value, minimum=1: max(int(minimum), int(round(float(value))))
+    gui._get_pane_layout_profile = lambda tab_key=None: {
+        'left_floor': 240,
+        'right_floor': 320,
+        'center_min': 620,
+        'left_ratio': 0.17,
+        'right_ratio': 0.22,
+    }
+    recorded_widths = []
+    gui._calculate_pane_widths = lambda total_w, tab_key=None: recorded_widths.append(total_w) or (300, 900, 400)
+    gui._create_toolbar = lambda: None
+    gui._setup_control_panel = lambda parent: None
+    gui._setup_center_panel = lambda parent: None
+    gui._setup_result_panel = lambda parent: None
+    applied_widths = []
+    gui._apply_pane_widths = lambda paned=None, tab_key=None: applied_widths.append((paned, tab_key)) or True
+    gui._schedule_window_distribution = lambda delay_ms=120: None
+    gui._optimize_window_distribution = lambda: None
+    gui._on_root_resize = lambda event: None
+
+    monkeypatch.setattr(gui_module.ttk, 'Style', lambda: SimpleNamespace(configure=lambda *args, **kwargs: None))
+    monkeypatch.setattr(gui_module.ttk, 'Frame', lambda *args, **kwargs: _DummyMainFrame())
+
+    paned_windows = []
+
+    class _SetupPanedWindow(_DummyPanedWindow):
+        def __init__(self, *args, **kwargs):
+            super().__init__(width=1400)
+            paned_windows.append(self)
+            self.pack_calls = []
+            self.add_calls = []
+
+        def pack(self, **kwargs):
+            self.pack_calls.append(kwargs)
+
+        def add(self, child, **kwargs):
+            self.add_calls.append((child, kwargs))
+
+    monkeypatch.setattr(gui_module.tk, 'PanedWindow', _SetupPanedWindow)
+
+    gui._setup_ui()
+
+    assert recorded_widths == [1400]
+    assert len(applied_widths) == 1
+    assert applied_widths[0][1] == 'image'
+    assert root.update_calls == 1
+    assert len(paned_windows) == 1
+
+
+def test_get_paned_layout_width_subtracts_sash_pixels():
+    gui = _make_gui_stub()
+    gui.main_paned = _DummyPanedWindow(width=1400, sashwidth=6)
+
+    assert gui._get_paned_sash_width(gui.main_paned) == 6
+    assert gui._get_paned_layout_width(gui.main_paned) == 1388
 
 
 def test_calculate_pane_widths_gives_comparison_tab_more_center_space():
@@ -1166,6 +1315,8 @@ def test_calculate_pane_widths_keeps_same_image_ratio_across_window_sizes():
 
     for compact, wide in zip(compact_widths, wide_widths):
         assert (wide / 2156) == pytest.approx(compact / 1496, abs=0.01)
+    assert compact_widths[2] / 1496 == pytest.approx(0.30, abs=0.001)
+    assert wide_widths[2] / 2156 == pytest.approx(0.30, abs=0.001)
 
 
 def test_optimize_window_distribution_waits_for_second_stable_pass():
@@ -1216,9 +1367,34 @@ def test_optimize_window_distribution_places_sashes_after_stable_pass():
     gui._optimize_window_distribution()
 
     assert gui._layout_retry_count == 0
-    assert len(gui.main_paned.paneconfigure_calls) == 3
-    assert gui.main_paned.sash_place_calls == [(0, 300, 0), (1, 796, 0)]
+    assert len(gui.main_paned.paneconfigure_calls) == 0
+    assert gui.main_paned.sash_place_calls == [(0, 300, 0), (1, 790, 0)]
     assert refreshes == [120]
+
+
+def test_optimize_window_distribution_forces_layout_after_retry_ceiling():
+    gui = _make_gui_stub()
+    gui.root = _DummyLayoutRoot(width=1600)
+    gui.main_paned = _DummyPanedWindow(width=1400)
+    gui._layout_job = None
+    gui._layout_retry_count = 12
+    gui._layout_stable_snapshot = (1600, 1400)
+    refreshes = []
+    gui._schedule_window_distribution = lambda delay_ms=120: None
+    gui._schedule_comparison_layout_refresh = lambda delay_ms=120: refreshes.append(delay_ms)
+    gui._get_pane_layout_profile = lambda tab_key=None: {
+        'left_floor': 240,
+        'right_floor': 320,
+        'center_min': 620,
+    }
+    gui._calculate_pane_widths = lambda total_w, tab_key=None: (300, total_w - 680, 380)
+
+    gui._optimize_window_distribution()
+
+    assert gui._layout_retry_count == 0
+    assert len(gui.main_paned.paneconfigure_calls) == 0
+    assert gui.main_paned.sash_place_calls == [(0, 300, 0), (1, 1014, 0)]
+    assert refreshes == [180]
 
 
 
@@ -1228,10 +1404,10 @@ def test_build_comparison_layout_uses_stable_presets():
     pair_stacked = gui._build_comparison_layout(stacked=True, variant='pair')
     group_side_by_side = gui._build_comparison_layout(stacked=False, variant='group')
 
-    assert pair_stacked['figsize'] == (13.4, 11.5)
-    assert pair_stacked['height_ratios'] == [0.75, 1.6, 1.6]
-    assert group_side_by_side['figsize'] == (14.5, 11.8)
-    assert group_side_by_side['height_ratios'] == [0.90, 0.80, 1.5]
+    assert pair_stacked['figsize'] == (13.4, 12.2)
+    assert pair_stacked['height_ratios'] == [0.82, 0.82, 1.55, 1.55]
+    assert group_side_by_side['figsize'] == (14.5, 12.4)
+    assert group_side_by_side['height_ratios'] == [0.90, 0.84, 1.52]
 
 
 def test_render_comparison_figure_keeps_cached_chart_for_layout_refresh(monkeypatch):
@@ -1284,8 +1460,8 @@ def test_show_comparison_window_renders_only_dispersion_charts():
     gui._show_comparison_window(left_result, right_result, "图像A", "图像B")
 
     titles = [ax.get_title() for ax in captured["figure"].axes]
-    assert titles[:4] == ["分散CNT数量对比", "分散比例对比", "长粗管占比对比", "混合评分对比"]
-    assert len(captured["figure"].axes) == 6
+    assert titles[:5] == ["总CNT数量对比", "分散比例对比", "网格CV对比", "团聚面积占比对比", "P90宽度对比"]
+    assert len(captured["figure"].axes) == 7
 
 
 def test_show_group_comparison_window_reuses_dispersion_dashboard():
@@ -1320,8 +1496,8 @@ def test_show_group_comparison_window_reuses_dispersion_dashboard():
     gui._show_group_comparison_window(base_group, exp_group)
 
     titles = [ax.get_title() for ax in captured["figure"].axes]
-    assert titles[:4] == ["分散CNT数量对比", "分散比例对比", "长粗管占比对比", "混合评分对比"]
-    assert len(captured["figure"].axes) == 6
+    assert titles[:5] == ["总CNT数量对比", "分散比例对比", "网格CV对比", "团聚面积占比对比", "P90宽度对比"]
+    assert len(captured["figure"].axes) == 7
 
 
 def test_plot_dispersion_bar_chart_ylim_includes_error_bars_and_pvalue_annotation():
@@ -1368,14 +1544,13 @@ def test_estimate_comparison_summary_height_stays_compact():
     summary_text = "\n".join([
         "识别参数: 模糊9/块11/C3, 长度>=4.0μm",
         "",
-        "图像A: sample_a.jpg",
-        "图像B: sample_b.jpg",
+        "固定输出（5项）",
+        "总CNT数量(绝对数量): 图像A 48 vs 图像B 41",
+        "网格CV(空间维度，越小越均匀): 图像A 0.41 vs 图像B 0.53",
+        "团聚面积占比(空间维度%): 图像A 18.0 vs 图像B 31.0",
         "",
-        "核心指标",
-        "阴影团聚(0-100，越低越好): 图像A 41.3 vs 图像B 40.7",
-        "均匀度(0-100，越高越好): 图像A 58.7 vs 图像B 59.3",
-        "",
-        "结论: 两组整体接近。",
+        "数量多，不等于分布均匀；因此分别用分散比例评价分散程度，用网格CV评价空间均匀性。",
+        "结论: 图像A在空间维度更优。",
     ])
 
     height = gui._estimate_comparison_summary_height(summary_text)
@@ -1391,13 +1566,13 @@ def test_configure_comparison_image_axis_uses_overlay_caption():
     gui._configure_comparison_image_axis(
         ax,
         image=np.zeros((8, 12, 3), dtype=np.uint8),
-        title="图像A典型分布\nsample_a.jpg\nCNT=451",
+        title="图像A典型结果\nsample_a.jpg\n总CNT=451 | 分散比例=68.0% | 网格CV=0.42",
     )
 
     assert ax.get_title() == ""
     assert len(ax.texts) == 1
     assert "sample_a.jpg" in ax.texts[0].get_text()
-    assert "CNT=451" in ax.texts[0].get_text()
+    assert "总CNT=451" in ax.texts[0].get_text()
 
 
 def test_build_spatial_hotspot_grid_highlights_obvious_local_cluster():
@@ -1474,7 +1649,7 @@ def test_configure_comparison_image_axis_appends_hotspot_summary_when_spatial_gi
     gui._configure_comparison_image_axis(
         ax,
         image=np.zeros((20, 20, 3), dtype=np.uint8),
-        title="图像A典型分布",
+        title="图像A典型结果",
         spatial=spatial,
     )
 
@@ -1527,7 +1702,12 @@ def test_update_advanced_analysis_populates_expanded_chart_set():
     )
 
     calls = []
-    gui._draw_spatial_score_chart = lambda spatial, cnt_count=None: calls.append(("score", cnt_count))
+    gui._get_evaluation_framework = lambda stats=None, dispersed_stats=None, roi=None: {
+        "thick_bundle": {"width_p90_um": 0.95},
+        "agglomeration": {"agglomerated_area_ratio": 0.18},
+        "long_cnt": {"skeleton_length_mean_um": 11.0},
+    }
+    gui._draw_spatial_score_chart = lambda stats, dispersed_stats=None, framework=None: calls.append(("score", stats.get("count"), framework.get("thick_bundle", {}).get("width_p90_um")))
     gui._draw_distribution_chart = lambda values: calls.append(("histogram", [m.id for m in values]))
     gui._draw_pie_chart = lambda distribution: calls.append(("pie", distribution))
     gui._draw_cluster_analysis = lambda values: calls.append(("cluster", [m.id for m in values]))
@@ -1536,7 +1716,7 @@ def test_update_advanced_analysis_populates_expanded_chart_set():
     gui._update_advanced_analysis()
 
     assert calls == [
-        ("score", 3),
+        ("score", 3, 0.95),
         ("histogram", [1, 2]),
         ("pie", {"分散CNT": 2, "团聚CNT": 1}),
         ("cluster", [1, 2]),
@@ -1684,7 +1864,8 @@ def test_update_results_falls_back_to_base_statistics_when_dispersed_stats_fail(
     gui._update_results()
 
     text = gui.result_panel.stats_text.getvalue()
-    assert "2\n\n" in text
+    assert "总CNT数量: 2" in text
+    assert "分散CNT数量: 2" in text
     assert "11.00" in text
     assert len(gui.result_panel.rows) == 2
     assert gui.result_panel.rows[0] == (1, "10.00", "", "")
@@ -1743,15 +1924,17 @@ def test_update_results_appends_evaluation_framework_when_available():
     gui._update_results()
 
     text = gui.result_panel.stats_text.getvalue()
-    assert "评判框架" in text
-    assert "A. 均匀性主指标" in text
+    assert "补充指标" in text
+    assert "空间维度" in text
+    assert "网格CV" in text
+    assert "团聚面积占比" in text
     assert "P90 宽度" in text
-    assert "长粗管数量" in text
-    assert "长粗管占比" in text
-    assert "最大团聚体面积" in text
+    assert "平均骨架长度" in text
+    assert "综合均匀性得分" in text
+    assert "数量多，不等于分布均匀" in text
 
 
-def test_build_evaluation_framework_report_text_includes_long_thick_fields():
+def test_build_evaluation_framework_report_text_uses_core_metric_language():
     gui = _make_gui_stub()
 
     report_text = gui._build_evaluation_framework_report_text({
@@ -1768,9 +1951,11 @@ def test_build_evaluation_framework_report_text_includes_long_thick_fields():
         "agglomeration": {"agglomerated_area_ratio": 0.18, "largest_agglomerate_area_um2": 14.2},
     })
 
-    assert "长粗管阈值" in report_text
-    assert "长粗管数量" in report_text
-    assert "长粗管占比" in report_text
+    assert "网格CV" in report_text
+    assert "团聚面积占比" in report_text
+    assert "P90 宽度" in report_text
+    assert "平均骨架长度" in report_text
+    assert "综合均匀性得分" in report_text
 
 
 def test_analyze_image_files_reuses_cache_and_dispatches_only_uncached_tasks():

@@ -12,6 +12,28 @@ def _get_expected_paned_width(self, root_width: int) -> int:
     return max(1, int(root_width) - self._scale_px(24))
 
 
+def _get_paned_sash_width(self, paned: Optional[tk.PanedWindow] = None) -> int:
+    """Return the sash width used by the PanedWindow."""
+    paned = paned or self.main_paned
+    if paned is None:
+        return self._scale_px(6)
+    try:
+        return max(0, int(paned.cget('sashwidth')))
+    except (tk.TclError, TypeError, ValueError, AttributeError):
+        return self._scale_px(6)
+
+
+def _get_paned_layout_width(self, paned: Optional[tk.PanedWindow] = None) -> int:
+    """Return the usable pane width after subtracting sash pixels."""
+    paned = paned or self.main_paned
+    if paned is None or not paned.winfo_exists():
+        return 1
+    total_w = max(1, int(paned.winfo_width()))
+    pane_count = len(paned.panes())
+    sash_total = self._get_paned_sash_width(paned) * max(0, pane_count - 1)
+    return max(1, total_w - sash_total)
+
+
 def _on_root_resize(self, event):
     """窗口尺寸变化时防抖重排三栏布局"""
     if event.widget is not self.root or self.main_paned is None:
@@ -70,13 +92,17 @@ def _get_pane_layout_profile(self, tab_key: Optional[str] = None) -> dict:
             'center_min': 720,
             'left_ratio': 0.15,
             'right_ratio': 0.15,
+            'left_ratio_cap': 0.22,
+            'right_ratio_cap': 0.28,
         }
     return {
         'left_floor': 240,
         'right_floor': 320,
         'center_min': 620,
         'left_ratio': 0.17,
-        'right_ratio': 0.22,
+        'right_ratio': 0.30,
+        'left_ratio_cap': 0.24,
+        'right_ratio_cap': 0.30,
     }
 
 
@@ -89,20 +115,27 @@ def _calculate_pane_widths(self, total_w: int, tab_key: Optional[str] = None) ->
     center_min = self._scale_px(profile['center_min'])
     left_ratio = float(profile.get('left_ratio', 0.0) or 0.0)
     right_ratio = float(profile.get('right_ratio', 0.0) or 0.0)
-
-    floor_total = left_floor + center_min + right_floor
-    if total_w <= floor_total:
-        left_w = left_floor
-        right_w = right_floor
-        center_w = max(self._scale_px(520), total_w - left_w - right_w)
-        return left_w, center_w, right_w
+    left_ratio_cap = float(profile.get('left_ratio_cap', 0.24) or 0.24)
+    right_ratio_cap = float(profile.get('right_ratio_cap', 0.28) or 0.28)
 
     if left_ratio <= 0.0 or right_ratio <= 0.0 or (left_ratio + right_ratio) >= 0.85:
         left_ratio = 0.17
-        right_ratio = 0.22
+        right_ratio = 0.30
+
+    left_ratio_cap = max(left_ratio, min(left_ratio_cap, 0.45))
+    right_ratio_cap = max(right_ratio, min(right_ratio_cap, 0.30))
+
+    # Relax hard side-pane floors on narrower windows so the result pane does
+    # not crowd out the center workspace before the window reaches its minimum.
+    left_floor = min(left_floor, max(self._scale_px(180), int(total_w * left_ratio_cap)))
+    right_floor = min(right_floor, max(self._scale_px(220), int(total_w * right_ratio_cap)))
 
     left_w = max(left_floor, int(round(total_w * left_ratio)))
     right_w = max(right_floor, int(round(total_w * right_ratio)))
+    left_cap_width = max(left_floor, int(round(total_w * left_ratio_cap)))
+    right_cap_width = max(right_floor, int(round(total_w * right_ratio_cap)))
+    left_w = min(left_w, left_cap_width)
+    right_w = min(right_w, right_cap_width)
     center_w = total_w - left_w - right_w
 
     if center_w < center_min:
@@ -137,6 +170,28 @@ def _calculate_pane_widths(self, total_w: int, tab_key: Optional[str] = None) ->
     return left_w, center_w, right_w
 
 
+def _apply_pane_widths(self, paned: Optional[tk.PanedWindow] = None, tab_key: Optional[str] = None) -> bool:
+    """Apply calculated widths and sash positions to the three-pane layout."""
+    paned = paned or self.main_paned
+    if paned is None or not paned.winfo_exists() or len(paned.panes()) < 3:
+        return False
+
+    total_w = max(1, int(paned.winfo_width()))
+    sash_width = self._get_paned_sash_width(paned)
+    layout_w = self._get_paned_layout_width(paned)
+    left_w, center_w, right_w = self._calculate_pane_widths(layout_w, tab_key)
+    left_sash = left_w
+    right_sash = max(left_sash + sash_width, total_w - right_w - sash_width)
+
+    try:
+        paned.sash_place(0, left_sash, 0)
+        paned.sash_place(1, min(right_sash, total_w - sash_width), 0)
+    except tk.TclError:
+        return False
+
+    return True
+
+
 def _optimize_window_distribution(self):
     """使用目标宽度约束优化窗口分布。"""
     self._layout_job = None
@@ -157,48 +212,34 @@ def _optimize_window_distribution(self):
         and abs(previous_snapshot[0] - root_w) <= self._scale_px(4)
         and abs(previous_snapshot[1] - total_w) <= self._scale_px(4)
     )
+    forced_apply = False
     if not is_stable_pass:
         self._layout_stable_snapshot = current_snapshot
         if self._layout_retry_count < 12:
             self._layout_retry_count += 1
             self._schedule_window_distribution(delay_ms=90)
-        return
+            return
+        forced_apply = True
 
     self._layout_retry_count = 0
     self._layout_stable_snapshot = current_snapshot
-    profile = self._get_pane_layout_profile()
-    panes = paned.panes()
-    if len(panes) >= 3:
-        try:
-            paned.paneconfigure(panes[0], minsize=self._scale_px(int(profile['left_floor'])))
-            paned.paneconfigure(panes[1], minsize=self._scale_px(int(profile['center_min'])))
-            paned.paneconfigure(panes[2], minsize=self._scale_px(int(profile['right_floor'])))
-        except tk.TclError:
-            pass
-
-    left_w, center_w, right_w = self._calculate_pane_widths(total_w)
-
-    left_sash = left_w
-    right_sash = left_w + center_w
-    right_sash = min(right_sash, total_w - 1)
-
-    try:
-        paned.sash_place(0, left_sash, 0)
-        paned.sash_place(1, right_sash, 0)
-    except tk.TclError:
+    if not self._apply_pane_widths(paned):
         return
 
-    self._schedule_comparison_layout_refresh(delay_ms=120)
+    self._schedule_comparison_layout_refresh(delay_ms=180 if forced_apply else 120)
 
 
 _LAYOUT_METHODS = {
     '_get_expected_paned_width': _get_expected_paned_width,
+    '_get_paned_sash_width': _get_paned_sash_width,
+    '_get_paned_layout_width': _get_paned_layout_width,
     '_on_root_resize': _on_root_resize,
     '_schedule_window_distribution': _schedule_window_distribution,
     '_get_active_center_tab_key': _get_active_center_tab_key,
     '_select_center_tab': _select_center_tab,
     '_get_pane_layout_profile': _get_pane_layout_profile,
     '_calculate_pane_widths': _calculate_pane_widths,
+    '_apply_pane_widths': _apply_pane_widths,
     '_optimize_window_distribution': _optimize_window_distribution,
 }
 

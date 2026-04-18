@@ -1136,8 +1136,8 @@ class AdvancedAnalysisPanel(ScrollableDashboardPanel):
         """设置高级分析布局"""
         self._create_chart_container(
             "score",
-            "阴影团聚与均匀度总览",
-            placeholder="完成检测后，这里会显示当前图像或当前 ROI 的阴影团聚与均匀度双指标概览。",
+            "核心五指标总览",
+            placeholder="完成检测后，这里会显示总CNT数量、分散比例、网格CV、团聚面积占比和P90宽度的统一总览。",
             title_color=self.colors['accent_primary'],
         )
         self._create_chart_container(
