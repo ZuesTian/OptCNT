@@ -517,9 +517,10 @@ def test_summarize_group_results_includes_aggregation_statistics():
         ],
     )
 
-    summary = gui._summarize_group_results("base组", base_results)
+    summary = gui._summarize_group_results("base组", base_results, group_role="base")
 
-    assert summary["file_details"][0]["aggregation_score"] == pytest.approx(45.0)
+    assert summary["role"] == "base"
+    assert summary["role_short_name"] == "base"
     assert summary["file_details"][0]["shadow_aggregation_score"] == pytest.approx(45.0)
     assert summary["file_details"][0]["dispersed_count"] > 0
     assert summary["file_details"][0]["long_cnt_score"] > 0
@@ -568,7 +569,15 @@ def test_summarize_group_results_resamples_mixed_density_grid_shapes():
     assert float(mean_grid.max()) > 0.0
 
 
-def test_compute_group_comparison_tests_include_core_and_long_thick_metrics():
+def test_summarize_group_results_defaults_generic_role_for_custom_labels():
+    gui = _make_gui_stub()
+
+    summary = gui._summarize_group_results("样品A", _make_group_results("sample", [(30.0, 50.0, 49.0, 51.0, 50.0, 0.30)]))
+
+    assert summary["role"] == "generic"
+    assert summary["role_display_name"] == "样品A"
+
+
     gui = _make_gui_stub()
     base_group = gui._summarize_group_results(
         "base组",
@@ -926,6 +935,7 @@ def test_format_group_comparison_summary_uses_strong_clustering_conclusion():
                 (32.0, 35.0, 34.0, 35.0, 36.0, 0.61),
             ],
         ),
+        group_role="base",
     )
     exp_group = gui._summarize_group_results(
         "实验组",
@@ -939,6 +949,7 @@ def test_format_group_comparison_summary_uses_strong_clustering_conclusion():
                 (34.0, 59.0, 58.0, 60.0, 59.0, 0.21),
             ],
         ),
+        group_role="experiment",
     )
 
     summary = gui._format_group_comparison_summary(base_group, exp_group)
@@ -952,11 +963,66 @@ def test_format_group_comparison_summary_uses_strong_clustering_conclusion():
     assert "数量多，不等于分布均匀" in summary
     assert "平均骨架长度" in summary
     assert "综合均匀性得分" in summary
+    assert "对比角色: base组（基准参考） vs 实验组（实验候选）" in summary
     assert "结论: 实验组在空间维度更优" in summary
     assert "base组逐图明细" in summary
     assert "总CNT=" in summary
     assert "团聚面积占比=" in summary
     assert "Mann-Whitney" not in summary
+
+
+def test_format_representative_caption_includes_structural_metrics():
+    gui = _make_gui_stub()
+    result = _make_result(
+        "base_1",
+        30.0,
+        40.0,
+        39.0,
+        41.0,
+        40.0,
+        0.55,
+        0.52,
+        0.30,
+        long_thick_count=10,
+        long_thick_ratio=0.33,
+    )
+    result["evaluation_framework"]["long_cnt"]["skeleton_length_mean_um"] = 18.2
+    group_summary = gui._summarize_group_results("base组", [result], group_role="base")
+
+    caption = gui._format_representative_caption(group_summary, result)
+
+    assert "P90宽度=" in caption
+    assert "平均骨架长度=" in caption
+    assert "长粗管占比=" in caption
+
+
+def test_format_group_comparison_summary_highlights_base_as_longer_and_thicker():
+    gui = _make_gui_stub()
+    base_results = [
+        _make_result("base_1", 30.0, 38.0, 37.0, 39.0, 38.0, 0.52, 0.49, 0.41, long_thick_count=12, long_thick_ratio=0.40),
+        _make_result("base_2", 31.0, 39.0, 38.0, 40.0, 39.0, 0.51, 0.48, 0.39, long_thick_count=11, long_thick_ratio=0.36),
+        _make_result("base_3", 32.0, 40.0, 39.0, 41.0, 40.0, 0.50, 0.47, 0.38, long_thick_count=13, long_thick_ratio=0.41),
+    ]
+    exp_results = [
+        _make_result("exp_1", 33.0, 62.0, 61.0, 63.0, 62.0, 0.29, 0.20, 0.12, long_thick_count=2, long_thick_ratio=0.06),
+        _make_result("exp_2", 34.0, 63.0, 62.0, 64.0, 63.0, 0.28, 0.19, 0.10, long_thick_count=3, long_thick_ratio=0.09),
+        _make_result("exp_3", 32.0, 61.0, 60.0, 62.0, 61.0, 0.30, 0.21, 0.11, long_thick_count=2, long_thick_ratio=0.07),
+    ]
+    for result in base_results:
+        result["evaluation_framework"]["long_cnt"]["skeleton_length_mean_um"] = 18.5
+    for result in exp_results:
+        result["evaluation_framework"]["long_cnt"]["skeleton_length_mean_um"] = 11.0
+
+    base_group = gui._summarize_group_results("base组", base_results, group_role="base")
+    exp_group = gui._summarize_group_results("实验组", exp_results, group_role="experiment")
+
+    summary = gui._format_group_comparison_summary(base_group, exp_group)
+
+    assert "长粗管占比" in summary
+    assert "长粗管数量" in summary
+    assert "结论: 实验组在空间维度更优" in summary
+    assert "base组同时表现为P90宽度更高、平均骨架长度更长、长粗管占比更高" in summary
+    assert "更符合肉眼观察到的“base组更长更粗”" in summary
 
 
 def test_format_group_comparison_summary_uses_cautious_conclusion_when_gap_is_small():
@@ -971,6 +1037,7 @@ def test_format_group_comparison_summary_uses_cautious_conclusion_when_gap_is_sm
                 (29.0, 45.0, 44.0, 46.0, 45.0, 0.39),
             ],
         ),
+        group_role="base",
     )
     exp_group = gui._summarize_group_results(
         "实验组",
@@ -982,6 +1049,7 @@ def test_format_group_comparison_summary_uses_cautious_conclusion_when_gap_is_sm
                 (30.0, 48.0, 47.0, 49.0, 48.0, 0.35),
             ],
         ),
+        group_role="experiment",
     )
 
     summary = gui._format_group_comparison_summary(base_group, exp_group)
@@ -1002,6 +1070,7 @@ def test_legacy_group_comparison_summary_delegates_to_current_formatter():
                 (29.0, 45.0, 44.0, 46.0, 45.0, 0.39),
             ],
         ),
+        group_role="base",
     )
     exp_group = gui._summarize_group_results(
         "实验组",
@@ -1013,6 +1082,7 @@ def test_legacy_group_comparison_summary_delegates_to_current_formatter():
                 (30.0, 48.0, 47.0, 49.0, 48.0, 0.35),
             ],
         ),
+        group_role="experiment",
     )
 
     legacy = gui._legacy_format_group_comparison_summary(
@@ -1050,7 +1120,19 @@ def test_format_comparison_summary_uses_compact_text():
     assert "Mann-Whitney" not in summary
 
 
-def test_format_comparison_summary_prefers_stored_compare_context_over_live_widgets():
+def test_format_comparison_summary_keeps_generic_left_right_labels():
+    gui = _make_gui_stub()
+    left_result = _make_result("left", 48.0, 60.0, 61.0, 59.0, 60.0, 0.39, 0.41, 0.18)
+    right_result = _make_result("right", 41.0, 47.0, 46.0, 48.0, 47.0, 0.51, 0.53, 0.31)
+
+    summary = gui._format_comparison_summary(left_result, right_result, "样品A", "样品B")
+
+    assert "对比角色:" not in summary
+    assert "base组" not in summary
+    assert "实验组" not in summary
+    assert "结论: 样品A在空间维度更优" in summary
+
+
     gui = _make_gui_stub()
     gui.min_length_um_var = _DummyVar(40.0)
     gui.min_slenderness_var = _DummyVar(9.0)
@@ -1138,7 +1220,8 @@ def test_plot_group_aggregation_risk_chart_uses_fixed_scale_and_group_colors():
 
     assert ax.get_title() == "阴影团聚 / 均匀度组间对比"
     assert ax.get_ylim() == (0.0, 100.0)
-    assert ax.get_legend() is not None
+    assert ax.get_legend().get_texts()[0].get_text() == "base组"
+    assert ax.get_legend().get_texts()[1].get_text() == "实验组"
     assert ax.patches[0].get_facecolor() == pytest.approx(to_rgba(CNTAnalyzerGUI.MODERN_COLORS["accent_rose"], alpha=0.95))
     assert ax.patches[2].get_facecolor() == pytest.approx(to_rgba(CNTAnalyzerGUI.MODERN_COLORS["accent_teal"], alpha=0.82))
 
@@ -1162,7 +1245,8 @@ def test_render_group_count_distribution_views_switches_to_single_point_mode():
 
     assert "样本量较少" in ax_box.get_title()
     assert ax_detail.get_title() == "逐图CNT概览"
-    assert len(ax_detail.patches) == 2
+    assert [tick.get_text() for tick in ax_box.get_xticklabels()] == ["base组", "实验组"]
+    assert [tick.get_text() for tick in ax_detail.get_yticklabels()] == ["base | base_1", "实验 | exp_1"]
 
 
 def test_fit_comparison_figure_to_frame_shrinks_figure_to_available_width():
@@ -1657,6 +1741,46 @@ def test_configure_comparison_image_axis_appends_hotspot_summary_when_spatial_gi
     assert len(ax.texts) == 1
     assert "阴影团聚" in ax.texts[0].get_text()
     assert "均匀度" in ax.texts[0].get_text()
+
+
+def test_draw_spatial_score_chart_relaxes_layout_for_explanatory_card(monkeypatch):
+    gui = _make_gui_stub()
+    gui.MODERN_COLORS = dict(CNTAnalyzerGUI.MODERN_COLORS)
+    gui._chart_dpi = 100
+    gui.analysis_panel = _DummyAnalysisPanel()
+    gui.analysis_panel.frames['score'] = _DummyChartFrame()
+
+    monkeypatch.setattr("src.gui.chart_manager.FigureCanvasTkAgg", _DummyChartCanvas)
+
+    stats = {
+        "count": 48,
+        "spatial_distribution": {
+            "grid_density_cv": 0.42,
+            "uniformity_scores": {"overall": 76.4, "confidence": "low"},
+        },
+    }
+    dispersed_stats = {
+        "dispersed_count": 31,
+        "agglomerated_count": 17,
+        "dispersed_ratio": 31 / 48,
+    }
+    framework = {
+        "uniformity": {"score": 76.4},
+        "thick_bundle": {"width_p90_um": 0.88},
+        "long_cnt": {"skeleton_length_mean_um": 12.5},
+        "agglomeration": {"agglomerated_area_ratio": 0.19},
+    }
+
+    gui._draw_spatial_score_chart(stats, dispersed_stats=dispersed_stats, framework=framework)
+
+    score_figure = gui._charts['score']['fig']
+    first_card_texts = score_figure.axes[0].texts
+    explanation_card_texts = score_figure.axes[5].texts
+
+    assert gui._charts['score']['canvas'].draw_calls == 1
+    assert explanation_card_texts[1].get_fontsize() < first_card_texts[1].get_fontsize()
+    assert explanation_card_texts[2].get_verticalalignment() == 'top'
+    assert explanation_card_texts[2].get_position()[1] < explanation_card_texts[1].get_position()[1]
 
 
 def test_update_advanced_analysis_clears_stale_charts_when_active_context_has_no_measurements():

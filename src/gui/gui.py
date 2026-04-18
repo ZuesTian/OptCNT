@@ -8,6 +8,7 @@ import inspect
 import os
 import sys
 import threading
+import textwrap
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -97,6 +98,7 @@ class CNTAnalyzerGUI:
     _prepare_comparison_display_image = bind_comparison_view_helpers.__globals__['_prepare_comparison_display_image']
     _configure_comparison_image_axis = bind_comparison_view_helpers.__globals__['_configure_comparison_image_axis']
     _estimate_comparison_summary_height = bind_comparison_view_helpers.__globals__['_estimate_comparison_summary_height']
+    _get_group_identity_labels = bind_comparison_view_helpers.__globals__['_get_group_identity_labels']
     _format_representative_caption = bind_comparison_view_helpers.__globals__['_format_representative_caption']
     _extract_group_core_metrics = bind_comparison_view_helpers.__globals__['_extract_group_core_metrics']
     _build_core_metric_conclusion = bind_comparison_view_helpers.__globals__['_build_core_metric_conclusion']
@@ -2042,6 +2044,14 @@ class CNTAnalyzerGUI:
             long_cnt.get('skeleton_length_mean_um', dispersed_length_mean),
             default=0.0,
         )
+        long_thick_count = self._safe_float(
+            long_cnt.get('long_thick_count', 0.0),
+            default=0.0,
+        )
+        long_thick_ratio = self._safe_float(
+            long_cnt.get('long_thick_ratio', 0.0),
+            default=0.0,
+        )
 
         return {
             'total_count': total_count,
@@ -2053,6 +2063,8 @@ class CNTAnalyzerGUI:
             'width_p90_um': width_p90_um,
             'uniformity_score': uniformity_score,
             'skeleton_length_mean_um': skeleton_length_mean_um,
+            'long_thick_count': long_thick_count,
+            'long_thick_ratio': long_thick_ratio,
             'dispersed_ratio_grade': self._grade_core_metric('dispersed_ratio', dispersed_ratio),
             'grid_density_cv_grade': self._grade_core_metric('grid_density_cv', grid_density_cv),
             'agglomerated_area_ratio_grade': self._grade_core_metric('agglomerated_area_ratio', agglomerated_area_ratio),
@@ -2419,6 +2431,50 @@ class CNTAnalyzerGUI:
         """初始化或获取图表对象"""
         return ensure_chart_manager(self).init_chart(key, figsize=figsize)
 
+    @staticmethod
+    def _wrap_score_card_text(text: str, width: int) -> str:
+        """Wrap score-card copy so longer guidance text stays readable."""
+        raw_lines = str(text or "").splitlines() or [""]
+        wrapped_lines = []
+        for raw_line in raw_lines:
+            line = raw_line.strip()
+            if not line:
+                wrapped_lines.append("")
+                continue
+            wrapped_lines.extend(
+                textwrap.wrap(
+                    line,
+                    width=max(8, int(width)),
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+                or [line]
+            )
+        return "\n".join(wrapped_lines)
+
+    @staticmethod
+    def _get_score_card_text_layout(detail_card: bool = False) -> dict:
+        """Return a compact layout for metric cards and a relaxed one for notes."""
+        if detail_card:
+            return {
+                'value_y': 0.72,
+                'value_fontsize': 9.6,
+                'subtitle_y': 0.44,
+                'subtitle_fontsize': 7.6,
+                'subtitle_va': 'top',
+                'subtitle_wrap_width': 21,
+                'value_wrap_width': 18,
+            }
+        return {
+            'value_y': 0.62,
+            'value_fontsize': 13.5,
+            'subtitle_y': 0.18,
+            'subtitle_fontsize': 8.2,
+            'subtitle_va': 'bottom',
+            'subtitle_wrap_width': 28,
+            'value_wrap_width': 16,
+        }
+
     def _draw_spatial_score_chart(self,
                                   stats: dict,
                                   dispersed_stats: Optional[dict] = None,
@@ -2485,6 +2541,7 @@ class CNTAnalyzerGUI:
                     ),
                     'grade': None,
                     'edge_color': self.MODERN_COLORS['border'],
+                    'detail_card': True,
                 },
             ]
 
@@ -2497,6 +2554,9 @@ class CNTAnalyzerGUI:
 
             for index, item in enumerate(card_items):
                 ax_card = fig.add_subplot(gs[index // 3, index % 3])
+                layout = self._get_score_card_text_layout(bool(item.get('detail_card')))
+                value_text = self._wrap_score_card_text(item['value'], width=layout['value_wrap_width'])
+                subtitle_text = self._wrap_score_card_text(item['subtitle'], width=layout['subtitle_wrap_width'])
                 ax_card.set_xticks([])
                 ax_card.set_yticks([])
                 ax_card.set_facecolor(self.MODERN_COLORS['bg_secondary'])
@@ -2529,14 +2589,15 @@ class CNTAnalyzerGUI:
                 )
                 ax_card.text(
                     0.06,
-                    0.62,
-                    item['value'],
+                    layout['value_y'],
+                    value_text,
                     transform=ax_card.transAxes,
                     ha='left',
                     va='top',
-                    fontsize=13.5 if index < 5 else 10.2,
+                    fontsize=layout['value_fontsize'],
                     color=self.MODERN_COLORS['text_primary'],
                     fontweight='bold',
+                    linespacing=1.18,
                 )
                 if item['grade']:
                     ax_card.text(
@@ -2552,14 +2613,15 @@ class CNTAnalyzerGUI:
                     )
                 ax_card.text(
                     0.06,
-                    0.18,
-                    item['subtitle'],
+                    layout['subtitle_y'],
+                    subtitle_text,
                     transform=ax_card.transAxes,
                     ha='left',
-                    va='bottom',
-                    fontsize=8.2,
-                    linespacing=1.28,
+                    va=layout['subtitle_va'],
+                    fontsize=layout['subtitle_fontsize'],
+                    linespacing=1.24,
                     color=self.MODERN_COLORS['text_secondary'],
+                    wrap=True,
                 )
 
             fig.tight_layout()
@@ -3760,7 +3822,52 @@ class CNTAnalyzerGUI:
         )
         return np.mean(np.stack(resized_grids, axis=0), axis=0)
 
-    def _summarize_group_results(self, group_label: str, results: List[dict]) -> dict:
+    def _resolve_group_role(self, role: Optional[str], label: Optional[str] = None) -> str:
+        """标准化组别角色。"""
+        normalized = str(role or "").strip().lower()
+        if normalized in {'base', 'control', 'baseline'}:
+            return 'base'
+        if normalized in {'experiment', 'exp', 'variant', 'treatment'}:
+            return 'experiment'
+        if normalized in {'left', 'right', 'generic'}:
+            return normalized
+
+        label_text = str(label or "").strip().lower()
+        if 'base' in label_text or '基准' in label_text or '对照' in label_text:
+            return 'base'
+        if '实验' in label_text or 'exp' in label_text or '试验' in label_text:
+            return 'experiment'
+        return 'generic'
+
+    def _get_group_role_display_name(self, role: Optional[str], fallback_label: Optional[str] = None) -> str:
+        """返回用于界面展示的组别角色名称。"""
+        normalized = self._resolve_group_role(role, fallback_label)
+        if normalized == 'base':
+            return 'base组'
+        if normalized == 'experiment':
+            return '实验组'
+        if normalized == 'left':
+            return '左侧对象'
+        if normalized == 'right':
+            return '右侧对象'
+        fallback = str(fallback_label or '').strip()
+        return fallback or '对象'
+
+    def _get_group_role_short_name(self, role: Optional[str], fallback_label: Optional[str] = None) -> str:
+        """返回用于紧凑标签的组别短名称。"""
+        normalized = self._resolve_group_role(role, fallback_label)
+        if normalized == 'base':
+            return 'base'
+        if normalized == 'experiment':
+            return '实验'
+        if normalized == 'left':
+            return '左侧'
+        if normalized == 'right':
+            return '右侧'
+        fallback = str(fallback_label or '').strip()
+        return fallback or '对象'
+
+    def _summarize_group_results(self, group_label: str, results: List[dict], group_role: Optional[str] = None) -> dict:
         """汇总一组图像的CNT统计结果"""
         count_values: List[float] = []
         dispersed_count_values: List[float] = []
@@ -3904,9 +4011,15 @@ class CNTAnalyzerGUI:
             })
 
         mean_density_grid = self._aggregate_group_density_grids(density_grids)
+        resolved_role = self._resolve_group_role(group_role, group_label)
+        role_display_name = self._get_group_role_display_name(resolved_role, group_label)
+        role_short_name = self._get_group_role_short_name(resolved_role, group_label)
 
         return {
             'label': group_label,
+            'role': resolved_role,
+            'role_display_name': role_display_name,
+            'role_short_name': role_short_name,
             'image_count': len(results),
             'results': results,
             'file_details': file_details,
@@ -4407,8 +4520,10 @@ class CNTAnalyzerGUI:
         metric_tests = [tests['shadow_aggregation_score'], tests['uniformity_score']]
         x = np.arange(len(metric_names))
         width = 0.34
-        base_metric_bars = ax.bar(x - width / 2, base_metric_means, width, label='base组', color=self.MODERN_COLORS['accent_rose'], alpha=0.95)
-        exp_metric_bars = ax.bar(x + width / 2, exp_metric_means, width, label='实验组', color=self.MODERN_COLORS['accent_teal'], alpha=0.82)
+        base_label = base_group.get('role_display_name') or base_group.get('label', 'base组')
+        exp_label = exp_group.get('role_display_name') or exp_group.get('label', '实验组')
+        base_metric_bars = ax.bar(x - width / 2, base_metric_means, width, label=base_label, color=self.MODERN_COLORS['accent_rose'], alpha=0.95)
+        exp_metric_bars = ax.bar(x + width / 2, exp_metric_means, width, label=exp_label, color=self.MODERN_COLORS['accent_teal'], alpha=0.82)
         ax.set_xticks(x)
         ax.set_xticklabels(metric_names)
         ax.set_ylabel('得分 (0-100)', color=self.MODERN_COLORS['text_secondary'])
@@ -4441,7 +4556,14 @@ class CNTAnalyzerGUI:
         exp_counts = self._get_group_detail_series(exp_group, 'count')
         base_names = [self._shorten_distribution_label(detail['name']) for detail in base_group.get('file_details', [])]
         exp_names = [self._shorten_distribution_label(detail['name']) for detail in exp_group.get('file_details', [])]
-        labels = ['base组', '实验组']
+        labels = [
+            base_group.get('role_display_name') or base_group.get('label', 'base组'),
+            exp_group.get('role_display_name') or exp_group.get('label', '实验组'),
+        ]
+        short_labels = [
+            base_group.get('role_short_name') or base_group.get('role_display_name') or base_group.get('label', 'base'),
+            exp_group.get('role_short_name') or exp_group.get('role_display_name') or exp_group.get('label', '实验'),
+        ]
         colors = [self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']]
         min_samples = min(len(base_counts), len(exp_counts)) if base_counts and exp_counts else 0
 
@@ -4462,7 +4584,7 @@ class CNTAnalyzerGUI:
             ax_box.text(1.5, max_count * 1.08 if max_count > 0 else 0.5, f"每组仅 {min_samples} 张图，已切换为单点概览 | {self._format_compact_significance(count_tests)}", ha='center', va='bottom', fontsize=8.5, color=self.MODERN_COLORS['text_primary'])
             ax_box.set_ylim(0, max_count * 1.22 if max_count > 0 else 1.0)
 
-            detail_labels = [f"base | {name}" for name in base_names] + [f"实验 | {name}" for name in exp_names]
+            detail_labels = [f"{short_labels[0]} | {name}" for name in base_names] + [f"{short_labels[1]} | {name}" for name in exp_names]
             detail_counts = base_counts + exp_counts
             detail_colors = [colors[0]] * len(base_counts) + [colors[1]] * len(exp_counts)
             positions = np.arange(len(detail_counts))
@@ -4493,23 +4615,37 @@ class CNTAnalyzerGUI:
         base_x = np.arange(1, len(base_counts) + 1)
         exp_x = np.arange(1, len(exp_counts) + 1)
         if max(len(base_counts), len(exp_counts)) <= 3:
-            ax_detail.scatter(base_x, base_counts, s=42, color=colors[0], label='base组', zorder=3)
-            ax_detail.scatter(exp_x, exp_counts, s=42, color=colors[1], label='实验组', zorder=3)
+            ax_detail.scatter(base_x, base_counts, s=42, color=colors[0], label=labels[0], zorder=3)
+            ax_detail.scatter(exp_x, exp_counts, s=42, color=colors[1], label=labels[1], zorder=3)
             ax_detail.set_title('组内逐图CNT样本点', color=self.MODERN_COLORS['text_primary'])
         else:
-            ax_detail.plot(base_x, base_counts, marker='o', linewidth=1.8, color=colors[0], label='base组')
-            ax_detail.plot(exp_x, exp_counts, marker='o', linewidth=1.8, color=colors[1], label='实验组')
+            ax_detail.plot(base_x, base_counts, marker='o', linewidth=1.8, color=colors[0], label=labels[0])
+            ax_detail.plot(exp_x, exp_counts, marker='o', linewidth=1.8, color=colors[1], label=labels[1])
             ax_detail.set_title('组内逐图CNT趋势', color=self.MODERN_COLORS['text_primary'])
         ax_detail.set_xlabel('组内图像序号', color=self.MODERN_COLORS['text_secondary'])
         ax_detail.set_ylabel('CNT数量', color=self.MODERN_COLORS['text_secondary'])
         ax_detail.legend(frameon=False)
         ax_detail.grid(True, alpha=0.25, linestyle='--')
 
-    def _get_comparison_palette(self, left_label: str, right_label: str) -> Tuple[str, str]:
-        """根据对比对象标签返回更符合语义的配色。"""
+    def _get_comparison_palette(self,
+                                left_label: str,
+                                right_label: str,
+                                left_role: Optional[str] = None,
+                                right_role: Optional[str] = None) -> Tuple[str, str]:
+        """根据对比对象角色返回更符合语义的配色。"""
+        resolved_left_role = self._resolve_group_role(left_role, left_label)
+        resolved_right_role = self._resolve_group_role(right_role, right_label)
+
+        if resolved_left_role == 'base' and resolved_right_role == 'experiment':
+            return self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']
+        if resolved_left_role == 'experiment' and resolved_right_role == 'base':
+            return self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']
+        if resolved_left_role == 'left' and resolved_right_role == 'right':
+            return self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']
+
         left_key = (left_label or "").lower()
         right_key = (right_label or "").lower()
-        if "base" in left_key or "实验" in right_label or "exp" in right_key:
+        if "base" in left_key or "实验" in right_key or "exp" in right_key:
             return self.MODERN_COLORS['accent_rose'], self.MODERN_COLORS['accent_teal']
         return self.MODERN_COLORS['accent_teal'], self.MODERN_COLORS['accent_rose']
 
@@ -4524,11 +4660,16 @@ class CNTAnalyzerGUI:
                                    scale: float = 1.0,
                                    test_result: Optional[dict] = None) -> None:
         """绘制双对象分散指标柱状图。"""
-        left_label = left_group.get('label', '对象A')
-        right_label = right_group.get('label', '对象B')
+        left_label = left_group.get('role_display_name') or left_group.get('label', '对象A')
+        right_label = right_group.get('role_display_name') or right_group.get('label', '对象B')
         left_stats = left_group.get(stats_key, self._summarize_numeric_series([]))
         right_stats = right_group.get(stats_key, self._summarize_numeric_series([]))
-        left_color, right_color = self._get_comparison_palette(left_label, right_label)
+        left_color, right_color = self._get_comparison_palette(
+            left_label,
+            right_label,
+            left_group.get('role'),
+            right_group.get('role'),
+        )
 
         values = [float(left_stats.get('mean', 0.0)) * scale, float(right_stats.get('mean', 0.0)) * scale]
         errors = [float(left_stats.get('std', 0.0)) * scale, float(right_stats.get('std', 0.0)) * scale]
@@ -4621,7 +4762,7 @@ class CNTAnalyzerGUI:
 
     def _format_group_detail_lines(self, group_summary: dict) -> List[str]:
         """生成精简版逐图明细。"""
-        lines = [f"{group_summary['label']}逐图明细:"]
+        lines = [f"{group_summary.get('role_display_name') or group_summary['label']}逐图明细:"]
         for detail in group_summary.get('file_details', []):
             lines.append(
                 f"  - {detail['name']}: 总CNT={detail.get('count', 0.0):.0f} | 分散CNT={detail.get('dispersed_count', 0.0):.0f} | "
@@ -4708,7 +4849,7 @@ class CNTAnalyzerGUI:
             ),
             (
                 "组别统计对比",
-                "分别选择 base 组和实验组的多张图，输出分散CNT数量、分散比例、显著性检验和典型分布。",
+                "分别选择 base组（基准参考） 和实验组（实验候选）的多张图，输出分散CNT数量、分散比例、显著性检验和典型分布。",
                 "选择两组图",
                 self._compare_image_groups,
             ),
@@ -4791,7 +4932,7 @@ class CNTAnalyzerGUI:
             return (
                 "本次组别对比使用当前界面的预处理与识别参数，"
                 "并仅分析中部 75% 区域以避开比例尺区域干扰；"
-                "第一组按 base组 统计，第二组按 实验组 统计。"
+                "第一组按 base组（基准参考）统计，第二组按 实验组（实验候选）统计。"
             )
         return (
             "本次双图对比使用当前界面的预处理与识别参数，"
@@ -4840,8 +4981,8 @@ class CNTAnalyzerGUI:
             report(total_images, total_images, "分析完成")
             return {
                 'mode': 'group',
-                'base_group': self._summarize_group_results("base组", base_results),
-                'exp_group': self._summarize_group_results("实验组", exp_results),
+                'base_group': self._summarize_group_results("base组", base_results, group_role='base'),
+                'exp_group': self._summarize_group_results("实验组", exp_results, group_role='experiment'),
                 'failures': base_failures + exp_failures,
                 'note': self._build_compare_note('group'),
             }

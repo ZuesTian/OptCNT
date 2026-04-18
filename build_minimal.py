@@ -9,9 +9,11 @@ Key goals:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import urllib.request
 import zipfile
@@ -26,7 +28,7 @@ TOOLS_DIR = ROOT_DIR / ".tools"
 UPX_DIR = TOOLS_DIR / "upx"
 LOCAL_UPX_GLOB = "upx*"
 
-EXCLUDE_MODULES = [
+BASE_EXCLUDE_MODULES = [
     "Cython",
     "IPython",
     "PyQt5",
@@ -39,7 +41,6 @@ EXCLUDE_MODULES = [
     "idlelib",
     "jupyter",
     "lib2to3",
-    "llvmlite",
     "matplotlib.backends.backend_gtk3",
     "matplotlib.backends.backend_gtk3agg",
     "matplotlib.backends.backend_gtk4",
@@ -55,7 +56,6 @@ EXCLUDE_MODULES = [
     "matplotlib.tests",
     "mpl_toolkits.tests",
     "notebook",
-    "numba",
     "numpy.random._examples",
     "pandas",
     "pip",
@@ -76,6 +76,19 @@ EXCLUDE_MODULES = [
     "wheel",
 ]
 
+PERFORMANCE_TRIM_ONLY_MODULES = [
+    "llvmlite.tests",
+    "llvmlite.binding.tests",
+    "numba.tests",
+    "numba.cuda.tests",
+    "numba.misc.numba_sysinfo",
+]
+
+SLIM_EXCLUDE_MODULES = [
+    "llvmlite",
+    "numba",
+]
+
 HIDDEN_IMPORTS = [
     "cv2.ximgproc",
     "matplotlib.backends._backend_tk",
@@ -87,6 +100,10 @@ HIDDEN_IMPORTS = [
 UPX_EXCLUDES = [
     "_uuid.pyd",
     "python3.dll",
+]
+
+FINAL_UPX_ARGS = [
+    "--best",
 ]
 
 
@@ -202,13 +219,50 @@ def ensure_upx() -> Path:
     return download_upx()
 
 
-def build_minimal() -> Path:
-    """Build the smallest practical OptCNT GUI executable."""
+def compress_executable_with_upx(upx_exe: Path, exe_path: Path) -> None:
+    """Shrink the final onefile executable without changing runtime behavior."""
+    command = [str(upx_exe), *FINAL_UPX_ARGS, str(exe_path)]
+    _print(f"Running final UPX pass: {' '.join(command)}")
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    combined_output = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )
+    if "GUARD_CF enabled PE files are not supported" in combined_output:
+        _print("Skipping final EXE UPX pass because the PyInstaller bootloader is GUARD_CF protected.")
+        return
+
+    if combined_output:
+        _print(combined_output)
+    raise subprocess.CalledProcessError(
+        result.returncode,
+        command,
+        output=result.stdout,
+        stderr=result.stderr,
+    )
+
+
+def resolve_build_profile(profile: str) -> tuple[list[str], list[str]]:
+    """Return excluded and trim-only modules for the chosen packaging profile."""
+    normalized = str(profile or "slim").strip().lower()
+    if normalized == "performance":
+        return list(BASE_EXCLUDE_MODULES), list(PERFORMANCE_TRIM_ONLY_MODULES)
+    if normalized == "slim":
+        return list(BASE_EXCLUDE_MODULES) + list(SLIM_EXCLUDE_MODULES), []
+    raise ValueError(f"Unsupported build profile: {profile}")
+
+
+def build_minimal(profile: str = "slim") -> Path:
+    """Build OptCNT with either a slim or performance-focused packaging profile."""
     if not running_in_virtualenv():
         _print("Warning: build_minimal.py is designed to run inside a dedicated virtual environment.")
 
     clean_build_dirs()
     upx_exe = ensure_upx()
+    exclude_modules, trim_only_modules = resolve_build_profile(profile)
+    _print(f"Using packaging profile: {profile}")
 
     args = [
         "main.py",
@@ -225,7 +279,10 @@ def build_minimal() -> Path:
     if os.name != "nt":
         args.append("--strip")
 
-    for module_name in EXCLUDE_MODULES:
+    for module_name in exclude_modules:
+        args.append(f"--exclude-module={module_name}")
+
+    for module_name in trim_only_modules:
         args.append(f"--exclude-module={module_name}")
 
     for module_name in HIDDEN_IMPORTS:
@@ -242,6 +299,8 @@ def build_minimal() -> Path:
     if not exe_path.exists():
         raise FileNotFoundError(f"Build finished without producing {exe_path}")
 
+    compress_executable_with_upx(upx_exe, exe_path)
+
     size_mb = exe_path.stat().st_size / (1024 * 1024)
     _print(f"Build completed: {exe_path}")
     _print(f"Executable size: {size_mb:.2f} MB")
@@ -254,5 +313,17 @@ def build_minimal() -> Path:
     return exe_path
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build a Windows OptCNT executable.")
+    parser.add_argument(
+        "--profile",
+        choices=("slim", "performance"),
+        default=os.environ.get("OPTCNT_BUILD_PROFILE", "slim"),
+        help="Packaging profile. 'slim' targets the smallest executable; 'performance' keeps numba/llvmlite.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    build_minimal()
+    cli_args = parse_args()
+    build_minimal(profile=cli_args.profile)

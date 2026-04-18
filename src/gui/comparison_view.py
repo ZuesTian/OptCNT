@@ -235,6 +235,19 @@ def _estimate_comparison_summary_height(self, summary_text: str) -> int:
     return self._scale_px(logical_height)
 
 
+def _get_group_identity_labels(self, group_summary: dict) -> tuple[str, str]:
+    """返回组别的主展示名和副标题。"""
+    role_display_name = group_summary.get('role_display_name') or group_summary.get('label') or '对象'
+    role = group_summary.get('role')
+    if role == 'base':
+        subtitle = '基准参考'
+    elif role == 'experiment':
+        subtitle = '实验候选'
+    else:
+        subtitle = ''
+    return role_display_name, subtitle
+
+
 def _format_representative_caption(self, group_summary: dict, representative_result: dict) -> str:
     """生成代表图标题，统一到五指标口径。"""
     framework = self._get_result_evaluation_framework(representative_result)
@@ -243,11 +256,14 @@ def _format_representative_caption(self, group_summary: dict, representative_res
         representative_result.get('dispersed_stats'),
         framework,
     )
+    role_display_name, subtitle = self._get_group_identity_labels(group_summary)
+    title = role_display_name if not subtitle else f"{role_display_name}（{subtitle}）"
     return (
-        f"{group_summary.get('label', '对象')}典型结果\n"
+        f"{title}典型结果\n"
         f"{representative_result.get('name', '未命名图像')}\n"
         f"总CNT={core_metrics['total_count']} | 分散比例={core_metrics['dispersed_ratio']:.1%} | "
-        f"网格CV={core_metrics['grid_density_cv']:.2f}"
+        f"网格CV={core_metrics['grid_density_cv']:.2f} | P90宽度={core_metrics['width_p90_um']:.2f}μm\n"
+        f"平均骨架长度={core_metrics['skeleton_length_mean_um']:.1f}μm | 长粗管占比={core_metrics.get('long_thick_ratio', 0.0):.1%}"
     )
 
 
@@ -263,6 +279,8 @@ def _extract_group_core_metrics(self, group_summary: dict) -> dict:
         'width_p90_um': float((group_summary.get('width_p90_um_stats') or {}).get('mean', 0.0) or 0.0),
         'uniformity_score': float((group_summary.get('uniformity_score_stats') or {}).get('mean', 0.0) or 0.0),
         'skeleton_length_mean_um': float((group_summary.get('skeleton_length_mean_stats') or {}).get('mean', 0.0) or 0.0),
+        'long_thick_count': float((group_summary.get('long_thick_count_stats') or {}).get('mean', 0.0) or 0.0),
+        'long_thick_ratio': float((group_summary.get('long_thick_ratio_stats') or {}).get('mean', 0.0) or 0.0),
     }
 
 
@@ -279,6 +297,8 @@ def _build_core_metric_conclusion(
     grid_gap = float(left_metrics.get('grid_density_cv', 0.0)) - float(right_metrics.get('grid_density_cv', 0.0))
     area_gap = float(left_metrics.get('agglomerated_area_ratio', 0.0)) - float(right_metrics.get('agglomerated_area_ratio', 0.0))
     width_gap = float(left_metrics.get('width_p90_um', 0.0)) - float(right_metrics.get('width_p90_um', 0.0))
+    length_gap = float(left_metrics.get('skeleton_length_mean_um', 0.0)) - float(right_metrics.get('skeleton_length_mean_um', 0.0))
+    long_thick_gap = float(left_metrics.get('long_thick_ratio', 0.0)) - float(right_metrics.get('long_thick_ratio', 0.0))
 
     left_spatial_better = (
         (grid_gap <= -0.05 and area_gap <= -0.03) or
@@ -294,9 +314,41 @@ def _build_core_metric_conclusion(
     right_dispersion_better = ratio_gap <= -0.05
     left_bundle_better = width_gap <= -0.12
     right_bundle_better = width_gap >= 0.12
+    left_longer_or_thicker = width_gap >= 0.12 or length_gap >= 1.8 or long_thick_gap >= 0.08
+    right_longer_or_thicker = width_gap <= -0.12 or length_gap <= -1.8 or long_thick_gap <= -0.08
     significant_spatial = bool(tests) and (
         self._is_test_significant((tests or {}).get('grid_density_cv')) or
         self._is_test_significant((tests or {}).get('agglomerated_area_ratio'))
+    )
+    significant_structure = bool(tests) and (
+        self._is_test_significant((tests or {}).get('width_p90_um')) or
+        self._is_test_significant((tests or {}).get('skeleton_length_mean_um')) or
+        self._is_test_significant((tests or {}).get('long_thick_ratio'))
+    )
+
+    def structure_phrase(label: str, *, wider: bool, longer: bool, long_thick: bool) -> str:
+        traits = []
+        if wider:
+            traits.append("P90宽度更高")
+        if longer:
+            traits.append("平均骨架长度更长")
+        if long_thick:
+            traits.append("长粗管占比更高")
+        if not traits:
+            return ""
+        return f"{label}同时表现为" + "、".join(traits) + "。"
+
+    left_structure = structure_phrase(
+        left_label,
+        wider=width_gap >= 0.12,
+        longer=length_gap >= 1.8,
+        long_thick=long_thick_gap >= 0.08,
+    )
+    right_structure = structure_phrase(
+        right_label,
+        wider=width_gap <= -0.12,
+        longer=length_gap <= -1.8,
+        long_thick=long_thick_gap <= -0.08,
     )
 
     if left_spatial_better:
@@ -305,8 +357,14 @@ def _build_core_metric_conclusion(
             conclusion += f" 同时 {left_label} 的分散比例也更高。"
         if left_bundle_better:
             conclusion += " P90宽度更低，束化尾部更轻。"
+        if right_structure:
+            conclusion += f" {right_structure}"
+        elif left_structure:
+            conclusion += f" {left_structure}"
         if tests and not significant_spatial:
             conclusion += " 当前更适合作为趋势判断。"
+        if tests and significant_structure and right_longer_or_thicker:
+            conclusion += f" 结构差异也有统计学支持，更符合肉眼观察到的“{right_label}更长更粗”。"
         return conclusion
 
     if right_spatial_better:
@@ -315,18 +373,40 @@ def _build_core_metric_conclusion(
             conclusion += f" 同时 {right_label} 的分散比例也更高。"
         if right_bundle_better:
             conclusion += " P90宽度更低，束化尾部更轻。"
+        if left_structure:
+            conclusion += f" {left_structure}"
+        elif right_structure:
+            conclusion += f" {right_structure}"
         if tests and not significant_spatial:
             conclusion += " 当前更适合作为趋势判断。"
+        if tests and significant_structure and left_longer_or_thicker:
+            conclusion += f" 结构差异也有统计学支持，更符合肉眼观察到的“{left_label}更长更粗”。"
         return conclusion
 
     if left_dispersion_better:
-        return f"结论: {left_label}分散比例更高，但空间维度差异有限；数量多，不等于分布均匀。"
+        conclusion = f"结论: {left_label}分散比例更高，但空间维度差异有限；数量多，不等于分布均匀。"
+        if right_structure:
+            conclusion += f" {right_structure}"
+        return conclusion
     if right_dispersion_better:
-        return f"结论: {right_label}分散比例更高，但空间维度差异有限；数量多，不等于分布均匀。"
+        conclusion = f"结论: {right_label}分散比例更高，但空间维度差异有限；数量多，不等于分布均匀。"
+        if left_structure:
+            conclusion += f" {left_structure}"
+        return conclusion
     if left_bundle_better:
-        return f"结论: 两者空间维度接近，但 {left_label} 的P90宽度更低，束化尾部略轻。"
+        conclusion = f"结论: 两者空间维度接近，但 {left_label} 的P90宽度更低，束化尾部略轻。"
+        if right_structure:
+            conclusion += f" {right_structure}"
+        return conclusion
     if right_bundle_better:
-        return f"结论: 两者空间维度接近，但 {right_label} 的P90宽度更低，束化尾部略轻。"
+        conclusion = f"结论: 两者空间维度接近，但 {right_label} 的P90宽度更低，束化尾部略轻。"
+        if left_structure:
+            conclusion += f" {left_structure}"
+        return conclusion
+    if left_structure:
+        return f"结论: 两者空间维度接近，但 {left_structure}"
+    if right_structure:
+        return f"结论: 两者空间维度接近，但 {right_structure}"
     return "结论: 两者在五个固定指标上接近，建议继续以网格CV和团聚面积占比作为主判断。"
 
 
@@ -340,6 +420,14 @@ def _format_group_comparison_summary(
     """生成按五指标统一口径的组别对比摘要。"""
     base_count = base_group['count_stats']
     exp_count = exp_group['count_stats']
+    base_display_name, base_subtitle = self._get_group_identity_labels(base_group)
+    exp_display_name, exp_subtitle = self._get_group_identity_labels(exp_group)
+    role_line = f"对比角色: {base_display_name}"
+    if base_subtitle:
+        role_line += f"（{base_subtitle}）"
+    role_line += f" vs {exp_display_name}"
+    if exp_subtitle:
+        role_line += f"（{exp_subtitle}）"
     base_core = self._extract_group_core_metrics(base_group)
     exp_core = self._extract_group_core_metrics(exp_group)
     compare_context = self._get_compare_display_context(
@@ -347,7 +435,7 @@ def _format_group_comparison_summary(
         *(exp_group.get('results') or []),
     )
     tests = self._compute_group_comparison_tests(base_group, exp_group)
-    conclusion = self._build_core_metric_conclusion('base组', base_core, '实验组', exp_core, tests=tests)
+    conclusion = self._build_core_metric_conclusion(base_display_name, base_core, exp_display_name, exp_core, tests=tests)
 
     lines: List[str] = []
     if note:
@@ -355,13 +443,14 @@ def _format_group_comparison_summary(
 
     lines.extend([
         self._format_compare_fixed_params(compare_context),
+        role_line,
         "",
         "固定输出（5项）",
         self._format_metric_comparison(
             '总CNT数量',
-            'base',
+            base_display_name,
             base_count['mean'],
-            '实验',
+            exp_display_name,
             exp_count['mean'],
             direction='up',
             qualifier='每图均值',
@@ -372,9 +461,9 @@ def _format_group_comparison_summary(
         ),
         self._format_metric_comparison(
             '分散比例',
-            'base',
+            base_display_name,
             base_core['dispersed_ratio'] * 100.0,
-            '实验',
+            exp_display_name,
             exp_core['dispersed_ratio'] * 100.0,
             direction='up',
             qualifier='数量维度(%)',
@@ -385,9 +474,9 @@ def _format_group_comparison_summary(
         ),
         self._format_metric_comparison(
             '网格CV',
-            'base',
+            base_display_name,
             base_core['grid_density_cv'],
-            '实验',
+            exp_display_name,
             exp_core['grid_density_cv'],
             direction='down',
             qualifier='空间维度，越小越均匀',
@@ -398,9 +487,9 @@ def _format_group_comparison_summary(
         ),
         self._format_metric_comparison(
             '团聚面积占比',
-            'base',
+            base_display_name,
             base_core['agglomerated_area_ratio'] * 100.0,
-            '实验',
+            exp_display_name,
             exp_core['agglomerated_area_ratio'] * 100.0,
             direction='down',
             qualifier='空间维度(%)',
@@ -411,9 +500,9 @@ def _format_group_comparison_summary(
         ),
         self._format_metric_comparison(
             'P90宽度',
-            'base',
+            base_display_name,
             base_core['width_p90_um'],
-            '实验',
+            exp_display_name,
             exp_core['width_p90_um'],
             direction='down',
             qualifier='束化尾部指标(μm)',
@@ -422,12 +511,25 @@ def _format_group_comparison_summary(
             right_std=(exp_group.get('width_p90_um_stats') or {}).get('std'),
             test_result=tests.get('width_p90_um'),
         ),
+        self._format_metric_comparison(
+            '长粗管占比',
+            base_display_name,
+            base_core['long_thick_ratio'] * 100.0,
+            exp_display_name,
+            exp_core['long_thick_ratio'] * 100.0,
+            direction='down',
+            qualifier='长粗管结构风险(%)，越低越好',
+            precision=1,
+            left_std=(base_group.get('long_thick_ratio_stats') or {}).get('std', 0.0) * 100.0,
+            right_std=(exp_group.get('long_thick_ratio_stats') or {}).get('std', 0.0) * 100.0,
+            test_result=tests.get('long_thick_ratio'),
+        ),
         "",
         "数量与空间分开解读",
         "数量多，不等于分布均匀；因此分别用分散比例评价分散程度，用网格CV评价空间均匀性。",
     ])
     lines.extend(self._format_dispersion_summary_lines(
-        'base',
+        base_display_name,
         base_core['total_count'],
         base_core['dispersed_count'],
         base_core['agglomerated_count'],
@@ -439,7 +541,7 @@ def _format_group_comparison_summary(
         uniformity_score=base_core['uniformity_score'],
     ))
     lines.extend(self._format_dispersion_summary_lines(
-        '实验',
+        exp_display_name,
         exp_core['total_count'],
         exp_core['dispersed_count'],
         exp_core['agglomerated_count'],
@@ -455,9 +557,9 @@ def _format_group_comparison_summary(
         "补充指标",
         self._format_metric_comparison(
             '平均骨架长度',
-            'base',
+            base_display_name,
             base_core['skeleton_length_mean_um'],
-            '实验',
+            exp_display_name,
             exp_core['skeleton_length_mean_um'],
             direction='up',
             qualifier='补充长度指标(μm)',
@@ -467,10 +569,23 @@ def _format_group_comparison_summary(
             test_result=tests.get('skeleton_length_mean_um'),
         ),
         self._format_metric_comparison(
+            '长粗管数量',
+            base_display_name,
+            base_core['long_thick_count'],
+            exp_display_name,
+            exp_core['long_thick_count'],
+            direction='down',
+            qualifier='长粗管绝对数量，越低越好',
+            precision=1,
+            left_std=(base_group.get('long_thick_count_stats') or {}).get('std'),
+            right_std=(exp_group.get('long_thick_count_stats') or {}).get('std'),
+            test_result=tests.get('long_thick_count'),
+        ),
+        self._format_metric_comparison(
             '综合均匀性得分',
-            'base',
+            base_display_name,
             base_core['uniformity_score'],
-            '实验',
+            exp_display_name,
             exp_core['uniformity_score'],
             direction='up',
             qualifier='仅展示层，不作为主结论',
@@ -569,6 +684,16 @@ def _format_comparison_summary(
             qualifier='束化尾部指标(μm)',
             precision=2,
         ),
+        self._format_metric_comparison(
+            '长粗管占比',
+            left_label,
+            left_core.get('long_thick_ratio', 0.0) * 100.0,
+            right_label,
+            right_core.get('long_thick_ratio', 0.0) * 100.0,
+            direction='down',
+            qualifier='长粗管结构风险(%)，越低越好',
+            precision=1,
+        ),
         "",
         "数量与空间分开解读",
         "数量多，不等于分布均匀；因此分别用分散比例评价分散程度，用网格CV评价空间均匀性。",
@@ -608,6 +733,16 @@ def _format_comparison_summary(
             right_core['skeleton_length_mean_um'],
             direction='up',
             qualifier='补充长度指标(μm)',
+            precision=1,
+        ),
+        self._format_metric_comparison(
+            '长粗管数量',
+            left_label,
+            left_core.get('long_thick_count', 0.0),
+            right_label,
+            right_core.get('long_thick_count', 0.0),
+            direction='down',
+            qualifier='长粗管绝对数量，越低越好',
             precision=1,
         ),
         self._format_metric_comparison(
@@ -765,8 +900,8 @@ def _show_comparison_window(
     left_result = self._ensure_result_visualization(left_result)
     right_result = self._ensure_result_visualization(right_result)
     summary_text = self._format_comparison_summary(left_result, right_result, left_label, right_label, note)
-    left_group = self._summarize_group_results(left_label, [left_result])
-    right_group = self._summarize_group_results(right_label, [right_result])
+    left_group = self._summarize_group_results(left_label, [left_result], group_role='left')
+    right_group = self._summarize_group_results(right_label, [right_result], group_role='right')
     tests = self._compute_group_comparison_tests(left_group, right_group)
     self._render_dispersion_comparison_dashboard(left_group, right_group, summary_text, tests)
 
@@ -794,6 +929,7 @@ _COMPARISON_VIEW_METHODS = {
     '_prepare_comparison_display_image': _prepare_comparison_display_image,
     '_configure_comparison_image_axis': _configure_comparison_image_axis,
     '_estimate_comparison_summary_height': _estimate_comparison_summary_height,
+    '_get_group_identity_labels': _get_group_identity_labels,
     '_format_representative_caption': _format_representative_caption,
     '_extract_group_core_metrics': _extract_group_core_metrics,
     '_build_core_metric_conclusion': _build_core_metric_conclusion,

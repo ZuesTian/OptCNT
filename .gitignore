@@ -11,9 +11,11 @@ dist/
 .eggs/
 *.whl
 .venv/
+.venv-build/
 venv/
 env/
 .env
+.tools/
 *.log
 .idea/
 .vscode/
