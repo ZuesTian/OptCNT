@@ -33,9 +33,11 @@ python main.py
 
 ### 单图分析
 
-- 结果表格默认一行对应一根 CNT
-- 结果表格包含 `ID`、`Length (um)`、`Dispersed CNT`、`Agglomerated CNT`
-- 结果面板会显示长度统计、空间分布、均匀度和评判框架摘要
+- 支持 CNT 检测、长度 / 宽度 / 长宽比测量
+- 支持分散 CNT / 团聚 CNT 统计
+- 支持骨架、轮廓、检测结果和空间分布可视化
+- 结果表格默认一行对应一根 CNT，包含 ID、Length (μm)、Dispersed CNT、Agglomerated CNT
+- 结果面板显示长度统计、空间分布、均匀度和评判框架摘要
 
 ### 对比分析
 
@@ -43,105 +45,108 @@ python main.py
 - 默认分析图像中部 `75%` 区域，尽量减小比例尺区域干扰
 - 对比分析在后台执行，适合连续多次调参与复核
 - 对比摘要会显示本次分析实际使用的参数快照
+- 组图对比会显式区分 `base组（基准参考）` 与 `实验组（实验候选）`，并在摘要、图表、代表图中保持一致命名和固定配色
+- 组图对比的主结论只围绕固定 `5` 项主指标展开：`总CNT数量`、`分散比例`、`网格CV`、`团聚面积占比`、`P90宽度`
+- `平均骨架长度` 与 `综合均匀性得分` 作为补充展示项保留，但不作为组间主结论的核心判定依据
+- 对比逻辑明确区分"数量"和"空间"两个维度：数量多不等于分布均匀，分散比例用于评价分散程度，网格CV用于评价空间均匀性
 
 ## 核心算法与数学模型
 
-本系统不仅提供图像的可视化分析，更内置了一套严谨的数学评价体系，以科学量化碳纳米管（CNT）的分布特征。以下是核心算法及指标的公式说明：
+### 1. 骨架提取与长度测量
 
-### 1. 骨架提取与长度测量 (Skeleton & Length)
+**骨架化 (Skeletonization)**：基于形态学细化算法（Zhang-Suen 算法），提取 CNT 连通域的单像素中心轴。
 
-- **骨架化 (Skeletonization)**：基于形态学细化算法（如 `cv2.ximgproc.thinning` 中的 Zhang-Suen 算法），提取 CNT 连通域的单像素中心轴。
-- **物理长度 (Physical Length)**：将骨架像素转化为无向图 $G(V, E)$，利用图遍历算法寻找图的直径（Diameter，即图中最长简单路径）作为 CNT 的实际物理长度，避免了简单周长法对复杂拓扑的高估。
+**物理长度 (Physical Length)**：将骨架像素转化为无向图 G(V, E)，利用图遍历算法寻找图的直径（Diameter，即图中最长简单路径）作为 CNT 的实际物理长度，避免了简单周长法对复杂拓扑的高估。
 
-### 2. 空间分布均匀性得分 (Uniformity Score)
+### 2. 空间分布均匀性得分
 
-传统的变异系数（CV）仅能反映单一维度的离散程度。系统采用多维度特征融合，并通过 Sigmoid 函数映射统一方向（0-100分，分数越高越均匀）：
+系统采用多维度特征融合，并通过 Sigmoid 函数映射统一方向（0-100分，分数越高越均匀）：
 
-$$
-S_{base} = w_{NN} \cdot S_{sig}(CV_{NN}) + w_{Grid} \cdot S_{sig}(CV_{Grid}) + w_{Moran} \cdot S_{moran}(I)
-$$
+```
+S_base = w_NN · S_sig(CV_NN) + w_Grid · S_sig(CV_Grid) + w_Moran · S_moran(I)
+```
 
 其中：
-- **$CV_{NN}$ (最近邻距离CV)**：反映个体间的局部排斥程度。
-- **$CV_{Grid}$ (网格密度CV)**：反映宏观上的空间占据均匀度。
-- **$I$ (Moran's I 莫兰指数)**：反映空间自相关性（聚集或离散）。
+- `CV_NN`：最近邻距离 CV，反映个体间的局部排斥程度
+- `CV_Grid`：网格密度 CV，反映宏观上的空间占据均匀度
+- `I`：Moran's I 莫兰指数，反映空间自相关性（聚集或离散）
 
-**映射函数：**
-对于“越小越好”的 CV 类指标，采用缩放的 Sigmoid 函数（参数 $k=4.0, m=0.6$）：
-$$ S_{sig}(x) = \frac{100}{1 + \exp\left(k \cdot \frac{x - m}{m}\right)} $$
-对于 Moran's I，映射中心偏移至随机分布点：
-$$ S_{moran}(I) = \frac{100}{1 + \exp(5.0 \cdot (I - 0.1))} $$
+**映射函数**：
+- 对于"越小越好"的 CV 类指标：`S_sig(x) = 100 / (1 + exp(k · (x - m) / m))`，其中 k=4.0, m=0.6
+- 对于 Moran's I：`S_moran(I) = 100 / (1 + exp(5.0 · (I - 0.1)))`
 
-**长管非线性惩罚 (Long Tube Penalty)：**
-大量超长 CNT 的存在会破坏宏观均匀性。系统引入针对 $>40\mu m$ 长管比例 $r$ 的幂次放大惩罚（指数 $exp=0.6$，最高扣减 $P_{max}=25.0$）：
-$$ Penalty = P_{max} \cdot \min(1.0, r)^{0.6} $$
+**长管非线性惩罚**：大量超长 CNT（>40μm）的存在会破坏宏观均匀性，引入幂次放大惩罚：`Penalty = P_max · min(1.0, r)^0.6`，最高扣减 25 分。
 
-最终均匀度主指标得分：
-$$ Score_{uniformity} = \max(0, S_{base} - Penalty) $$
+**最终均匀度**：`Score_uniformity = max(0, S_base - Penalty)`
 
-### 3. 四维评判框架与混合评分 (Hybrid Evaluation Framework)
+### 3. 四维评判框架与混合评分
 
-为了全面评估 CNT 样品的质量，系统构建了四个独立维度的评价框架，并合成最终的**混合评分 (Hybrid Score)**。混合评分位于 $[0, 100]$，分数越高代表样品综合质量（从长度、细度、均匀度角度）越优。
+系统构建了四个独立维度的评价框架，合成最终的混合评分（0-100分）：
 
-$$ Score_{hybrid} = 0.30 \times Score_A + 0.20 \times Score_B + 0.30 \times Score_C + 0.20 \times Score_D $$
+```
+Score_hybrid = 0.30 × Score_A + 0.20 × Score_B + 0.30 × Score_C + 0.20 × Score_D
+```
 
-#### A. 均匀性主指标 (Uniformity, 权重 30%)
-直接采用上述计算的综合均匀度得分：
-$$ Score_A = Score_{uniformity} $$
+| 维度 | 指标 | 权重 | 说明 |
+|------|------|------|------|
+| A | 均匀性主指标 | 30% | 直接采用综合均匀度得分 |
+| B | 粗管/束化指标 | 20% | 基于平均宽度和 P90 宽度评估团束现象 |
+| C | 长管指标 | 30% | 评估 CNT 的长度优势 |
+| D | 团聚指标 | 20% | 评估团聚程度，团聚面积占比越低越好 |
 
-#### B. 粗管/束化指标 (Thick Bundle, 权重 20%)
-评估 CNT 的表观宽度与团束现象。基于平均宽度 $W_{mean}$ 和 90 分位数宽度 $W_{p90}$ 计算：
-$$ S_{inv}(x) = \frac{100}{1 + x / 1.0\mu m} $$
-$$ Score_B = \frac{S_{inv}(W_{mean}) + S_{inv}(W_{p90})}{2} $$
+## 核心能力概览
 
-#### C. 长管指标 (Long Tube, 权重 30%)
-评估 CNT 的长度优势。结合平均骨架长度 $L_{mean}$ 与超长管占比 $r_{>40\mu m}$：
-$$ S_{mean} = 100 \times \min\left(1.0, \frac{L_{mean}}{80.0\mu m}\right) $$
-$$ S_{ratio} = 100 \times (r_{>40\mu m})^{0.6} $$
-$$ Score_C = \frac{S_{mean} + S_{ratio}}{2} $$
-*(注：长管在均匀性维度作为惩罚项，而在本维度作为长度优势加分项，体现了物理性能与涂布工艺的 trade-off。)*
-
-#### D. 团聚指标 (Agglomeration, 权重 20%)
-通过多模态空间热点检测（点密度、覆盖率、阴影密度）划分出团聚区。基于团聚区总面积占比 $R_{area}$ 和最大单体团聚区占比 $R_{largest}$：
-$$ Score_D = \frac{100(1 - R_{area}) + 100(1 - R_{largest})}{2} $$
+- 基于预处理、骨架和轮廓结果完成 CNT 检测与长度 / 宽度测量
+- 提供分散 / 团聚统计、空间分布和热点区域分析
+- 支持双图对比和组图对比，并输出摘要与图表
+- 组图对比会显式区分 `base组（基准参考）` 与 `实验组（实验候选）`
+- 当前组间主结论围绕固定 `5` 项指标：`总CNT数量`、`分散比例`、`网格CV`、`团聚面积占比`、`P90宽度`
+- 对比解读遵循"数量维度"和"空间维度"分开看的原则：**数量多，不等于分布均匀**
 
 ## 项目结构
 
 ```text
 OptCNT/
-|-- main.py
+|-- main.py                 # 轻量入口，转发到 src.main
 |-- src/
-|   |-- main.py
-|   |-- core/
-|   |   |-- analyzer_core.py
-|   |   |-- models.py
-|   |   |-- stats_compat.py
-|   |   `-- utils.py
-|   `-- gui/
-|       |-- gui.py
-|       |-- gui_styles.py
-|       |-- panels.py
-|       `-- widgets.py
-|-- tests/
-|-- benchmark.py
-|-- benchmark_data.py
-|-- build_minimal.py
-|-- package_windows.ps1
-|-- PACKAGING.md
-|-- requirements.txt
-|-- requirements-dev.txt
-|-- requirements-build.txt
-`-- requirements-optional.txt
+|   |-- main.py            # 主程序入口
+|   |-- core/              # 核心分析模块
+|   |   |-- analyzer_core.py   # CNTAnalyzer 类，图像处理核心
+|   |   |-- models.py          # 数据模型（ROIRegion, CNTMeasurement）
+|   |   |-- utils.py           # 工具函数和常量
+|   |   |-- stats_compat.py    # 统计兼容性模块
+|   `-- gui/               # GUI 模块
+|       |-- gui.py             # 主 GUI 控制器
+|       |-- panels.py          # 面板组件
+|       |-- widgets.py         # 自定义控件
+|       |-- comparison_view.py # 对比视图
+|       |-- chart_manager.py   # 图表管理
+|       |-- gui_layout.py      # 布局辅助
+|       |-- gui_tasking.py     # 任务处理
+|       `-- gui_styles.py      # 样式定义
+|-- tests/                 # 测试用例
+|-- package_windows.ps1    # Windows 打包脚本
+|-- build_minimal.py       # 最小化构建脚本
+`-- PACKAGING.md          # 打包详细说明
 ```
 
 ## 依赖说明
 
-- `requirements.txt`：桌面程序运行依赖
-- `requirements-dev.txt`：运行依赖 + `pytest`
-- `requirements-build.txt`：运行依赖 + PyInstaller 打包依赖
-- `requirements-optional.txt`：可选扩展依赖，例如 `scikit-learn`
+| 文件 | 说明 |
+|------|------|
+| `requirements.txt` | 桌面程序运行依赖 |
+| `requirements-dev.txt` | 运行依赖 + `pytest` |
+| `requirements-build.txt` | 运行依赖 + PyInstaller 打包依赖 |
+| `requirements-optional.txt` | 可选扩展依赖，例如 `scikit-learn` |
 
-打包版本使用的是 `opencv-contrib-python-headless`，这样 `cv2.ximgproc.thinning` 这条更快的细化路径也能在最终 `exe` 中使用。
+打包版本使用 `opencv-contrib-python-headless`，确保 `cv2.ximgproc.thinning` 细化路径在最终 exe 中可用。
+
+核心依赖：
+- `opencv-contrib-python-headless>=4.5.0` - 图像处理核心
+- `numpy>=1.20.0` - 数值计算
+- `Pillow>=8.0.0` - 图像显示
+- `matplotlib>=3.3.0` - 图表绘制
+- `numba>=0.60.0` - JIT 加速（可选，性能模式保留）
 
 ## 测试
 
@@ -152,17 +157,33 @@ pytest -q
 
 ## Windows 打包
 
-如果要构建体积尽量小、并带 UPX 压缩的 Windows 可执行文件，可以直接运行：
+### 一键打包
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\package_windows.ps1
 ```
 
-这个脚本会自动：
+默认使用 `slim` 配置（最小体积，排除 numba/llvmlite）。如需保留 JIT 加速：
 
-1. 重新创建 `.venv-build`
-2. 安装 `requirements-build.txt`
-3. 复用或自动下载可用的 UPX
+```powershell
+powershell -ExecutionPolicy Bypass -File .\package_windows.ps1 -Profile performance
+```
+
+### 打包流程
+
+脚本会自动：
+
+1. 创建 `.venv-build` 虚拟环境
+2. 安装 `requirements-build.txt` 依赖
+3. 复用或自动下载 UPX 压缩工具
 4. 构建 `dist\OptCNT.exe`
+5. 运行 UPX `--best` 压缩
+
+### 打包配置
+
+| 配置 | 说明 | 体积 | 性能 |
+|------|------|------|------|
+| `slim` | 最小体积，排除 numba/llvmlite | 较小 | 标准 |
+| `performance` | 保留 numba/llvmlite，仅裁剪测试模块 | 较大 | JIT 加速 |
 
 更多打包细节见 [PACKAGING.md](PACKAGING.md)。
