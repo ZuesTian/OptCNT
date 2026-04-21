@@ -2753,6 +2753,67 @@ class CNTAnalyzer:
             'severe_mask': severe_mask,
         }
 
+    def _build_spatial_hotspot_masks_legacy(self, spatial_distribution: Dict[str, object]) -> Dict[str, np.ndarray]:
+        """Build hotspot masks using the 2026-04-10 dispersed-ratio thresholds."""
+        point_grid = np.array(
+            spatial_distribution.get('point_density_grid') or spatial_distribution.get('density_grid') or [],
+            dtype=float,
+        )
+        coverage_grid = np.array(spatial_distribution.get('coverage_density_grid') or [], dtype=float)
+        shadow_grid = np.array(spatial_distribution.get('shadow_density_grid') or [], dtype=float)
+
+        if point_grid.size == 0 and coverage_grid.size == 0 and shadow_grid.size == 0:
+            empty = np.zeros((0, 0), dtype=float)
+            return {
+                'point_grid': empty,
+                'coverage_grid': empty,
+                'shadow_grid': empty,
+                'hotspot_grid': empty,
+                'hotspot_mask': np.zeros((0, 0), dtype=bool),
+                'severe_mask': np.zeros((0, 0), dtype=bool),
+            }
+
+        point_norm = self._normalize_hotspot_grid(point_grid, percentile=SPATIAL_HOTSPOT_POINT_PERCENTILE)
+        coverage_norm = self._normalize_hotspot_grid(coverage_grid, percentile=SPATIAL_HOTSPOT_COVERAGE_PERCENTILE)
+        shadow_norm = self._normalize_hotspot_grid(shadow_grid, percentile=SPATIAL_HOTSPOT_SHADOW_PERCENTILE)
+        hotspot_grid = np.clip(
+            point_norm * SPATIAL_HOTSPOT_POINT_WEIGHT +
+            coverage_norm * SPATIAL_HOTSPOT_COVERAGE_WEIGHT +
+            shadow_norm * SPATIAL_HOTSPOT_SHADOW_WEIGHT,
+            0.0,
+            1.0,
+        )
+
+        active_mask = (point_grid > 0) | (coverage_grid > 0) | (shadow_grid > 0)
+        active_scores = hotspot_grid[active_mask]
+        hotspot_mask = np.zeros_like(hotspot_grid, dtype=bool)
+        severe_mask = np.zeros_like(hotspot_grid, dtype=bool)
+
+        if active_scores.size > 0 and float(np.max(active_scores) - np.min(active_scores)) >= SPATIAL_HOTSPOT_ACTIVE_SCORE_RANGE_MIN:
+            hotspot_percentile = (
+                SPATIAL_HOTSPOT_MASK_PERCENTILE_LARGE
+                if active_scores.size >= 6 else
+                SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL
+            )
+            severe_percentile = (
+                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE
+                if active_scores.size >= 8 else
+                SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL
+            )
+            hotspot_threshold = float(np.percentile(active_scores, hotspot_percentile))
+            severe_threshold = float(np.percentile(active_scores, severe_percentile))
+            hotspot_mask = active_mask & (hotspot_grid >= hotspot_threshold) & (hotspot_grid > 0)
+            severe_mask = active_mask & (hotspot_grid >= severe_threshold) & (hotspot_grid > 0)
+
+        return {
+            'point_grid': point_grid,
+            'coverage_grid': coverage_grid,
+            'shadow_grid': shadow_grid,
+            'hotspot_grid': hotspot_grid,
+            'hotspot_mask': hotspot_mask,
+            'severe_mask': severe_mask,
+        }
+
     @staticmethod
     def _summarize_length_statistics(measurements: List[CNTMeasurement]) -> Dict[str, object]:
         """Summarize CNT length statistics for a measurement subset."""
@@ -2928,7 +2989,16 @@ class CNTAnalyzer:
         widths = self._collect_measurement_metric_values(measurements, 'width_mean_um', 'width_median_um')
         lengths = [float(m.length_um) for m in measurements if m.length_um is not None and np.isfinite(float(m.length_um))]
         total_measurement_count = len(measurements)
-        hotspot_area_metrics = self._summarize_hotspot_area_metrics(dispersed_stats.get('hotspot_mask'), roi=roi)
+        hotspot_area_metrics = {
+            'area_ratio': float(spatial.get('hotspot_area_ratio', 0.0) or 0.0),
+            'largest_area_ratio': float(spatial.get('largest_hotspot_area_ratio', 0.0) or 0.0),
+            'largest_area_um2': float(spatial.get('largest_hotspot_area_um2', 0.0) or 0.0),
+            'roi_area_um2': float((stats or {}).get('roi_area_um2', 0.0) or 0.0),
+        }
+        if hotspot_area_metrics['roi_area_um2'] <= 0.0 or (
+            hotspot_area_metrics['area_ratio'] <= 0.0 and hotspot_area_metrics['largest_area_um2'] <= 0.0
+        ):
+            hotspot_area_metrics = self._summarize_hotspot_area_metrics(dispersed_stats.get('hotspot_mask'), roi=roi)
 
         apparent_width_mean_um = float(np.mean(widths)) if widths else 0.0
         width_p90_um = float(np.percentile(widths, 90)) if widths else 0.0
@@ -3061,7 +3131,10 @@ class CNTAnalyzer:
             }
         
         # 获取空间分布分析结果
-        spatial_distribution = self.analyze_spatial_distribution(roi)
+        if 'analyze_spatial_distribution' in getattr(self, '__dict__', {}):
+            spatial_distribution = self.analyze_spatial_distribution(roi)
+        else:
+            spatial_distribution = self.analyze_spatial_distribution(roi, grid_size=10)
         if not spatial_distribution:
             dispersed_length_stats = self._summarize_length_statistics(measurements)
             # 如果没有空间分布数据，返回全部作为分散CNT
@@ -3079,7 +3152,12 @@ class CNTAnalyzer:
             }
         
         # 获取热点掩码
-        hotspot_info = self._build_spatial_hotspot_masks(spatial_distribution)
+        hotspot_builder = (
+            self._build_spatial_hotspot_masks
+            if '_build_spatial_hotspot_masks' in getattr(self, '__dict__', {})
+            else self._build_spatial_hotspot_masks_legacy
+        )
+        hotspot_info = hotspot_builder(spatial_distribution)
         hotspot_mask = hotspot_info['hotspot_mask']
         severe_mask = hotspot_info['severe_mask']
         active_mask = severe_mask if mode == 'severe_only' else hotspot_mask

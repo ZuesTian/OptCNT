@@ -8,12 +8,13 @@ import itertools
 import json
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
 
 from src.core.analyzer_core import CNTAnalyzer
+from src.core.stats_compat import mannwhitneyu, ttest_ind
 from src.core.utils import (
     SCALE_BAR_DEFAULT_UM,
     CALIBRATED_BLUR_KERNEL,
@@ -43,6 +44,18 @@ REPRESENTATIVE_FILES = {
     "22-0-60-500-6.jpg",
     "22-0-60-500-10.jpg",
     "22-0-50-500-16.jpg",
+}
+
+# Spatial-first group-separation metrics: designed for the use case where the
+# experiment group is expected to be more dispersed / uniform than the base
+# group, while structural thickness metrics stay as secondary penalties.
+SEPARATION_METRIC_CONFIG = {
+    "dispersed_ratio": {"direction": "high", "weight": 0.20},
+    "grid_density_cv": {"direction": "low", "weight": 0.25},
+    "uniformity_score": {"direction": "high", "weight": 0.25},
+    "agglomerated_area_ratio": {"direction": "low", "weight": 0.15},
+    "width_p90_um": {"direction": "low", "weight": 0.10},
+    "long_thick_ratio": {"direction": "low", "weight": 0.05},
 }
 
 
@@ -143,6 +156,148 @@ def summarize_metric(records: List[dict], key: str) -> dict:
     }
 
 
+def resolve_group_role(group_name: str) -> str:
+    normalized = str(group_name or "").strip().lower()
+    return "base" if normalized.startswith("base") else "experiment"
+
+
+def resolve_group_bucket(group_name: str) -> str:
+    label = str(group_name or "").strip()
+    return label.rsplit("-", 1)[-1] if "-" in label else label
+
+
+def compute_cohens_d(exp_values: List[float], base_values: List[float]) -> Optional[float]:
+    exp = np.array(exp_values, dtype=float)
+    base = np.array(base_values, dtype=float)
+    if exp.size < 2 or base.size < 2:
+        return None
+
+    exp_var = float(np.var(exp, ddof=1))
+    base_var = float(np.var(base, ddof=1))
+    pooled_den = exp.size + base.size - 2
+    if pooled_den <= 0:
+        return None
+
+    pooled_var = (((exp.size - 1) * exp_var) + ((base.size - 1) * base_var)) / pooled_den
+    pooled_std = float(np.sqrt(max(pooled_var, 1e-12)))
+    return float((float(np.mean(exp)) - float(np.mean(base))) / pooled_std)
+
+
+def build_group_separation_report(records: List[dict], metric_config: Optional[Dict[str, dict]] = None) -> dict:
+    config = metric_config or SEPARATION_METRIC_CONFIG
+    grouped: Dict[str, Dict[str, List[dict]]] = {}
+    for item in records:
+        bucket = resolve_group_bucket(item.get("group", ""))
+        role = resolve_group_role(item.get("group", ""))
+        grouped.setdefault(bucket, {}).setdefault(role, []).append(item)
+
+    pair_reports = {}
+    pair_scores = []
+
+    for bucket, bucket_groups in sorted(grouped.items()):
+        base_records = bucket_groups.get("base", [])
+        exp_records = bucket_groups.get("experiment", [])
+        if not base_records or not exp_records:
+            continue
+
+        metric_reports = {}
+        ranking = []
+        weighted_effect_sum = 0.0
+        total_weight = 0.0
+
+        for metric_name, metric_meta in config.items():
+            direction = str(metric_meta.get("direction", "high")).lower()
+            weight = float(metric_meta.get("weight", 1.0) or 0.0)
+            base_values = [float(item.get(metric_name, 0.0)) for item in base_records]
+            exp_values = [float(item.get(metric_name, 0.0)) for item in exp_records]
+            base_summary = summarize_metric(base_records, metric_name)
+            exp_summary = summarize_metric(exp_records, metric_name)
+            diff = float(exp_summary["mean"] - base_summary["mean"])
+            oriented_gap = diff if direction == "high" else -diff
+
+            try:
+                _, t_pvalue = ttest_ind(
+                    np.array(base_values, dtype=float),
+                    np.array(exp_values, dtype=float),
+                    equal_var=False,
+                    nan_policy="omit",
+                )
+                if not np.isfinite(t_pvalue):
+                    t_pvalue = None
+            except (TypeError, ValueError, FloatingPointError):
+                t_pvalue = None
+
+            try:
+                _, mw_pvalue = mannwhitneyu(
+                    np.array(base_values, dtype=float),
+                    np.array(exp_values, dtype=float),
+                    alternative="two-sided",
+                )
+                if not np.isfinite(mw_pvalue):
+                    mw_pvalue = None
+            except (TypeError, ValueError, FloatingPointError):
+                mw_pvalue = None
+
+            cohens_d = compute_cohens_d(exp_values, base_values)
+            oriented_effect = None
+            if cohens_d is not None:
+                oriented_effect = cohens_d if direction == "high" else -cohens_d
+                weighted_effect_sum += weight * float(np.clip(oriented_effect, -3.0, 3.0))
+                total_weight += weight
+
+            best_pvalue = min(
+                value for value in (t_pvalue, mw_pvalue)
+                if value is not None
+            ) if any(value is not None for value in (t_pvalue, mw_pvalue)) else None
+
+            metric_reports[metric_name] = {
+                "direction_for_experiment_better": direction,
+                "weight": weight,
+                "base_mean": round(base_summary["mean"], 4),
+                "exp_mean": round(exp_summary["mean"], 4),
+                "diff_exp_minus_base": round(diff, 4),
+                "oriented_gap_for_exp_better": round(oriented_gap, 4),
+                "cohens_d_exp_vs_base": None if cohens_d is None else round(cohens_d, 4),
+                "oriented_effect_for_exp_better": None if oriented_effect is None else round(oriented_effect, 4),
+                "t_pvalue": None if t_pvalue is None else round(float(t_pvalue), 6),
+                "mw_pvalue": None if mw_pvalue is None else round(float(mw_pvalue), 6),
+            }
+            ranking.append(
+                {
+                    "metric": metric_name,
+                    "direction_for_experiment_better": direction,
+                    "weight": weight,
+                    "oriented_gap_for_exp_better": round(oriented_gap, 4),
+                    "oriented_effect_for_exp_better": None if oriented_effect is None else round(oriented_effect, 4),
+                    "best_pvalue": None if best_pvalue is None else round(float(best_pvalue), 6),
+                }
+            )
+
+        ranking.sort(
+            key=lambda item: (
+                item["oriented_gap_for_exp_better"] <= 0,
+                1.0 if item["best_pvalue"] is None else item["best_pvalue"],
+                -abs(item["oriented_effect_for_exp_better"] or 0.0),
+            )
+        )
+        pair_score = weighted_effect_sum / total_weight if total_weight > 0 else 0.0
+        pair_scores.append(pair_score)
+        pair_reports[bucket] = {
+            "base_group": next((item.get("group") for item in base_records), f"base-{bucket}"),
+            "exp_group": next((item.get("group") for item in exp_records), f"experiment-{bucket}"),
+            "pair_score": round(pair_score, 5),
+            "metrics": metric_reports,
+            "ranked_metrics": ranking,
+        }
+
+    overall_score = float(mean(pair_scores)) if pair_scores else 0.0
+    return {
+        "metric_config": config,
+        "overall_score": round(overall_score, 5),
+        "pairs": pair_reports,
+    }
+
+
 def collect_candidate_metrics(analyzer: CNTAnalyzer) -> List[dict]:
     metrics: List[dict] = []
     binary = analyzer.binary_image
@@ -206,6 +361,11 @@ def run_current_pipeline(image_path: Path, params: dict) -> dict:
     dispersed_stats = analyzer.get_dispersed_statistics()
     spatial = stats.get("spatial_distribution") or {}
     aggregation_scores = spatial.get("aggregation_scores") or {}
+    framework = analyzer.get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
+    uniformity = framework.get("uniformity") or {}
+    thick_bundle = framework.get("thick_bundle") or {}
+    long_cnt = framework.get("long_cnt") or {}
+    agglomeration = framework.get("agglomeration") or {}
 
     valid_mask = analyzer._get_valid_analysis_mask()
     fg_ratio = 0.0
@@ -236,6 +396,14 @@ def run_current_pipeline(image_path: Path, params: dict) -> dict:
         "dispersed_ratio": round(float(dispersed_stats.get("dispersed_ratio", 0.0)), 5),
         "agglomerated_count": int(dispersed_stats.get("agglomerated_count", 0)),
         "shadow_aggregation_score": round(float(aggregation_scores.get("overall", 0.0)), 3),
+        "grid_density_cv": round(float(spatial.get("grid_density_cv", 0.0) or 0.0), 5),
+        "morans_i": round(float(spatial.get("morans_i", 0.0) or 0.0), 5),
+        "uniformity_score": round(float(uniformity.get("score", 0.0) or 0.0), 3),
+        "agglomerated_area_ratio": round(float(agglomeration.get("agglomerated_area_ratio", 0.0) or 0.0), 5),
+        "width_p90_um": round(float(thick_bundle.get("width_p90_um", 0.0) or 0.0), 5),
+        "hybrid_score": round(float(framework.get("hybrid_score", 0.0) or 0.0), 3),
+        "skeleton_length_mean_um": round(float(long_cnt.get("skeleton_length_mean_um", stats.get("length_mean", 0.0)) or 0.0), 3),
+        "long_thick_ratio": round(float(long_cnt.get("long_thick_ratio", 0.0) or 0.0), 5),
     }
 
 
@@ -341,11 +509,20 @@ def build_dataset_report(current_records: List[dict], legacy_records: List[dict]
             "dispersed_ratio_summary": summarize_metric(group_records, "dispersed_ratio"),
             "agglomerated_count_summary": summarize_metric(group_records, "agglomerated_count"),
             "shadow_aggregation_score_summary": summarize_metric(group_records, "shadow_aggregation_score"),
+            "grid_density_cv_summary": summarize_metric(group_records, "grid_density_cv"),
+            "morans_i_summary": summarize_metric(group_records, "morans_i"),
+            "uniformity_score_summary": summarize_metric(group_records, "uniformity_score"),
+            "agglomerated_area_ratio_summary": summarize_metric(group_records, "agglomerated_area_ratio"),
+            "width_p90_um_summary": summarize_metric(group_records, "width_p90_um"),
+            "hybrid_score_summary": summarize_metric(group_records, "hybrid_score"),
+            "skeleton_length_mean_um_summary": summarize_metric(group_records, "skeleton_length_mean_um"),
+            "long_thick_ratio_summary": summarize_metric(group_records, "long_thick_ratio"),
         }
 
     return {
         "best_params": best_params,
         "group_summary": by_group,
+        "group_separation": build_group_separation_report(merged),
         "records": merged,
         "abnormal_files": abnormal,
     }
@@ -376,6 +553,7 @@ def main():
         }
         records = [run_current_pipeline(path, params) for path in image_paths]
         score = score_records(records)
+        separation = build_group_separation_report(records)
         grid_results.append(
             {
                 "params": {
@@ -384,10 +562,16 @@ def main():
                     "adaptive_c": adaptive_c,
                 },
                 "score": score,
+                "group_separation": separation,
             }
         )
 
     grid_results.sort(key=lambda item: item["score"]["total_score"], reverse=True)
+    separation_sorted_results = sorted(
+        grid_results,
+        key=lambda item: float((item.get("group_separation") or {}).get("overall_score", 0.0)),
+        reverse=True,
+    )
     best_params = dict(grid_results[0]["params"])
     current_records = [run_current_pipeline(path, {**best_params, "threshold_invert": True}) for path in image_paths]
     legacy_records = [run_legacy_pipeline(path) for path in image_paths]
@@ -401,6 +585,7 @@ def main():
             "adaptive_c": CALIBRATED_ADAPTIVE_C,
         },
         "top_grid_results": grid_results[:5],
+        "top_group_separation_results": separation_sorted_results[:5],
         "dataset_report": build_dataset_report(current_records, legacy_records, best_params),
     }
 

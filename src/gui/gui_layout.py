@@ -84,17 +84,7 @@ def _select_center_tab(self, tab_key: str) -> bool:
 
 def _get_pane_layout_profile(self, tab_key: Optional[str] = None) -> dict:
     """返回统一的三栏布局配置（逻辑像素 + 稳定比例）。"""
-    active_tab = tab_key or self._get_active_center_tab_key()
-    if active_tab == 'comparison':
-        return {
-            'left_floor': 230,
-            'right_floor': 280,
-            'center_min': 720,
-            'left_ratio': 0.15,
-            'right_ratio': 0.15,
-            'left_ratio_cap': 0.22,
-            'right_ratio_cap': 0.28,
-        }
+    _ = tab_key or self._get_active_center_tab_key()
     return {
         'left_floor': 240,
         'right_floor': 320,

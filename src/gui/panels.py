@@ -809,6 +809,7 @@ class ResultPanel(ttk.Frame):
         self.stats_text: Optional[tk.Text] = None
         self._result_paned: Optional[tk.PanedWindow] = None
         self._result_layout_job: Optional[str] = None
+        self._last_result_panel_height: Optional[int] = None
         self._tree_columns = ('ID', '长度(μm)', '分散CNT', '团聚CNT')
 
         self._setup_ui()
@@ -891,6 +892,11 @@ class ResultPanel(ttk.Frame):
         """窗口高度变化后延迟重排结果区上下比例。"""
         if event is not None and event.widget is not self:
             return
+        current_height = max(1, self.winfo_height())
+        last_height = self._last_result_panel_height
+        if last_height is not None and abs(current_height - last_height) < _scale_px(self, 24):
+            return
+        self._last_result_panel_height = current_height
         if self._result_layout_job is not None:
             self.after_cancel(self._result_layout_job)
         self._result_layout_job = self.after(80, self._apply_balanced_result_split)
@@ -904,6 +910,7 @@ class ResultPanel(ttk.Frame):
             return
 
         total_height = max(1, self._result_paned.winfo_height())
+        self._last_result_panel_height = total_height
         stats_height = _calculate_result_split_height(self, total_height)
 
         try:

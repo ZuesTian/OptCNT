@@ -672,9 +672,11 @@ class CNTAnalyzerGUI:
         self.comparison_panel.pack(fill=tk.BOTH, expand=True)
 
     def _on_center_tab_changed(self, event) -> None:
-        """标签页切换时刷新对比分析图表，并重算三栏布局。"""
-        if event.widget is self.center_notebook:
-            self._schedule_window_distribution(delay_ms=60)
+        """标签页切换时仅在 comparison 页刷新内容布局。"""
+        if event.widget is not self.center_notebook:
+            return
+
+        if self._get_active_center_tab_key() == 'comparison':
             self._schedule_comparison_layout_refresh(delay_ms=60)
 
     def _refresh_scale_status_ui(self):

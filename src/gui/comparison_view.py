@@ -105,8 +105,7 @@ def _render_comparison_figure(self, summary_text: str, figure: Figure):
     ensure_chart_manager(self).mount_comparison_figure(figure, chart_frame, padx=8, pady=8)
     self.comparison_panel.refresh_layout()
     self.comparison_panel.scroll_to_top()
-    self._schedule_comparison_layout_refresh(delay_ms=60)
-    self._schedule_comparison_layout_refresh(delay_ms=180)
+    self._schedule_comparison_layout_refresh(delay_ms=90)
 
 
 def _should_stack_comparison_images(
