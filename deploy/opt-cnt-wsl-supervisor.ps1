@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 $SshKey       = 'C:\Users\AMD\.codex\mcp\.secrets\ali_mcp.pem'
 $KnownHosts   = 'C:\Users\AMD\.codex\mcp\.secrets\known_hosts_ali_mcp'
 $RemoteHost   = '47.236.76.214'
+$RemoteSshPort = 22222
 $TunnelPort   = 8870
 $RemotePort   = 8769
 $HealthUrl    = "http://127.0.0.1:$TunnelPort/api/v1/health"
@@ -38,6 +39,7 @@ function Stop-Child([System.Diagnostics.Process]$Process) {
 function Start-Tunnel {
     $arguments = @(
         '-N', '-T',
+        '-p', "$RemoteSshPort",
         '-o', 'BatchMode=yes',
         '-o', 'ExitOnForwardFailure=yes',
         '-o', 'ServerAliveInterval=20',
@@ -76,7 +78,7 @@ function Repair-WslNet {
 
 function Test-WindowsOnline {
     try {
-        return (Test-NetConnection -ComputerName $RemoteHost -Port 22 -WarningAction SilentlyContinue -InformationLevel Quiet)
+        return (Test-NetConnection -ComputerName $RemoteHost -Port $RemoteSshPort -WarningAction SilentlyContinue -InformationLevel Quiet)
     } catch { return $false }
 }
 

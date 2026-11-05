@@ -41,7 +41,7 @@ from .serialization import (
 )
 from .sessions import AnalysisSession, SessionStore
 
-APP_VERSION = "2026.08.12"
+APP_VERSION = "2026.11.05"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WEB_DIR = PROJECT_ROOT / "web"
 PREVIEW_JPEG_QUALITY = 82
@@ -219,6 +219,7 @@ def create_app(*, web_dir: Optional[Path] = None) -> FastAPI:
             "service": "optcnt",
             "version": APP_VERSION,
             "analysis_engine": "CNTAnalyzer",
+            "engine_version": ENGINE_VERSION,
             "opencv": cv2.__version__,
             "skeletonization": "deterministic_morphology",
             **session_store.status(),
