@@ -4,23 +4,37 @@
 import heapq
 import logging
 import os
+from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
 import cv2
 import numpy as np
 
 try:
-    from numba import jit
+    from numba import jit as _numba_jit
     NUMBA_AVAILABLE = True
-except ImportError:
+except Exception:
+    _numba_jit = None
     NUMBA_AVAILABLE = False
-    # 如果 numba 不可用，创建一个空装饰器
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
 
-from .models import ROIRegion, CNTMeasurement
+
+def jit(*args, **kwargs):
+    """Use Numba when its runtime is healthy, otherwise keep the exact Python kernel."""
+    def decorator(func):
+        global NUMBA_AVAILABLE
+        if not NUMBA_AVAILABLE or _numba_jit is None:
+            return func
+        try:
+            return _numba_jit(*args, **kwargs)(func)
+        except Exception:
+            # A mismatched optional llvmlite/Numba installation can import but
+            # fail while creating the first dispatcher.  Disable acceleration
+            # for this process without making the analysis engine unavailable.
+            NUMBA_AVAILABLE = False
+            return func
+    return decorator
+
+from .models import ROIRegion, CNTMeasurement, ParticleMeasurement
 from .utils import (
     SCALE_BAR_BLUE_THRESHOLD, SCALE_BAR_BLUE_SCORE_MIN, SCALE_BAR_MIN_SPAN_PX,
     SCALE_BAR_BGR_DIST_MAX, SCALE_BAR_ROI_X_RATIO, SCALE_BAR_ROI_Y_RATIO,
@@ -51,9 +65,44 @@ from .utils import (
     SPATIAL_HOTSPOT_MASK_PERCENTILE_SMALL, SPATIAL_HOTSPOT_SEVERE_PERCENTILE_LARGE,
     SPATIAL_HOTSPOT_SEVERE_PERCENTILE_SMALL, SPATIAL_HOTSPOT_OVERLAP_RATIO_THRESHOLD,
     SPATIAL_HOTSPOT_MASK_UPSAMPLE, SPATIAL_HOTSPOT_ABSOLUTE_SCORE_MIN,
+    PARTICLE_LOCAL_BACKGROUND_SIGMA, PARTICLE_FOREGROUND_SIGMA,
+    PARTICLE_LOCAL_CONTRAST_THRESHOLD, PARTICLE_MIN_AREA_PX,
+    PARTICLE_MAX_AREA_RATIO, PARTICLE_MAX_ASPECT_RATIO,
+    PARTICLE_MIN_SOLIDITY, PARTICLE_MIN_FILL_RATIO,
+    PARTICLE_MIN_CORE_RADIUS_PX, PARTICLE_MIN_CONFIDENCE,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _SpatialDistributionContext:
+    """Grid-independent spatial inputs shared by one statistics pass."""
+
+    measurements: List[CNTMeasurement]
+    offset_x: int
+    offset_y: int
+    width: int
+    height: int
+    centroids: List[Tuple[float, float]]
+    local_contours: List[np.ndarray]
+    centroid_array: np.ndarray
+    nearest_neighbor_stats: Dict[str, float]
+    coverage_mask: np.ndarray
+    shadow_response: Optional[np.ndarray]
+    long_tube_ratio: float
+
+
+@dataclass(frozen=True)
+class _SkeletonGraph:
+    """Compact 8-neighbor skeleton graph used by the CNT candidate kernel."""
+
+    points: np.ndarray
+    neighbor_indices: np.ndarray
+    degrees: np.ndarray
+
+    def __len__(self) -> int:
+        return int(len(self.points))
 
 
 class CNTAnalyzer:
@@ -70,6 +119,8 @@ class CNTAnalyzer:
         self.skeleton_overlay = None
         self.scale_um_per_pixel = 0.1
         self.measurements: List[CNTMeasurement] = []
+        self.particle_measurements: List[ParticleMeasurement] = []
+        self.particle_mask = None
         self.rois: List[ROIRegion] = []
         self.ocr_templates = None
         self.auto_enhance_enabled = True
@@ -325,6 +376,7 @@ class CNTAnalyzer:
             raise ValueError("无效图像数据")
 
         self.original_image = image.copy()
+        self.clear_measurements()
         self.image = self._auto_enhance_image(image) if self.auto_enhance_enabled else image.copy()
         self._prepare_analysis_image(self.original_image)
         self._reset_scale_state()
@@ -367,9 +419,12 @@ class CNTAnalyzer:
 
     def set_scale(self, pixels: float, micrometers: float):
         """设置比例尺"""
-        if pixels <= 0 or micrometers <= 0:
-            raise ValueError("像素数和微米数必须大于0")
-        self.scale_um_per_pixel = micrometers / pixels
+        if not np.isfinite(pixels) or not np.isfinite(micrometers) or pixels <= 0 or micrometers <= 0:
+            raise ValueError("像素数和微米数必须为有限正数")
+        scale = micrometers / pixels
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("比例尺必须为有限正数")
+        self.scale_um_per_pixel = scale
 
     def record_manual_scale(self,
                             pixels: float,
@@ -747,6 +802,8 @@ class CNTAnalyzer:
     def clear_measurements(self):
         """清空所有测量结果"""
         self.measurements = []
+        self.particle_measurements = []
+        self.particle_mask = None
 
     def _get_analysis_region(self, roi: Optional[ROIRegion] = None) -> tuple:
         """获取分析区域"""
@@ -996,26 +1053,18 @@ class CNTAnalyzer:
         return self.binary_image
 
     def _skeletonize(self, binary: np.ndarray) -> np.ndarray:
-        """生成骨架"""
+        """Generate a deterministic morphology skeleton on every runtime."""
         work = np.where(binary > 0, 255, 0).astype(np.uint8)
         if not np.any(work):
             return work
-
-        thinning = getattr(getattr(cv2, "ximgproc", None), "thinning", None)
-        if thinning is None:
-            try:
-                import cv2.ximgproc as cv2_ximgproc  # type: ignore[import-not-found]
-            except Exception:
-                cv2_ximgproc = None
-            thinning = getattr(cv2_ximgproc, "thinning", None)
-        if thinning is not None:
-            return thinning(work)
 
         skeleton = np.zeros_like(work)
         element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
         while True:
-            eroded = cv2.erode(work, element)
+            # The default erosion border is foreground.  A full mask would
+            # therefore never shrink; treat pixels outside the ROI as background.
+            eroded = cv2.erode(work, element, borderType=cv2.BORDER_CONSTANT, borderValue=0)
             opened = cv2.dilate(eroded, element)
             residue = cv2.subtract(work, opened)
             skeleton = cv2.bitwise_or(skeleton, residue)
@@ -1057,6 +1106,41 @@ class CNTAnalyzer:
         )
 
     # ===== 骨架处理方法 =====
+    @staticmethod
+    def _empty_skeleton_graph() -> _SkeletonGraph:
+        return _SkeletonGraph(
+            points=np.empty((0, 2), dtype=np.int32),
+            neighbor_indices=np.empty((0, 8), dtype=np.int32),
+            degrees=np.empty(0, dtype=np.uint8),
+        )
+
+    def _build_skeleton_graph(self, skeleton: np.ndarray) -> _SkeletonGraph:
+        """Build a compact array adjacency graph while preserving legacy point order."""
+        skeleton_points = np.column_stack(np.where(skeleton > 0))
+        if len(skeleton_points) < 2:
+            return self._empty_skeleton_graph()
+
+        # Integer tuple hashes are deterministic.  Keeping the legacy set order
+        # preserves endpoint tie-breaking while removing per-edge Python objects.
+        point_set = {(int(y), int(x)) for y, x in skeleton_points}
+        points = np.asarray(list(point_set), dtype=np.int32)
+        if len(points) < 2:
+            return self._empty_skeleton_graph()
+
+        if NUMBA_AVAILABLE:
+            neighbor_indices, degrees = _build_skeleton_adjacency_fast(
+                points,
+                int(skeleton.shape[0]),
+                int(skeleton.shape[1]),
+            )
+        else:
+            neighbor_indices, degrees = _build_skeleton_adjacency_numpy(
+                points,
+                int(skeleton.shape[0]),
+                int(skeleton.shape[1]),
+            )
+        return _SkeletonGraph(points, neighbor_indices, degrees)
+
     def _build_skeleton_neighbors(self, skeleton: np.ndarray) -> dict:
         """构建骨架邻接表"""
         skeleton_points = np.column_stack(np.where(skeleton > 0))
@@ -1271,12 +1355,21 @@ class CNTAnalyzer:
         if len(endpoints) < 2:
             return []
 
+        if len(endpoints) == 2 and self._is_simple_skeleton_graph(neighbors):
+            # Dijkstra starts its returned diameter at the endpoint farthest from
+            # endpoints[0].  Starting at endpoints[1] preserves the exact segment
+            # summation order, including the final floating-point bit pattern.
+            simple_path = self._trace_skeleton_path(
+                endpoints[1],
+                neighbors,
+                float(SKELETON_WALK_ANGLE_DEG),
+            )
+            if len(simple_path) == len(neighbors):
+                return simple_path
+
         diameter_path = self._find_graph_diameter_path(neighbors)
         if len(diameter_path) >= 2:
             return diameter_path
-
-        if self._is_simple_skeleton_graph(neighbors):
-            return self._trace_skeleton_path(endpoints[0], neighbors, float(SKELETON_WALK_ANGLE_DEG))
 
         best_path: List[Tuple[int, int]] = []
         best_length = -1.0
@@ -1288,6 +1381,230 @@ class CNTAnalyzer:
                     best_length = path_length
                     best_path = path
         return best_path
+
+    def _find_best_skeleton_graph_path(self,
+                                       graph: _SkeletonGraph,
+                                       angle_candidates: List[float]) -> List[Tuple[int, int]]:
+        """Find the primary path from a compact graph, retaining legacy branch behavior."""
+        if len(graph) < 2:
+            return []
+
+        endpoint_indices = np.flatnonzero(graph.degrees == 1)
+        if len(endpoint_indices) < 2:
+            return []
+
+        if len(endpoint_indices) == 2 and bool(np.all(graph.degrees <= 2)):
+            start_index = int(endpoint_indices[1])
+            if NUMBA_AVAILABLE:
+                path_indices, path_length = _trace_simple_skeleton_indices_fast(
+                    graph.neighbor_indices,
+                    graph.degrees,
+                    start_index,
+                )
+                if path_length == len(graph):
+                    return [
+                        (int(graph.points[index, 0]), int(graph.points[index, 1]))
+                        for index in path_indices[:path_length]
+                    ]
+
+        diameter_path = self._find_skeleton_graph_diameter_path(graph, endpoint_indices)
+        if len(diameter_path) >= 2:
+            return diameter_path
+
+        best_path: List[Tuple[int, int]] = []
+        best_length = -1.0
+        for angle_deg in angle_candidates:
+            for endpoint_index in endpoint_indices:
+                path = self._trace_skeleton_graph_path(
+                    graph,
+                    int(endpoint_index),
+                    angle_deg,
+                )
+                path_length = self._calculate_path_length(path)
+                if path_length > best_length:
+                    best_length = path_length
+                    best_path = path
+        return best_path
+
+    def _trace_skeleton_graph_path(self,
+                                   graph: _SkeletonGraph,
+                                   start_index: int,
+                                   angle_deg: float) -> List[Tuple[int, int]]:
+        """Trace an exceptional branch directly over compact adjacency arrays."""
+        path_indices = [int(start_index)]
+        previous_index = -1
+        current_index = int(start_index)
+        visited = np.zeros(len(graph), dtype=bool)
+        visited[current_index] = True
+
+        while len(path_indices) < len(graph):
+            degree = int(graph.degrees[current_index])
+            candidates = [
+                int(candidate_index)
+                for candidate_index in graph.neighbor_indices[current_index, :degree]
+                if int(candidate_index) != previous_index and not visited[int(candidate_index)]
+            ]
+            if not candidates:
+                break
+
+            next_index = candidates[0]
+            if len(candidates) > 1 and previous_index >= 0 and degree >= 3:
+                current_point = graph.points[current_index]
+                previous_point = graph.points[previous_index]
+                in_vec = np.array(
+                    [
+                        int(current_point[0]) - int(previous_point[0]),
+                        int(current_point[1]) - int(previous_point[1]),
+                    ],
+                    dtype=float,
+                )
+                in_norm = float(np.linalg.norm(in_vec))
+                best_index = -1
+                best_cos = -2.0
+                if in_norm > 0:
+                    for candidate_index in candidates:
+                        candidate_point = graph.points[candidate_index]
+                        out_vec = np.array(
+                            [
+                                int(candidate_point[0]) - int(current_point[0]),
+                                int(candidate_point[1]) - int(current_point[1]),
+                            ],
+                            dtype=float,
+                        )
+                        out_norm = float(np.linalg.norm(out_vec))
+                        if out_norm <= 0:
+                            continue
+                        cosine = float(np.dot(in_vec, out_vec) / (in_norm * out_norm))
+                        if cosine > best_cos:
+                            best_cos = cosine
+                            best_index = candidate_index
+                if (
+                    best_index < 0 or
+                    best_cos < self._continuation_cosine_threshold(angle_deg)
+                ):
+                    break
+                next_index = best_index
+
+            path_indices.append(next_index)
+            visited[next_index] = True
+            previous_index, current_index = current_index, next_index
+
+        return [
+            (int(graph.points[index, 0]), int(graph.points[index, 1]))
+            for index in path_indices
+        ]
+
+    def _find_skeleton_graph_diameter_path(self,
+                                           graph: _SkeletonGraph,
+                                           endpoint_indices: Optional[np.ndarray] = None) -> List[Tuple[int, int]]:
+        """Run the legacy two-pass Dijkstra strategy over compact adjacency arrays."""
+        if len(graph) < 2:
+            return []
+        if endpoint_indices is None:
+            endpoint_indices = np.flatnonzero(graph.degrees == 1)
+        if len(endpoint_indices) < 2:
+            return []
+
+        if NUMBA_AVAILABLE:
+            path_indices, path_length = _find_skeleton_graph_diameter_fast(
+                graph.points,
+                graph.neighbor_indices,
+                graph.degrees,
+                endpoint_indices.astype(np.int32),
+            )
+            if path_length < 2:
+                return []
+            return [
+                (int(graph.points[index, 0]), int(graph.points[index, 1]))
+                for index in path_indices[:path_length]
+            ]
+
+        farthest_index, _, _ = self._find_farthest_skeleton_graph_node(
+            int(endpoint_indices[0]),
+            graph,
+            endpoint_indices,
+        )
+        farthest_endpoint, parents, _ = self._find_farthest_skeleton_graph_node(
+            farthest_index,
+            graph,
+            endpoint_indices,
+        )
+
+        path_indices: List[int] = []
+        current_index = farthest_endpoint
+        while current_index >= 0:
+            path_indices.append(current_index)
+            current_index = int(parents[current_index])
+        path_indices.reverse()
+        if len(path_indices) < 2:
+            return []
+        return [
+            (int(graph.points[index, 0]), int(graph.points[index, 1]))
+            for index in path_indices
+        ]
+
+    def _find_farthest_skeleton_graph_node(self,
+                                           start_index: int,
+                                           graph: _SkeletonGraph,
+                                           target_indices: np.ndarray) -> Tuple[int, np.ndarray, np.ndarray]:
+        """Array-backed Dijkstra with the same `(distance, y, x)` heap ordering."""
+        distances = np.full(len(graph), np.inf, dtype=np.float64)
+        parents = np.full(len(graph), -1, dtype=np.int32)
+        distances[start_index] = 0.0
+        start_point = graph.points[start_index]
+        queue = [(0.0, int(start_point[0]), int(start_point[1]), int(start_index))]
+
+        while queue:
+            current_dist, _, _, point_index = heapq.heappop(queue)
+            if current_dist > float(distances[point_index]) + 1e-9:
+                continue
+
+            point = graph.points[point_index]
+            degree = int(graph.degrees[point_index])
+            for neighbor_index in graph.neighbor_indices[point_index, :degree]:
+                neighbor_index = int(neighbor_index)
+                neighbor = graph.points[neighbor_index]
+                edge_length = float(np.hypot(
+                    int(neighbor[0]) - int(point[0]),
+                    int(neighbor[1]) - int(point[1]),
+                ))
+                new_dist = current_dist + edge_length
+                if new_dist + 1e-9 < float(distances[neighbor_index]):
+                    distances[neighbor_index] = new_dist
+                    parents[neighbor_index] = point_index
+                    heapq.heappush(
+                        queue,
+                        (new_dist, int(neighbor[0]), int(neighbor[1]), neighbor_index),
+                    )
+
+        farthest_index = start_index
+        farthest_distance = -1.0
+        for target_index in target_indices:
+            target_index = int(target_index)
+            point_distance = float(distances[target_index])
+            if not np.isfinite(point_distance):
+                continue
+            if point_distance > farthest_distance:
+                farthest_index = target_index
+                farthest_distance = point_distance
+        return farthest_index, parents, distances
+
+    @staticmethod
+    def _skeleton_graph_to_neighbors(graph: _SkeletonGraph) -> dict:
+        """Materialize the legacy map only when a branch graph needs Dijkstra."""
+        neighbors = {}
+        points = graph.points
+        for point_index in range(len(graph)):
+            point = (int(points[point_index, 0]), int(points[point_index, 1]))
+            degree = int(graph.degrees[point_index])
+            neighbors[point] = [
+                (
+                    int(points[neighbor_index, 0]),
+                    int(points[neighbor_index, 1]),
+                )
+                for neighbor_index in graph.neighbor_indices[point_index, :degree]
+            ]
+        return neighbors
 
     def _extract_primary_path(self, skeleton: np.ndarray, neighbors: Optional[dict] = None) -> np.ndarray:
         """提取骨架主路径"""
@@ -1334,7 +1651,18 @@ class CNTAnalyzer:
         return total_length
 
     # ===== 宽度测量方法 =====
-    def _measure_width(self, skeleton: np.ndarray, cnt_binary: np.ndarray) -> dict:
+    @staticmethod
+    def _foreground_distance_transform(binary: np.ndarray) -> np.ndarray:
+        """Measure distance to background, including outside the cropped region."""
+        if np.any(binary[0]) or np.any(binary[-1]) or np.any(binary[:, 0]) or np.any(binary[:, -1]):
+            padded = cv2.copyMakeBorder(binary, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+            return cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1].copy()
+        return cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+
+    def _measure_width(self,
+                       skeleton: np.ndarray,
+                       cnt_binary: np.ndarray,
+                       distance_transform: Optional[np.ndarray] = None) -> dict:
         """通过骨架法测量CNT宽度（鲁棒统计）
 
         对骨架上的每个点，计算其到最近轮廓边界的距离（即半宽），
@@ -1351,7 +1679,11 @@ class CNTAnalyzer:
         if skeleton is None or cnt_binary is None:
             return result
 
-        dist_transform = cv2.distanceTransform(cnt_binary, cv2.DIST_L2, 5)
+        dist_transform = (
+            distance_transform
+            if distance_transform is not None else
+            self._foreground_distance_transform(cnt_binary)
+        )
 
         skeleton_mask = skeleton > 0
         if not skeleton_mask.any():
@@ -1369,6 +1701,12 @@ class CNTAnalyzer:
 
     def _split_stuck_cnt_region(self, cnt_binary: np.ndarray, split_mode: str = "conservative") -> List[np.ndarray]:
         """对疑似粘连CNT连通域进行分离（距离变换 + 分水岭）"""
+        return [region for region, _ in self._split_stuck_cnt_region_with_distance(cnt_binary, split_mode)]
+
+    def _split_stuck_cnt_region_with_distance(self,
+                                              cnt_binary: np.ndarray,
+                                              split_mode: str = "conservative") -> List[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        """Split a region and retain a reusable distance transform when unchanged."""
         if cnt_binary is None or cnt_binary.size == 0:
             return []
 
@@ -1379,7 +1717,7 @@ class CNTAnalyzer:
 
         mode = (split_mode or "conservative").lower()
         if mode in ("off", "none", "close", "0"):
-            return [region]
+            return [(region, None)]
 
         # 保守策略：仅对“面积较大且骨架端点异常”的连通域尝试分离，降低过分割风险
         if mode == "aggressive":
@@ -1394,18 +1732,18 @@ class CNTAnalyzer:
             bypass_endpoint_check = False
 
         if area < area_threshold:
-            return [region]
+            return [(region, None)]
 
         skeleton = self._skeletonize(region)
         neighbors = self._build_skeleton_neighbors(skeleton)
         endpoints = self._count_endpoints(skeleton, neighbors) if neighbors else 0
         if not bypass_endpoint_check and endpoints == 2:
-            return [region]
+            return [(region, None)]
 
-        dist = cv2.distanceTransform(region, cv2.DIST_L2, 5)
+        dist = self._foreground_distance_transform(region)
         max_dist = float(dist.max())
         if max_dist <= 1.0:
-            return [region]
+            return [(region, dist)]
 
         sure_fg = cv2.threshold(dist, peak_ratio * max_dist, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
         kernel = np.ones((3, 3), np.uint8)
@@ -1413,7 +1751,7 @@ class CNTAnalyzer:
 
         n_fg, markers = cv2.connectedComponents(sure_fg)
         if n_fg <= 2:
-            return [region]
+            return [(region, dist)]
 
         sure_bg = cv2.dilate(region, kernel, iterations=1)
         unknown = cv2.subtract(sure_bg, sure_fg)
@@ -1434,7 +1772,9 @@ class CNTAnalyzer:
             if cv2.countNonZero(piece) >= min_piece_area:
                 pieces.append(piece)
 
-        return pieces if len(pieces) >= 2 else [region]
+        if len(pieces) >= 2:
+            return [(piece, None) for piece in pieces]
+        return [(region, dist)]
 
     def _get_endpoint_limit(self, profile: str) -> int:
         """根据识别风格返回骨架端点上限"""
@@ -1480,23 +1820,26 @@ class CNTAnalyzer:
                              x_offset: int,
                              y_offset: int,
                              profile: str,
-                             bypass_endpoint_filter: bool = False) -> Optional[dict]:
+                             bypass_endpoint_filter: bool = False,
+                             contour: Optional[np.ndarray] = None,
+                             distance_transform: Optional[np.ndarray] = None) -> Optional[dict]:
         """从局部二值区域提取候选 CNT"""
-        sub_contours, _ = cv2.findContours(cnt_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not sub_contours:
-            return None
-
-        sub_contour = max(sub_contours, key=cv2.contourArea)
+        sub_contour = contour
+        if sub_contour is None:
+            sub_contours, _ = cv2.findContours(cnt_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not sub_contours:
+                return None
+            sub_contour = max(sub_contours, key=cv2.contourArea)
         area = float(cv2.contourArea(sub_contour))
         if area < 1.0:
             return None
 
         skeleton_region = self._skeletonize(cnt_binary)
-        neighbors = self._build_skeleton_neighbors(skeleton_region)
-        if len(neighbors) < 2:
+        skeleton_graph = self._build_skeleton_graph(skeleton_region)
+        if len(skeleton_graph) < 2:
             return None
 
-        best_path = self._find_best_skeleton_path(neighbors, list(SKELETON_ANGLE_THRESHOLDS))
+        best_path = self._find_best_skeleton_graph_path(skeleton_graph, list(SKELETON_ANGLE_THRESHOLDS))
         if len(best_path) < 2:
             return None
         length_px = float(self._calculate_path_length(best_path))
@@ -1516,7 +1859,11 @@ class CNTAnalyzer:
             if endpoint_count <= 0 or endpoint_count > endpoint_limit:
                 return None
 
-        width_stats = self._measure_width(skeleton_region, cnt_binary)
+        width_stats = self._measure_width(
+            skeleton_region,
+            cnt_binary,
+            distance_transform=distance_transform,
+        )
         width_mean_px = float(width_stats['mean'])
         width_median_px = float(width_stats['median'])
         width_iqr_px = float(width_stats['iqr'])
@@ -1655,11 +2002,39 @@ class CNTAnalyzer:
         merged['merged_from'] = len(members)
         return merged
 
+    def _iter_nearby_candidate_pairs(self, candidates: List[dict], distance: float):
+        """Yield possible endpoint neighbors in the original pair ordering."""
+        cells_by_candidate = []
+        buckets: Dict[Tuple[int, int], List[int]] = {}
+        for index, candidate in enumerate(candidates):
+            cells = {
+                (int(np.floor(point[0] / distance)), int(np.floor(point[1] / distance)))
+                for point in self._candidate_endpoints_xy(candidate)
+            }
+            cells_by_candidate.append(cells)
+            for cell in cells:
+                buckets.setdefault(cell, []).append(index)
+
+        for index, cells in enumerate(cells_by_candidate):
+            possible_neighbors = set()
+            for cell_x, cell_y in cells:
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        possible_neighbors.update(
+                            other for other in buckets.get((cell_x + dx, cell_y + dy), ())
+                            if other > index
+                        )
+            # Retain union-find roots, output ordering and subsequent CNT IDs.
+            for next_index in sorted(possible_neighbors):
+                yield index, next_index
+
     def _merge_nearby_cnt_candidates(self,
                                      candidates: List[dict],
                                      merge_distance_px: float,
                                      profile: str) -> List[dict]:
         """合并距离近且主方向一致的候选 CNT"""
+        if not np.isfinite(merge_distance_px):
+            raise ValueError("合并距离必须为有限数值")
         if merge_distance_px <= 0 or len(candidates) < 2:
             return candidates
 
@@ -1677,18 +2052,17 @@ class CNTAnalyzer:
             if root_first != root_second:
                 parents[root_second] = root_first
 
-        for index in range(len(candidates)):
-            for next_index in range(index + 1, len(candidates)):
-                metrics = self._candidate_pair_metrics(candidates[index], candidates[next_index])
-                if metrics.get('distance', float('inf')) > merge_distance_px:
-                    continue
-                if metrics.get('angle_diff', 180.0) > CNT_MERGE_MAX_ANGLE_DIFF_DEG:
-                    continue
-                if metrics.get('alignment_a', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
-                    continue
-                if metrics.get('alignment_b', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
-                    continue
-                union(index, next_index)
+        for index, next_index in self._iter_nearby_candidate_pairs(candidates, merge_distance_px):
+            metrics = self._candidate_pair_metrics(candidates[index], candidates[next_index])
+            if metrics.get('distance', float('inf')) > merge_distance_px:
+                continue
+            if metrics.get('angle_diff', 180.0) > CNT_MERGE_MAX_ANGLE_DIFF_DEG:
+                continue
+            if metrics.get('alignment_a', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
+                continue
+            if metrics.get('alignment_b', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
+                continue
+            union(index, next_index)
 
         groups: Dict[int, List[dict]] = {}
         for index, candidate in enumerate(candidates):
@@ -1797,6 +2171,8 @@ class CNTAnalyzer:
 
         y1, y2, x1, x2 = self._get_analysis_region(roi)
         candidates: List[dict] = []
+        split_mode_key = (split_mode or "conservative").lower()
+        split_disabled = split_mode_key in ("off", "none", "close", "0")
         length_factor = self._get_profile_length_factor(profile)
         eff_min_length_px = 0.0
         if min_length_um > 0 and self.scale_um_per_pixel > 0:
@@ -1826,15 +2202,26 @@ class CNTAnalyzer:
             relative_contour = contour - np.array([x_min, y_min])
             mask = np.zeros(cnt_region.shape, dtype=np.uint8)
             cv2.drawContours(mask, [relative_contour], 0, 255, -1)
+            cv2.bitwise_and(cnt_region, mask, dst=mask)
 
-            cnt_binary = cnt_region & mask
-            split_regions = self._split_stuck_cnt_region(cnt_binary, split_mode=split_mode)
-            for sub_binary in split_regions:
+            if not split_disabled:
+                candidate_regions = [
+                    (sub_binary, None, distance_transform)
+                    for sub_binary, distance_transform in self._split_stuck_cnt_region_with_distance(
+                        mask,
+                        split_mode=split_mode_key,
+                    )
+                ]
+            if split_disabled:
+                candidate_regions = [(mask, relative_contour, None)]
+            for sub_binary, sub_contour, distance_transform in candidate_regions:
                 candidate = self._build_cnt_candidate(
                     sub_binary,
                     x_offset=x_min,
                     y_offset=y_min,
                     profile=profile,
+                    contour=sub_contour,
+                    distance_transform=distance_transform,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -1862,6 +2249,267 @@ class CNTAnalyzer:
             cnt_id += 1
 
         return output
+
+    # ===== 深色紧凑颗粒检测 =====
+    @staticmethod
+    def _particle_ramp(value: float, low: float, high: float) -> float:
+        """将颗粒特征线性映射到 0..1。"""
+        if high <= low:
+            return 1.0 if value >= high else 0.0
+        return float(np.clip((float(value) - low) / (high - low), 0.0, 1.0))
+
+    @staticmethod
+    def _particle_component_shape(binary: np.ndarray) -> dict:
+        """计算单个颗粒连通域的紧凑形态特征。"""
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return {}
+        contour = max(contours, key=cv2.contourArea)
+        contour_area = float(cv2.contourArea(contour))
+        if contour_area <= 0:
+            return {}
+        perimeter = float(cv2.arcLength(contour, True))
+        hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+        x, y, width, height = cv2.boundingRect(contour)
+        pixel_area = int(np.count_nonzero(binary))
+        core_radius = float(CNTAnalyzer._foreground_distance_transform(binary).max())
+        return {
+            'contour': contour,
+            'area': float(pixel_area),
+            'contour_area': contour_area,
+            'circularity': float(4.0 * np.pi * contour_area / (perimeter ** 2)) if perimeter > 0 else 0.0,
+            'solidity': float(contour_area / hull_area) if hull_area > 0 else 0.0,
+            'fill_ratio': float(pixel_area / max(1, width * height)),
+            'aspect_ratio': float(max(width, height) / max(1, min(width, height))),
+            'core_radius': core_radius,
+            'bbox': (int(x), int(y), int(width), int(height)),
+        }
+
+    @staticmethod
+    def _build_particle_mask(local_contrast: np.ndarray, threshold: float) -> np.ndarray:
+        mask = np.where(local_contrast >= float(threshold), 255, 0).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    def _get_particle_measurements(self, roi: Optional[ROIRegion] = None) -> List[ParticleMeasurement]:
+        return roi.particle_measurements if roi is not None else self.particle_measurements
+
+    def _get_particle_exclusion_mask(self, roi: Optional[ROIRegion] = None) -> np.ndarray:
+        """返回颗粒检测专用的比例尺排除掩码。
+
+        优先复用已定位的比例尺区域；尚未定位时，将整图右下角的保守
+        排除区映射到当前 ROI，保证全图和 ROI 使用相同口径。
+        """
+        y1, y2, x1, x2 = self._get_analysis_region(roi)
+        height = max(1, y2 - y1)
+        width = max(1, x2 - x1)
+        exclusion_mask = self.get_scale_exclusion_mask(roi)
+        if exclusion_mask is not None and exclusion_mask.shape == (height, width):
+            return exclusion_mask
+
+        original = self.original_image if self.original_image is not None else self._get_analysis_image()
+        image_height, image_width = original.shape[:2]
+        fallback_x1 = int(image_width * 0.84)
+        fallback_y1 = int(image_height * 0.88)
+        local_x1 = max(0, fallback_x1 - x1)
+        local_y1 = max(0, fallback_y1 - y1)
+        local_x2 = min(width, image_width - x1)
+        local_y2 = min(height, image_height - y1)
+
+        fallback_mask = np.zeros((height, width), dtype=np.uint8)
+        if local_x2 > local_x1 and local_y2 > local_y1:
+            fallback_mask[local_y1:local_y2, local_x1:local_x2] = 255
+        return fallback_mask
+
+    def detect_particles(self,
+                         roi: Optional[ROIRegion] = None,
+                         min_confidence: float = PARTICLE_MIN_CONFIDENCE) -> List[ParticleMeasurement]:
+        """识别相对局部背景更暗且保持二维紧凑形态的颗粒。
+
+        该检测链路独立于 CNT 骨架检测。它同时检查主阈值下的暗度/几何
+        特征，以及放宽阈值后的形态稳定性，以抑制细长 CNT 和交叉结点。
+        """
+        original = self.original_image if self.original_image is not None else self._get_analysis_image()
+        y1, y2, x1, x2 = self._get_analysis_region(roi)
+        region = original[y1:y2, x1:x2]
+        if region is None or region.size == 0:
+            raise ValueError("颗粒分析区域为空")
+
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        foreground = cv2.GaussianBlur(
+            gray, (0, 0), float(PARTICLE_FOREGROUND_SIGMA)
+        ).astype(np.float32)
+        background = cv2.GaussianBlur(
+            gray, (0, 0), float(PARTICLE_LOCAL_BACKGROUND_SIGMA)
+        ).astype(np.float32)
+        local_contrast = background - foreground
+
+        adaptive_threshold = float(np.percentile(local_contrast, 96.0))
+        threshold = float(np.clip(
+            adaptive_threshold,
+            PARTICLE_LOCAL_CONTRAST_THRESHOLD * 0.70,
+            PARTICLE_LOCAL_CONTRAST_THRESHOLD * 1.30,
+        ))
+        loose_threshold = max(8.0, threshold * 0.60)
+        mask = self._build_particle_mask(local_contrast, threshold)
+        loose_mask = self._build_particle_mask(local_contrast, loose_threshold)
+
+        exclusion_mask = self._get_particle_exclusion_mask(roi)
+        mask[exclusion_mask > 0] = 0
+        loose_mask[exclusion_mask > 0] = 0
+
+        component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        _, loose_labels, loose_stats, _ = cv2.connectedComponentsWithStats(loose_mask, 8)
+        full_image_area = max(1, int(original.shape[0] * original.shape[1]))
+        max_area = max(PARTICLE_MIN_AREA_PX + 1, int(full_image_area * PARTICLE_MAX_AREA_RATIO))
+        output: List[ParticleMeasurement] = []
+        accepted_mask = np.zeros_like(mask)
+
+        for label_id in range(1, component_count):
+            bx, by, bw, bh, pixel_area = [int(value) for value in stats[label_id]]
+            if pixel_area < PARTICLE_MIN_AREA_PX or pixel_area > max_area:
+                continue
+            if bx <= 0 or by <= 0 or bx + bw >= region.shape[1] or by + bh >= region.shape[0]:
+                continue
+
+            component = (labels[by:by + bh, bx:bx + bw] == label_id).astype(np.uint8)
+            shape = self._particle_component_shape(component)
+            if not shape:
+                continue
+            if (
+                shape['aspect_ratio'] > PARTICLE_MAX_ASPECT_RATIO or
+                shape['solidity'] < PARTICLE_MIN_SOLIDITY or
+                shape['fill_ratio'] < PARTICLE_MIN_FILL_RATIO or
+                shape['core_radius'] < PARTICLE_MIN_CORE_RADIUS_PX
+            ):
+                continue
+
+            component_pixels = labels == label_id
+            values = local_contrast[component_pixels]
+            mean_contrast = float(np.mean(values))
+            peak_contrast = float(np.max(values))
+            if peak_contrast < threshold * 2.6:
+                continue
+
+            peak_y, peak_x = np.unravel_index(
+                int(np.argmax(np.where(component_pixels, local_contrast, -np.inf))),
+                local_contrast.shape,
+            )
+            loose_id = int(loose_labels[peak_y, peak_x])
+            if loose_id <= 0:
+                continue
+            lbx, lby, lbw, lbh, loose_area = [int(value) for value in loose_stats[loose_id]]
+            loose_component = (
+                loose_labels[lby:lby + lbh, lbx:lbx + lbw] == loose_id
+            ).astype(np.uint8)
+            loose_shape = self._particle_component_shape(loose_component)
+            if not loose_shape:
+                continue
+            if (
+                loose_shape['aspect_ratio'] > PARTICLE_MAX_ASPECT_RATIO or
+                loose_shape['solidity'] < 0.50 or
+                loose_shape['fill_ratio'] < 0.40
+            ):
+                continue
+
+            compact_score = (
+                0.25 * self._particle_ramp(shape['solidity'], 0.45, 0.90) +
+                0.20 * self._particle_ramp(shape['fill_ratio'], 0.30, 0.72) +
+                0.20 * self._particle_ramp(shape['core_radius'], 1.30, 4.00) +
+                0.20 * (1.0 - self._particle_ramp(shape['aspect_ratio'], 1.30, 3.00)) +
+                0.15 * self._particle_ramp(shape['circularity'], 0.20, 0.85)
+            )
+            contrast_score = (
+                0.55 * self._particle_ramp(mean_contrast, threshold * 1.10, threshold * 2.90) +
+                0.45 * self._particle_ramp(peak_contrast, threshold * 2.25, threshold * 4.75)
+            )
+            size_score = self._particle_ramp(pixel_area, 5.0, 25.0)
+            base_score = 0.50 * contrast_score + 0.38 * compact_score + 0.12 * size_score
+            loose_score = (
+                0.45 * self._particle_ramp(loose_shape['solidity'], 0.40, 0.90) +
+                0.40 * self._particle_ramp(loose_shape['fill_ratio'], 0.20, 0.65) +
+                0.15 * (1.0 - self._particle_ramp(loose_shape['aspect_ratio'], 1.50, 4.00))
+            )
+            persistence = float(pixel_area / max(1, loose_area))
+            confidence = float(np.clip(
+                0.68 * base_score +
+                0.24 * loose_score +
+                0.08 * self._particle_ramp(persistence, 0.25, 0.85),
+                0.0,
+                1.0,
+            ))
+            if confidence < float(min_confidence):
+                continue
+
+            local_contour = shape['contour'] + np.array([bx, by], dtype=np.int32)
+            contour = local_contour + np.array([x1, y1], dtype=np.int32)
+            rect = cv2.minAreaRect(local_contour)
+            major_axis = float(max(rect[1]))
+            minor_axis = float(min(rect[1]))
+            equivalent_diameter = float(np.sqrt(4.0 * pixel_area / np.pi))
+            cx, cy = centroids[label_id]
+            scale = float(self.scale_um_per_pixel)
+            output.append(ParticleMeasurement(
+                id=len(output),
+                contour=contour.astype(np.int32),
+                centroid=(float(cx + x1), float(cy + y1)),
+                area_pixels=float(pixel_area),
+                equivalent_diameter_pixels=equivalent_diameter,
+                major_axis_pixels=major_axis,
+                minor_axis_pixels=minor_axis,
+                area_um2=float(pixel_area * scale * scale),
+                equivalent_diameter_um=float(equivalent_diameter * scale),
+                major_axis_um=float(major_axis * scale),
+                minor_axis_um=float(minor_axis * scale),
+                circularity=float(shape['circularity']),
+                solidity=float(shape['solidity']),
+                aspect_ratio=float(shape['aspect_ratio']),
+                mean_local_contrast=mean_contrast,
+                peak_local_contrast=peak_contrast,
+                confidence=confidence,
+            ))
+            accepted_mask[component_pixels] = 255
+
+        output.sort(key=lambda item: (item.centroid[1], item.centroid[0]))
+        for particle_id, particle in enumerate(output):
+            particle.id = particle_id
+        if roi is not None:
+            roi.particle_measurements = output
+        else:
+            self.particle_measurements = output
+        self.particle_mask = accepted_mask
+        return output
+
+    def get_particle_statistics(self, roi: Optional[ROIRegion] = None) -> Dict[str, object]:
+        particles = self._get_particle_measurements(roi)
+        if not particles:
+            return {
+                'count': 0,
+                'total_area_pixels': 0.0,
+                'total_area_um2': 0.0,
+                'area_ratio': 0.0,
+                'equivalent_diameter_mean_um': 0.0,
+                'equivalent_diameter_median_um': 0.0,
+                'equivalent_diameter_max_um': 0.0,
+                'confidence_mean': 0.0,
+            }
+        y1, y2, x1, x2 = self._get_analysis_region(roi)
+        region_area = max(1, int((y2 - y1) * (x2 - x1)))
+        exclusion_mask = self._get_particle_exclusion_mask(roi)
+        valid_area_pixels = max(1, region_area - int(np.count_nonzero(exclusion_mask)))
+        diameters = np.asarray([item.equivalent_diameter_um for item in particles], dtype=float)
+        total_area_pixels = float(sum(item.area_pixels for item in particles))
+        return {
+            'count': len(particles),
+            'total_area_pixels': total_area_pixels,
+            'total_area_um2': float(sum(item.area_um2 for item in particles)),
+            'area_ratio': float(total_area_pixels / valid_area_pixels),
+            'equivalent_diameter_mean_um': float(np.mean(diameters)),
+            'equivalent_diameter_median_um': float(np.median(diameters)),
+            'equivalent_diameter_max_um': float(np.max(diameters)),
+            'confidence_mean': float(np.mean([item.confidence for item in particles])),
+        }
 
     # ===== 可视化方法 =====
     def get_visualization(self, roi: Optional[ROIRegion] = None) -> np.ndarray:
@@ -1896,6 +2544,37 @@ class CNTAnalyzer:
                 cv2.putText(vis_image, text, (cx - 50, cy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 0), 1)
 
+        return vis_image
+
+    def get_particle_visualization(self, roi: Optional[ROIRegion] = None) -> np.ndarray:
+        """获取颗粒专用标注图；红色轮廓与 P 编号不参与 CNT 统计。"""
+        if self.image is None:
+            raise ValueError("请先加载图像")
+        vis_image = self.image.copy()
+        self._draw_scale_exclusion_annotation(vis_image)
+        for region in self.rois:
+            cv2.rectangle(
+                vis_image,
+                (region.x, region.y),
+                (region.x + region.width, region.y + region.height),
+                region.color,
+                2,
+            )
+        for particle in self._get_particle_measurements(roi):
+            cv2.drawContours(vis_image, [particle.contour], -1, (0, 0, 255), 2)
+            cx, cy = (int(round(value)) for value in particle.centroid)
+            radius = max(5, int(round(particle.equivalent_diameter_pixels * 0.65)))
+            cv2.circle(vis_image, (cx, cy), radius, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(
+                vis_image,
+                f"P{particle.id + 1}",
+                (cx + radius + 2, max(12, cy - radius)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (0, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
         return vis_image
 
     def get_visualization_with_skeleton(self, roi: Optional[ROIRegion] = None) -> np.ndarray:
@@ -2028,10 +2707,28 @@ class CNTAnalyzer:
         if len(centroid_array) < 2:
             return result
 
-        diffs = centroid_array[:, None, :] - centroid_array[None, :, :]
-        distances = np.sqrt(np.sum(diffs ** 2, axis=2))
-        np.fill_diagonal(distances, np.inf)
-        nearest_distances = np.min(distances, axis=1)
+        # Bound working memory independently of point count.  Each off-diagonal
+        # tile supplies both directions, so each pair is evaluated only once.
+        points = np.asarray(centroid_array, dtype=np.float64)
+        count = len(points)
+        nearest_squared = np.full(count, np.inf, dtype=np.float64)
+        block_size = 256
+        for start in range(0, count, block_size):
+            stop = min(start + block_size, count)
+            for other_start in range(start, count, block_size):
+                other_stop = min(other_start + block_size, count)
+                diffs = points[start:stop, None, :] - points[None, other_start:other_stop, :]
+                np.square(diffs, out=diffs)
+                distances_squared = np.sum(diffs, axis=2)
+                del diffs
+                if start == other_start:
+                    np.fill_diagonal(distances_squared, np.inf)
+                np.minimum(nearest_squared[start:stop], distances_squared.min(axis=1),
+                           out=nearest_squared[start:stop])
+                if start != other_start:
+                    np.minimum(nearest_squared[other_start:other_stop], distances_squared.min(axis=0),
+                               out=nearest_squared[other_start:other_stop])
+        nearest_distances = np.sqrt(nearest_squared)
         nn_mean = float(np.mean(nearest_distances))
         nn_std = float(np.std(nearest_distances))
         nn_cv = float(nn_std / nn_mean) if nn_mean > 0 else 0.0
@@ -2080,14 +2777,15 @@ class CNTAnalyzer:
                                    local_contours: List[np.ndarray],
                                    width: int,
                                    height: int,
-                                   grid_size: int) -> np.ndarray:
+                                   grid_size: int,
+                                   coverage_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """按像素覆盖率构建网格，作为团聚程度的辅助参考。"""
         grid = np.zeros((grid_size, grid_size), dtype=float)
         if not local_contours or width <= 0 or height <= 0:
             return grid
 
-        mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.drawContours(mask, local_contours, -1, 255, -1)
+        if coverage_mask is None:
+            coverage_mask = self._build_coverage_mask(local_contours, width, height)
 
         # Use linspace for equal-size cell boundaries
         row_edges = np.linspace(0, height, grid_size + 1).astype(int)
@@ -2096,9 +2794,20 @@ class CNTAnalyzer:
             y1, y2 = row_edges[row], row_edges[row + 1]
             for col in range(grid_size):
                 x1, x2 = col_edges[col], col_edges[col + 1]
-                cell = mask[y1:y2, x1:x2]
+                cell = coverage_mask[y1:y2, x1:x2]
                 grid[row, col] = float(np.count_nonzero(cell) / max(1, cell.size))
         return grid
+
+    @staticmethod
+    def _build_coverage_mask(local_contours: List[np.ndarray], width: int, height: int) -> np.ndarray:
+        """Rasterize CNT contours once so multiple grid sizes can share the same mask."""
+        mask = np.zeros((max(0, height), max(0, width)), dtype=np.uint8)
+        if local_contours and width > 0 and height > 0:
+            # These are independent objects, not a contour hierarchy.  Filling
+            # them together applies the even-odd rule and erases overlaps.
+            for contour in local_contours:
+                cv2.drawContours(mask, [contour], 0, 255, -1)
+        return mask
 
     def _build_shadow_density_grid(self,
                                    offset_x: int,
@@ -2106,11 +2815,40 @@ class CNTAnalyzer:
                                    width: int,
                                    height: int,
                                    grid_size: int,
-                                   roi: Optional[ROIRegion] = None) -> np.ndarray:
+                                   roi: Optional[ROIRegion] = None,
+                                   shadow_response: Optional[np.ndarray] = None) -> np.ndarray:
         """按原图阴影强度构建网格，捕捉大束 CNT 下方的暗影团聚区。"""
         grid = np.zeros((grid_size, grid_size), dtype=float)
         if width <= 0 or height <= 0:
             return grid
+
+        if shadow_response is None:
+            shadow_response = self._build_shadow_response(offset_x, offset_y, width, height, roi=roi)
+        if shadow_response is None:
+            return grid
+
+        local_height, local_width = shadow_response.shape[:2]
+        row_edges = np.linspace(0, local_height, grid_size + 1).astype(int)
+        col_edges = np.linspace(0, local_width, grid_size + 1).astype(int)
+        for row in range(grid_size):
+            cell_y1, cell_y2 = row_edges[row], row_edges[row + 1]
+            for col in range(grid_size):
+                cell_x1, cell_x2 = col_edges[col], col_edges[col + 1]
+                cell = shadow_response[cell_y1:cell_y2, cell_x1:cell_x2]
+                if cell.size == 0:
+                    continue
+                grid[row, col] = float(np.mean(cell))
+        return grid
+
+    def _build_shadow_response(self,
+                               offset_x: int,
+                               offset_y: int,
+                               width: int,
+                               height: int,
+                               roi: Optional[ROIRegion] = None) -> Optional[np.ndarray]:
+        """Build the grid-independent shadow response shared across grid sizes."""
+        if width <= 0 or height <= 0:
+            return None
 
         if self.original_image is not None:
             gray_source = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
@@ -2122,11 +2860,11 @@ class CNTAnalyzer:
         x1 = max(0, int(offset_x))
         x2 = min(gray_source.shape[1], int(offset_x + width))
         if y2 <= y1 or x2 <= x1:
-            return grid
+            return None
 
         local_gray = gray_source[y1:y2, x1:x2].copy()
         if local_gray.size == 0:
-            return grid
+            return None
 
         exclusion_mask = self.get_scale_exclusion_mask(roi)
         if exclusion_mask is not None and exclusion_mask.shape == local_gray.shape and np.any(exclusion_mask):
@@ -2144,22 +2882,8 @@ class CNTAnalyzer:
         low = float(np.percentile(darkness, 55))
         high = float(np.percentile(darkness, 96))
         if high <= low:
-            return grid
-
-        shadow_response = np.clip((darkness - low) / (high - low), 0.0, 1.0)
-
-        local_height, local_width = shadow_response.shape[:2]
-        row_edges = np.linspace(0, local_height, grid_size + 1).astype(int)
-        col_edges = np.linspace(0, local_width, grid_size + 1).astype(int)
-        for row in range(grid_size):
-            cell_y1, cell_y2 = row_edges[row], row_edges[row + 1]
-            for col in range(grid_size):
-                cell_x1, cell_x2 = col_edges[col], col_edges[col + 1]
-                cell = shadow_response[cell_y1:cell_y2, cell_x1:cell_x2]
-                if cell.size == 0:
-                    continue
-                grid[row, col] = float(np.mean(cell))
-        return grid
+            return None
+        return np.clip((darkness - low) / (high - low), 0.0, 1.0)
 
     def _summarize_density_grid(self, grid: np.ndarray) -> Dict[str, float]:
         """汇总网格分布统计量。"""
@@ -2419,9 +3143,51 @@ class CNTAnalyzer:
         aggregation_scores['range_component'] = float(np.clip(float(uniformity_scores.get('range_component', 0.0)) * 100.0, 0.0, 100.0))
         return aggregation_scores
 
+    def _prepare_spatial_distribution_context(self,
+                                              roi: Optional[ROIRegion] = None) -> Optional[_SpatialDistributionContext]:
+        """Compute grid-independent spatial statistics once for multiple grid views."""
+        measurements, offset_x, offset_y, width, height = self._get_local_measurements(roi)
+        if not measurements or width <= 0 or height <= 0:
+            return None
+
+        centroids, local_contours = self._extract_spatial_distribution_inputs(
+            measurements, offset_x, offset_y
+        )
+        centroid_array = np.array(centroids, dtype=float)
+        nearest_neighbor_stats = self._calculate_nearest_neighbor_stats(centroid_array, width, height)
+        coverage_mask = self._build_coverage_mask(local_contours, width, height)
+        shadow_response = self._build_shadow_response(offset_x, offset_y, width, height, roi=roi)
+
+        lengths_um = [
+            float(measurement.length_um)
+            for measurement in measurements
+            if measurement.length_um is not None and np.isfinite(float(measurement.length_um))
+        ]
+        long_tube_ratio = 0.0
+        if len(centroids) >= 2 and lengths_um:
+            long_count = sum(length >= UNIFORMITY_LONG_TUBE_THRESHOLD_UM for length in lengths_um)
+            long_tube_ratio = float(long_count / len(lengths_um))
+
+        return _SpatialDistributionContext(
+            measurements=measurements,
+            offset_x=int(offset_x),
+            offset_y=int(offset_y),
+            width=int(width),
+            height=int(height),
+            centroids=centroids,
+            local_contours=local_contours,
+            centroid_array=centroid_array,
+            nearest_neighbor_stats=nearest_neighbor_stats,
+            coverage_mask=coverage_mask,
+            shadow_response=shadow_response,
+            long_tube_ratio=long_tube_ratio,
+        )
+
     def analyze_spatial_distribution(self,
                                      roi: Optional[ROIRegion] = None,
-                                     grid_size: Optional[int] = None) -> Dict[str, object]:
+                                     grid_size: Optional[int] = None,
+                                     *,
+                                     context: Optional[_SpatialDistributionContext] = None) -> Dict[str, object]:
         """分析 CNT 空间分布均匀性。
 
         说明:
@@ -2429,34 +3195,64 @@ class CNTAnalyzer:
             - 主均匀性得分基于像素覆盖率 CV、热点面积占比与密度极差项。
             - 额外返回统一方向的主分与等级标签，便于在对比图中稳定展示。
         """
-        measurements, offset_x, offset_y, width, height = self._get_local_measurements(roi)
-
-        if not measurements or width <= 0 or height <= 0:
-            return {}
-
-        centroids, local_contours = self._extract_spatial_distribution_inputs(
-            measurements, offset_x, offset_y
-        )
-        centroid_array = np.array(centroids, dtype=float)
+        if context is None:
+            measurements, offset_x, offset_y, width, height = self._get_local_measurements(roi)
+            if not measurements or width <= 0 or height <= 0:
+                return {}
+            centroids, local_contours = self._extract_spatial_distribution_inputs(
+                measurements, offset_x, offset_y
+            )
+            centroid_array = np.array(centroids, dtype=float)
+            nn_stats = self._calculate_nearest_neighbor_stats(centroid_array, width, height)
+            long_tube_ratio = 0.0
+            if measurements and len(centroids) >= 2:
+                lengths_um = [
+                    float(measurement.length_um)
+                    for measurement in measurements
+                    if measurement.length_um is not None and np.isfinite(float(measurement.length_um))
+                ]
+                if lengths_um:
+                    long_count = sum(length >= UNIFORMITY_LONG_TUBE_THRESHOLD_UM for length in lengths_um)
+                    long_tube_ratio = float(long_count / len(lengths_um))
+        else:
+            measurements = context.measurements
+            offset_x = context.offset_x
+            offset_y = context.offset_y
+            width = context.width
+            height = context.height
+            centroids = context.centroids
+            local_contours = context.local_contours
+            nn_stats = context.nearest_neighbor_stats
+            long_tube_ratio = context.long_tube_ratio
 
         grid_size = self._resolve_spatial_grid_size(len(centroids), grid_size)
-        nn_stats = self._calculate_nearest_neighbor_stats(centroid_array, width, height)
         point_density_grid = self._build_centroid_count_grid(centroids, width, height, grid_size)
-        coverage_density_grid = self._build_coverage_ratio_grid(local_contours, width, height, grid_size)
-        shadow_density_grid = self._build_shadow_density_grid(offset_x, offset_y, width, height, grid_size, roi=roi)
+        if context is None:
+            coverage_density_grid = self._build_coverage_ratio_grid(local_contours, width, height, grid_size)
+            shadow_density_grid = self._build_shadow_density_grid(
+                offset_x, offset_y, width, height, grid_size, roi=roi
+            )
+        else:
+            coverage_density_grid = self._build_coverage_ratio_grid(
+                local_contours,
+                width,
+                height,
+                grid_size,
+                coverage_mask=context.coverage_mask,
+            )
+            shadow_density_grid = self._build_shadow_density_grid(
+                offset_x,
+                offset_y,
+                width,
+                height,
+                grid_size,
+                roi=roi,
+                shadow_response=context.shadow_response,
+            )
         point_grid_stats = self._summarize_density_grid(point_density_grid)
         coverage_grid_stats = self._summarize_density_grid(coverage_density_grid)
         shadow_grid_stats = self._summarize_density_grid(shadow_density_grid)
         morans_i = self._calculate_grid_morans_i(point_density_grid)
-
-        # 计算长管比例作为诊断信息
-        long_tube_ratio = 0.0
-        if measurements and len(centroids) >= 2:
-            lengths_um = [float(m.length_um) for m in measurements
-                          if m.length_um is not None and np.isfinite(float(m.length_um))]
-            if lengths_um:
-                long_count = sum(1 for l in lengths_um if l >= UNIFORMITY_LONG_TUBE_THRESHOLD_UM)
-                long_tube_ratio = float(long_count / len(lengths_um))
 
         spatial_distribution = {
             'grid_size': int(grid_size),
@@ -3101,7 +3897,9 @@ class CNTAnalyzer:
 
     def get_dispersed_statistics(self,
                                  roi: Optional[ROIRegion] = None,
-                                 strictness: str = "all_hotspots") -> Dict[str, object]:
+                                 strictness: str = "all_hotspots",
+                                 *,
+                                 spatial_context: Optional[_SpatialDistributionContext] = None) -> Dict[str, object]:
         """获取排除团聚区域后的分散CNT统计信息
         
         Args:
@@ -3131,7 +3929,13 @@ class CNTAnalyzer:
             }
         
         # 获取空间分布分析结果
-        if 'analyze_spatial_distribution' in getattr(self, '__dict__', {}):
+        if spatial_context is not None:
+            spatial_distribution = self.analyze_spatial_distribution(
+                roi,
+                grid_size=10,
+                context=spatial_context,
+            )
+        elif 'analyze_spatial_distribution' in getattr(self, '__dict__', {}):
             spatial_distribution = self.analyze_spatial_distribution(roi)
         else:
             spatial_distribution = self.analyze_spatial_distribution(roi, grid_size=10)
@@ -3230,7 +4034,10 @@ class CNTAnalyzer:
             'severe_mask': severe_mask,
         }
 
-    def get_statistics(self, roi: Optional[ROIRegion] = None) -> Dict[str, object]:
+    def get_statistics(self,
+                       roi: Optional[ROIRegion] = None,
+                       *,
+                       spatial_context: Optional[_SpatialDistributionContext] = None) -> Dict[str, object]:
         """获取测量结果的统计信息
 
         Args:
@@ -3241,19 +4048,238 @@ class CNTAnalyzer:
         """
         measurements = roi.measurements if roi else self.measurements
 
+        particle_stats = self.get_particle_statistics(roi)
         if not measurements:
-            return {}
+            return {
+                **self._summarize_length_statistics([]),
+                'spatial_distribution': {},
+                'particle_statistics': particle_stats,
+            }
 
         length_stats = self._summarize_length_statistics(measurements)
-        spatial_distribution = self.analyze_spatial_distribution(roi)
+        spatial_distribution = (
+            self.analyze_spatial_distribution(roi, context=spatial_context)
+            if spatial_context is not None else
+            self.analyze_spatial_distribution(roi)
+        )
 
         return {
             **length_stats,
             'spatial_distribution': spatial_distribution,
+            'particle_statistics': particle_stats,
         }
+
+    def get_statistics_bundle(self,
+                              roi: Optional[ROIRegion] = None) -> Tuple[Dict[str, object], Dict[str, object]]:
+        """Return primary and dispersed statistics from one shared spatial context."""
+        spatial_context = self._prepare_spatial_distribution_context(roi)
+        stats = self.get_statistics(roi, spatial_context=spatial_context)
+        dispersed_stats = self.get_dispersed_statistics(
+            roi,
+            spatial_context=spatial_context,
+        )
+        return stats, dispersed_stats
 
 
 # ===== Numba 优化函数 =====
+def _build_skeleton_adjacency_numpy(points: np.ndarray,
+                                    height: int,
+                                    width: int) -> Tuple[np.ndarray, np.ndarray]:
+    """NumPy fallback for the compact skeleton adjacency builder."""
+    neighbor_indices = np.full((len(points), 8), -1, dtype=np.int32)
+    degrees = np.zeros(len(points), dtype=np.uint8)
+    if len(points) == 0 or height <= 0 or width <= 0:
+        return neighbor_indices, degrees
+
+    index_map = np.full((height, width), -1, dtype=np.int32)
+    index_map[points[:, 0], points[:, 1]] = np.arange(len(points), dtype=np.int32)
+    for point_index, (y, x) in enumerate(points):
+        degree = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                neighbor_y = int(y) + dy
+                neighbor_x = int(x) + dx
+                if 0 <= neighbor_y < height and 0 <= neighbor_x < width:
+                    neighbor_index = int(index_map[neighbor_y, neighbor_x])
+                    if neighbor_index >= 0:
+                        neighbor_indices[point_index, degree] = neighbor_index
+                        degree += 1
+        degrees[point_index] = degree
+    return neighbor_indices, degrees
+
+
+@jit(nopython=True, cache=True)
+def _build_skeleton_adjacency_fast(points: np.ndarray,
+                                   height: int,
+                                   width: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build an N×8 adjacency array without Python dictionaries or edge tuples."""
+    point_count = len(points)
+    neighbor_indices = np.full((point_count, 8), -1, dtype=np.int32)
+    degrees = np.zeros(point_count, dtype=np.uint8)
+    if point_count == 0 or height <= 0 or width <= 0:
+        return neighbor_indices, degrees
+
+    index_map = np.full((height, width), -1, dtype=np.int32)
+    for point_index in range(point_count):
+        index_map[points[point_index, 0], points[point_index, 1]] = point_index
+
+    for point_index in range(point_count):
+        y = points[point_index, 0]
+        x = points[point_index, 1]
+        degree = 0
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                if dy == 0 and dx == 0:
+                    continue
+                neighbor_y = y + dy
+                neighbor_x = x + dx
+                if 0 <= neighbor_y < height and 0 <= neighbor_x < width:
+                    neighbor_index = index_map[neighbor_y, neighbor_x]
+                    if neighbor_index >= 0:
+                        neighbor_indices[point_index, degree] = neighbor_index
+                        degree += 1
+        degrees[point_index] = degree
+    return neighbor_indices, degrees
+
+
+@jit(nopython=True, cache=True)
+def _trace_simple_skeleton_indices_fast(neighbor_indices: np.ndarray,
+                                        degrees: np.ndarray,
+                                        start_index: int) -> Tuple[np.ndarray, int]:
+    """Trace an unbranched chain in linear time using compact adjacency arrays."""
+    point_count = len(degrees)
+    path_indices = np.empty(point_count, dtype=np.int32)
+    if point_count == 0 or start_index < 0 or start_index >= point_count:
+        return path_indices, 0
+
+    previous_index = -1
+    current_index = start_index
+    path_length = 0
+    while path_length < point_count:
+        path_indices[path_length] = current_index
+        path_length += 1
+
+        next_index = -1
+        degree = int(degrees[current_index])
+        for neighbor_offset in range(degree):
+            candidate_index = int(neighbor_indices[current_index, neighbor_offset])
+            if candidate_index != previous_index:
+                next_index = candidate_index
+                break
+        if next_index < 0:
+            break
+        previous_index = current_index
+        current_index = next_index
+
+    return path_indices, path_length
+
+
+@jit(nopython=True, cache=True)
+def _find_farthest_skeleton_graph_node_fast(points: np.ndarray,
+                                             neighbor_indices: np.ndarray,
+                                             degrees: np.ndarray,
+                                             start_index: int,
+                                             target_indices: np.ndarray) -> Tuple[int, np.ndarray, np.ndarray]:
+    """Dijkstra over compact arrays with legacy distance/coordinate tie ordering."""
+    point_count = len(points)
+    distances = np.full(point_count, np.inf, dtype=np.float64)
+    parents = np.full(point_count, -1, dtype=np.int32)
+    visited = np.zeros(point_count, dtype=np.uint8)
+    distances[start_index] = 0.0
+
+    for _ in range(point_count):
+        current_index = -1
+        current_distance = np.inf
+        current_y = 0
+        current_x = 0
+        for point_index in range(point_count):
+            if visited[point_index] != 0:
+                continue
+            point_distance = distances[point_index]
+            if not np.isfinite(point_distance):
+                continue
+            point_y = int(points[point_index, 0])
+            point_x = int(points[point_index, 1])
+            if (
+                current_index < 0 or
+                point_distance < current_distance or
+                (
+                    point_distance == current_distance and
+                    (point_y < current_y or (point_y == current_y and point_x < current_x))
+                )
+            ):
+                current_index = point_index
+                current_distance = point_distance
+                current_y = point_y
+                current_x = point_x
+
+        if current_index < 0:
+            break
+        visited[current_index] = 1
+        degree = int(degrees[current_index])
+        for neighbor_offset in range(degree):
+            neighbor_index = int(neighbor_indices[current_index, neighbor_offset])
+            dy = int(points[neighbor_index, 0]) - int(points[current_index, 0])
+            dx = int(points[neighbor_index, 1]) - int(points[current_index, 1])
+            new_distance = current_distance + np.sqrt(float(dy * dy + dx * dx))
+            if new_distance + 1e-9 < distances[neighbor_index]:
+                distances[neighbor_index] = new_distance
+                parents[neighbor_index] = current_index
+
+    farthest_index = start_index
+    farthest_distance = -1.0
+    for target_offset in range(len(target_indices)):
+        target_index = int(target_indices[target_offset])
+        point_distance = distances[target_index]
+        if not np.isfinite(point_distance):
+            continue
+        if point_distance > farthest_distance:
+            farthest_index = target_index
+            farthest_distance = point_distance
+    return farthest_index, parents, distances
+
+
+@jit(nopython=True, cache=True)
+def _find_skeleton_graph_diameter_fast(points: np.ndarray,
+                                       neighbor_indices: np.ndarray,
+                                       degrees: np.ndarray,
+                                       endpoint_indices: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Return the two-pass graph diameter path as compact point indices."""
+    empty_path = np.empty(len(points), dtype=np.int32)
+    if len(points) < 2 or len(endpoint_indices) < 2:
+        return empty_path, 0
+
+    farthest_index, _, _ = _find_farthest_skeleton_graph_node_fast(
+        points,
+        neighbor_indices,
+        degrees,
+        int(endpoint_indices[0]),
+        endpoint_indices,
+    )
+    farthest_endpoint, parents, _ = _find_farthest_skeleton_graph_node_fast(
+        points,
+        neighbor_indices,
+        degrees,
+        farthest_index,
+        endpoint_indices,
+    )
+
+    reverse_path = np.empty(len(points), dtype=np.int32)
+    path_length = 0
+    current_index = farthest_endpoint
+    while current_index >= 0 and path_length < len(points):
+        reverse_path[path_length] = current_index
+        path_length += 1
+        current_index = int(parents[current_index])
+
+    path_indices = np.empty(len(points), dtype=np.int32)
+    for path_index in range(path_length):
+        path_indices[path_index] = reverse_path[path_length - path_index - 1]
+    return path_indices, path_length
+
+
 @jit(nopython=True, cache=True)
 def _calculate_path_length_fast(path_array: np.ndarray) -> float:
     """使用 Numba JIT 加速的路径长度计算

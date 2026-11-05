@@ -820,7 +820,11 @@ def test_handle_single_detection_result_defers_advanced_analysis_refresh(monkeyp
     gui._last_preprocess_signature = ("sig",)
     gui._roi_signature = lambda roi: None
     gui.MODERN_COLORS = {"info": "#0ea5e9"}
-    gui.analyzer = SimpleNamespace(image=np.zeros((12, 12, 3), dtype=np.uint8), measurements=[])
+    gui.analyzer = SimpleNamespace(
+        image=np.zeros((12, 12, 3), dtype=np.uint8),
+        measurements=[],
+        particle_measurements=[],
+    )
 
     status_calls = []
     sync_calls = []
@@ -837,7 +841,7 @@ def test_handle_single_detection_result_defers_advanced_analysis_refresh(monkeyp
 
     class _DoneFutureWithResult:
         def result(self):
-            return [SimpleNamespace(id=0)]
+            return {"measurements": [SimpleNamespace(id=0)], "particles": []}
 
     monkeypatch.setattr(gui_module.messagebox, "showinfo", lambda *args, **kwargs: None)
 
@@ -871,6 +875,7 @@ def test_apply_scale_forces_preprocess_refresh_in_preprocess_mode(monkeypatch):
     gui.analyzer = SimpleNamespace(
         scale_um_per_pixel=0.1,
         measurements=[],
+        particle_measurements=[],
         rois=[],
         record_manual_scale=fake_record_manual_scale,
     )
@@ -1380,15 +1385,13 @@ def test_get_paned_layout_width_subtracts_sash_pixels():
     assert gui._get_paned_layout_width(gui.main_paned) == 1388
 
 
-def test_calculate_pane_widths_gives_comparison_tab_more_center_space():
+def test_calculate_pane_widths_stays_stable_when_switching_to_comparison_tab():
     gui = _make_gui_stub()
 
     image_widths = gui._calculate_pane_widths(2156, 'image')
     comparison_widths = gui._calculate_pane_widths(2156, 'comparison')
 
-    assert comparison_widths[1] > image_widths[1]
-    assert comparison_widths[0] < image_widths[0]
-    assert comparison_widths[2] < image_widths[2]
+    assert comparison_widths == image_widths
 
 
 def test_calculate_pane_widths_keeps_same_image_ratio_across_window_sizes():
@@ -1527,7 +1530,7 @@ def test_render_comparison_figure_keeps_cached_chart_for_layout_refresh(monkeypa
     assert stale_widget.destroy_calls == 1
     assert gui.comparison_panel.section_heights['comparison_summary'] == 180
     assert gui.comparison_panel.text_content['comparison_summary'] == 'summary'
-    assert scheduled == [60, 180]
+    assert scheduled == [90]
 
 
 def test_show_comparison_window_renders_only_dispersion_charts():
@@ -1824,6 +1827,10 @@ def test_update_advanced_analysis_populates_expanded_chart_set():
             "dispersed_measurements": measurements[:2],
         },
     )
+    gui.analyzer.get_statistics_bundle = lambda roi=None: (
+        gui.analyzer.get_statistics(roi),
+        gui.analyzer.get_dispersed_statistics(roi),
+    )
 
     calls = []
     gui._get_evaluation_framework = lambda stats=None, dispersed_stats=None, roi=None: {
@@ -1950,6 +1957,10 @@ def test_update_results_prioritizes_dispersed_statistics_for_primary_summary():
             },
         },
     )
+    gui.analyzer.get_statistics_bundle = lambda roi=None: (
+        gui.analyzer.get_statistics(roi),
+        gui.analyzer.get_dispersed_statistics(roi),
+    )
 
     gui._update_results()
 
@@ -1983,6 +1994,10 @@ def test_update_results_falls_back_to_base_statistics_when_dispersed_stats_fail(
             "spatial_distribution": {},
         },
         get_dispersed_statistics=lambda roi=None: (_ for _ in ()).throw(ValueError("bad dispersed stats")),
+    )
+    gui.analyzer.get_statistics_bundle = lambda roi=None: (
+        gui.analyzer.get_statistics(roi),
+        gui.analyzer.get_dispersed_statistics(roi),
     )
 
     gui._update_results()
@@ -2043,6 +2058,10 @@ def test_update_results_appends_evaluation_framework_when_available():
             },
             "agglomeration": {"agglomerated_area_ratio": 0.18, "largest_agglomerate_area_um2": 14.2},
         },
+    )
+    gui.analyzer.get_statistics_bundle = lambda roi=None: (
+        gui.analyzer.get_statistics(roi),
+        gui.analyzer.get_dispersed_statistics(roi),
     )
 
     gui._update_results()
@@ -2576,13 +2595,23 @@ def test_run_image_analysis_uses_center_roi_and_crops_visualization_for_compare_
             captured["detect_roi"] = roi
             return []
 
+        def detect_particles(self, roi=None):
+            captured["particle_roi"] = roi
+            return []
+
         def get_statistics(self, roi=None):
             captured["stats_roi"] = roi
+            return {"count": 0, "particle_statistics": {"count": 0}}
+
+        def get_particle_statistics(self, roi=None):
             return {"count": 0}
 
         def get_dispersed_statistics(self, roi=None):
             captured["dispersed_roi"] = roi
             return {"dispersed_count": 0, "agglomerated_count": 0, "dispersed_ratio": 0.0}
+
+        def get_statistics_bundle(self, roi=None):
+            return self.get_statistics(roi), self.get_dispersed_statistics(roi)
 
         def get_visualization(self, roi=None):
             captured["visualization_roi"] = roi

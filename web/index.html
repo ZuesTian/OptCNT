@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#123c37" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="OptCNT 光学显微镜 CNT 完整骨架分析、空间统计与组间对比工作台"
+    />
+    <title>OptCNT · 完整光学分析工作台</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23123c37'/%3E%3Cpath d='M7 22 L16 9 L25 22' stroke='%23e8f3ef' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='9' r='2' fill='%2344b8a0'/%3E%3C/svg%3E" />
+    <script src="theme.js?v=20260813"></script>
+    <link rel="stylesheet" href="styles.css?v=20260813-paste2" />
+    <link rel="stylesheet" href="theme.css?v=20260813" />
+  </head>
+  <body>
+    <a class="skip-link" href="#mainContent">跳到主要内容</a>
+
+    <div class="app-shell">
+      <aside class="app-rail" aria-label="主导航">
+        <button class="brand-button" type="button" data-page="analyze" aria-label="返回单图分析">
+          <span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="brand-text"><strong>OptCNT</strong><small>OPTICAL INTELLIGENCE</small></span>
+        </button>
+
+        <nav class="rail-nav">
+          <button class="rail-link active" type="button" data-page="analyze">
+            <span class="rail-icon" aria-hidden="true">◫</span>
+            <span><b>单图工作台</b><small>ANALYZE</small></span>
+          </button>
+          <button class="rail-link" type="button" data-page="compare">
+            <span class="rail-icon" aria-hidden="true">⇄</span>
+            <span><b>组间对比</b><small>COMPARE</small></span>
+          </button>
+          <button class="rail-link" type="button" data-page="method">
+            <span class="rail-icon" aria-hidden="true">⌁</span>
+            <span><b>方法与边界</b><small>METHOD</small></span>
+          </button>
+        </nav>
+
+        <section class="rail-engine-card">
+          <span id="railStatusDot" class="status-dot checking"></span>
+          <div><strong id="railStatusText">正在连接分析引擎</strong><small id="railVersion">CNTAnalyzer</small></div>
+        </section>
+
+        <footer class="rail-footer">
+          <span>FULL ENGINE</span>
+          <b>2026.08</b>
+        </footer>
+      </aside>
+
+      <main id="mainContent" class="main-content">
+        <header class="app-topbar">
+          <div class="mobile-brand"><span class="mobile-brand-symbol">O</span><strong>OptCNT</strong></div>
+          <div class="topbar-context">
+            <span>光学显微镜 CNT</span>
+            <i>/</i>
+            <strong id="currentSection">单图工作台</strong>
+          </div>
+          <div class="topbar-actions">
+            <span class="lifecycle-chip" title="图片仅在分析会话中临时保留"><i></i>会话过期自动清理</span>
+            <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-icon aria-hidden="true">☾</span><span data-theme-label>深色</span></button>
+            <a class="portal-link" href="https://zuestian.github.io/Cnanotools/">工具总览 <span>↗</span></a>
+            <button id="helpButton" class="round-button" type="button" aria-label="打开方法说明">?</button>
+          </div>
+        </header>
+
+        <section id="page-analyze" class="app-page active" data-page-panel="analyze">
+          <header class="page-intro">
+            <div>
+              <p class="eyebrow"><span></span>SHARED PYTHON ENGINE</p>
+              <h1>从一张显微图，得到<strong>可追溯的完整结论。</strong></h1>
+              <p>远端与桌面端共用同一个 CNTAnalyzer 核心，包含骨架路径、逐根测量、空间统计、团聚判定和完整导出。</p>
+            </div>
+            <div class="intro-proof">
+              <strong>同源算法</strong>
+              <span>Python · OpenCV · Skeleton</span>
+            </div>
+          </header>
+
+          <section id="analysisStudio" class="analysis-studio">
+            <input id="singleImageInput" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/tiff,image/bmp,image/webp,.tif,.tiff" />
+            <header class="studio-header">
+              <div class="session-file">
+                <span class="file-icon">IMG</span>
+                <div><strong id="sessionFileName">未打开图像</strong><small id="sessionFileMeta">选择文件、拖放或粘贴图片</small></div>
+              </div>
+              <div class="session-state"><span id="sessionStateDot" class="status-dot ready"></span><p><strong id="sessionStateText">工具就绪</strong><small id="sessionExpiryText">打开图像后创建临时会话</small></p></div>
+              <button id="replaceImageButton" class="secondary-button compact" type="button">打开图像</button>
+            </header>
+
+            <div class="studio-grid">
+              <section class="viewer-card">
+                <header class="viewer-toolbar">
+                  <div id="viewTabs" class="segmented-control" role="tablist" aria-label="分析视图">
+                    <button class="active" type="button" data-view="original">原图</button>
+                    <button type="button" data-view="enhanced">增强</button>
+                    <button type="button" data-view="binary" disabled>二值</button>
+                    <button type="button" data-view="skeleton_preview" disabled>骨架预览</button>
+                    <button type="button" data-view="overlay" disabled>检测</button>
+                    <button type="button" data-view="skeleton" disabled>骨架结果</button>
+                    <button type="button" data-view="particles" disabled>颗粒识别</button>
+                  </div>
+                  <div class="viewer-tools">
+                    <button id="drawScaleButton" class="tool-button" type="button" title="在图像上拖动比例尺线段"><span>╱</span>画比例尺</button>
+                    <button id="drawRoiButton" class="tool-button" type="button" title="在图像上拖动 ROI 矩形"><span>□</span>画 ROI</button>
+                    <button id="fitImageButton" class="tool-button icon-only" type="button" aria-label="图像适应画布">适应</button>
+                  </div>
+                </header>
+
+                <div id="imageViewport" class="image-viewport">
+                  <div id="viewerEmpty" class="viewer-empty">
+                    <span aria-hidden="true"></span>
+                    <strong>打开显微镜图像</strong>
+                    <p>从本地选择、拖放到画布，或直接粘贴图片（Ctrl+V）</p>
+                    <label class="viewer-open-button" for="singleImageInput">打开图像</label>
+                    <small id="uploadLimitText">PNG、JPEG、TIFF、BMP、WebP · 单张不超过 25 MB</small>
+                  </div>
+                  <div id="imageTransform" class="image-transform">
+                    <img id="analysisImage" alt="当前显微镜分析视图" draggable="false" />
+                    <canvas id="interactionCanvas" aria-label="比例尺和 ROI 交互图层"></canvas>
+                  </div>
+                  <div id="viewerBusy" class="viewer-busy hidden" role="status"><span class="busy-spinner"></span><strong id="viewerBusyTitle">正在分析</strong><small id="viewerBusyDetail">请稍候</small></div>
+                  <div id="drawHint" class="draw-hint hidden"><span>按住并拖动</span><strong id="drawHintText">绘制区域</strong><button id="cancelDrawButton" type="button">取消</button></div>
+                </div>
+
+                <footer class="viewer-footer">
+                  <div><span id="activeViewLabel">原始图像</span><i></i><small id="activeRoiLabel">分析范围：全图</small></div>
+                  <div class="zoom-control">
+                    <button id="zoomOutButton" type="button" aria-label="缩小">−</button>
+                    <span id="zoomValue">适应</span>
+                    <button id="zoomInButton" type="button" aria-label="放大">＋</button>
+                  </div>
+                </footer>
+              </section>
+
+              <aside class="context-drawer">
+                <div class="drawer-tabs" role="tablist" aria-label="分析设置">
+                  <button class="active" type="button" data-drawer="calibration">校准</button>
+                  <button type="button" data-drawer="roi">ROI</button>
+                  <button type="button" data-drawer="parameters">参数</button>
+                </div>
+
+                <section class="drawer-panel active" data-drawer-panel="calibration">
+                  <header class="drawer-heading"><span>CALIBRATION</span><h2>确认物理尺度</h2><p>自动检测结果可直接使用，也可在画布上重画比例尺。</p></header>
+                  <article id="scaleStatusCard" class="status-card warning">
+                    <span id="scaleConfidenceBadge">待确认</span>
+                    <div><strong id="scaleStatusTitle">正在检测比例尺</strong><small id="scaleStatusDetail">—</small></div>
+                  </article>
+                  <div class="form-grid two-columns">
+                    <label class="form-field"><span>线段像素</span><div class="input-unit"><input id="scalePixelsInput" type="number" min="0.1" step="0.1" value="0" /><b>px</b></div></label>
+                    <label class="form-field"><span>对应长度</span><div class="input-unit"><input id="scaleUmInput" type="number" min="0.1" step="0.1" value="10" /><b>μm</b></div></label>
+                  </div>
+                  <button id="applyScaleButton" class="primary-button full-width" type="button">应用比例尺</button>
+                  <div class="drawer-tip"><span>提示</span><p>点击画布上方“画比例尺”，沿标尺线拖动。标尺与文字区域会自动从检测掩码中排除。</p></div>
+                </section>
+
+                <section class="drawer-panel" data-drawer-panel="roi">
+                  <header class="drawer-heading"><span>REGION</span><h2>管理分析区域</h2><p>可以保存多个 ROI，并在全图与不同区域之间切换分析。</p></header>
+                  <button id="useFullImageButton" class="roi-item active" type="button" data-roi-name=""><span class="roi-swatch full"></span><div><strong>完整图像</strong><small>当前全幅范围</small></div><b>✓</b></button>
+                  <div id="roiList" class="roi-list"><p class="empty-list">尚未创建 ROI</p></div>
+                  <button id="drawerDrawRoiButton" class="secondary-button full-width" type="button">＋ 在画布上新建 ROI</button>
+                  <div class="drawer-tip"><span>交互</span><p>在画布上拖出矩形后会立即建立 ROI。每个 ROI 可单独预处理、检测与导出。</p></div>
+                </section>
+
+                <section class="drawer-panel" data-drawer-panel="parameters">
+                  <header class="drawer-heading"><span>PARAMETERS</span><h2>预处理与识别</h2><p>基于当前 ROI 自动建议，也可展开精确控制全部桌面端参数。</p></header>
+                  <div class="profile-row">
+                    <label class="form-field"><span>检测风格</span><select id="detectionProfile"><option value="balanced">标准（推荐）</option><option value="precision">少误检</option><option value="recall">少漏检</option></select></label>
+                    <button id="suggestParamsButton" class="secondary-button" type="button">自动建议</button>
+                  </div>
+                  <article id="suggestionCard" class="suggestion-card"><span>AI</span><p><strong>等待图像建议</strong><small>载入图像后自动评估噪点、边缘密度和前景比例。</small></p></article>
+
+                  <details class="parameter-group" open>
+                    <summary><span><b>预处理</b><small>分割与骨架输入</small></span><i>⌄</i></summary>
+                    <div class="parameter-body">
+                      <label class="range-control"><span><b>高斯模糊核</b><output id="blurValue">9</output></span><input id="blurInput" type="range" min="1" max="15" step="2" value="9" /></label>
+                      <label class="range-control"><span><b>自适应块大小</b><output id="blockValue">11</output></span><input id="blockInput" type="range" min="3" max="51" step="2" value="11" /></label>
+                      <label class="range-control"><span><b>自适应常数 C</b><output id="adaptiveCValue">3</output></span><input id="adaptiveCInput" type="range" min="0" max="10" step="1" value="3" /></label>
+                      <label class="range-control"><span><b>断裂桥接强度</b><output id="bridgeValue">0</output></span><input id="bridgeInput" type="range" min="0" max="10" step="1" value="0" /></label>
+                      <label class="switch-row"><span><b>深色目标</b><small>浅背景上的深色 CNT</small></span><input id="thresholdInvertInput" type="checkbox" checked /><i></i></label>
+                    </div>
+                  </details>
+
+                  <details class="parameter-group">
+                    <summary><span><b>检测过滤</b><small>长度、形态与粘连处理</small></span><i>⌄</i></summary>
+                    <div class="parameter-body">
+                      <div class="form-grid two-columns">
+                        <label class="form-field"><span>最小长度</span><div class="input-unit"><input id="minLengthInput" type="number" min="0" step="0.5" value="5" /><b>μm</b></div></label>
+                        <label class="form-field"><span>最大长度</span><div class="input-unit"><input id="maxLengthInput" type="number" min="0.1" step="1" value="1000" /><b>μm</b></div></label>
+                        <label class="form-field"><span>最小长宽比</span><input id="minSlendernessInput" type="number" min="0" step="0.5" value="4" /></label>
+                        <label class="form-field"><span>近邻合并距离</span><div class="input-unit"><input id="mergeDistanceInput" type="number" min="0" max="20" step="1" value="0" /><b>px</b></div></label>
+                      </div>
+                      <label class="form-field"><span>粘连拆分</span><select id="splitModeInput"><option value="off">不拆分</option><option value="conservative">标准拆分</option><option value="aggressive">强力拆分</option></select></label>
+                    </div>
+                  </details>
+
+                  <div class="analysis-actions">
+                    <button id="previewButton" class="secondary-button" type="button">生成骨架预览</button>
+                    <button id="analyzeButton" class="primary-button" type="button">完整检测 CNT <span>→</span></button>
+                  </div>
+                </section>
+              </aside>
+            </div>
+          </section>
+
+          <section id="resultsDashboard" class="results-dashboard hidden">
+            <header class="section-heading">
+              <div><span>ANALYSIS OUTPUT</span><h2>完整分析结果</h2><p id="resultSummaryLine">结果来自服务器上的同源 CNTAnalyzer 核心。</p></div>
+              <div class="result-header-actions">
+                <button id="scrollToViewerButton" class="secondary-button compact" type="button">返回图像</button>
+                <div class="export-menu">
+                  <button id="exportMenuButton" class="primary-button compact" type="button">导出结果 <span>⌄</span></button>
+                  <div id="exportMenu" class="export-popover hidden">
+                    <a data-export="json" href="#">JSON 完整数据</a>
+                    <a data-export="csv" href="#">CSV CNT 与颗粒数据</a>
+                    <a data-export="report" href="#">TXT 分析报告</a>
+                    <a data-export="overlay" href="#">PNG 轮廓结果</a>
+                    <a data-export="skeleton" href="#">PNG 骨架结果</a>
+                    <a data-export="particles" href="#">PNG 颗粒标注</a>
+                  </div>
+                </div>
+              </div>
+            </header>
+
+            <div class="result-hero-grid">
+              <article class="score-card hero-score">
+                <div id="uniformityRing" class="score-ring"><strong id="uniformityScore">—</strong><small>/100</small></div>
+                <div><span>综合均匀性</span><h3 id="uniformityGrade">等待结果</h3><p id="uniformityConfidence">—</p></div>
+              </article>
+              <article class="metric-card"><span>总 CNT 数量</span><strong id="resultCount">—</strong><small>逐根骨架测量</small></article>
+              <article class="metric-card"><span>分散比例</span><strong id="resultDispersed">—</strong><small id="resultDispersedGrade">—</small></article>
+              <article class="metric-card"><span>网格 CV</span><strong id="resultGridCv">—</strong><small id="resultGridGrade">—</small></article>
+              <article class="metric-card"><span>团聚面积占比</span><strong id="resultAggArea">—</strong><small id="resultAggGrade">—</small></article>
+              <article class="metric-card"><span>P90 宽度</span><strong id="resultP90Width">—</strong><small id="resultWidthGrade">—</small></article>
+              <article class="metric-card particle-metric"><span>颗粒候选</span><strong id="resultParticleCount">—</strong><small>独立口径</small></article>
+              <article class="metric-card supplement"><span>平均骨架长度</span><strong id="resultMeanLength">—</strong><small>μm</small></article>
+              <article class="metric-card supplement"><span>混合评分</span><strong id="resultHybridScore">—</strong><small>四维框架</small></article>
+            </div>
+
+            <div class="dashboard-tabs" role="tablist" aria-label="结果详情">
+              <button class="active" type="button" data-result-tab="overview">结果总览</button>
+              <button type="button" data-result-tab="measurements">逐 CNT 数据 <span id="measurementCountBadge">0</span></button>
+              <button type="button" data-result-tab="spatial">空间统计</button>
+              <button type="button" data-result-tab="framework">四维框架</button>
+              <button type="button" data-result-tab="particles">颗粒识别 <span id="particleCountBadge">0</span></button>
+            </div>
+
+            <section class="result-tab-panel active" data-result-panel="overview">
+              <div class="chart-layout">
+                <article class="dashboard-card chart-card"><header><div><span>LENGTH</span><h3>骨架长度分布</h3></div><small id="histogramCaption">—</small></header><canvas id="lengthHistogram"></canvas></article>
+                <article class="dashboard-card chart-card"><header><div><span>DISPERSION</span><h3>分散 / 团聚构成</h3></div><small id="dispersionCaption">—</small></header><canvas id="dispersionChart"></canvas></article>
+                <article class="dashboard-card chart-card"><header><div><span>MORPHOLOGY</span><h3>长度与宽度关系</h3></div><small>逐 CNT</small></header><canvas id="morphologyChart"></canvas></article>
+              </div>
+              <article class="dashboard-card insight-card"><header><div><span>INTERPRETATION</span><h3>结果解读</h3></div></header><ul id="resultInsights"></ul></article>
+            </section>
+
+            <section class="result-tab-panel" data-result-panel="measurements">
+              <article class="dashboard-card table-card">
+                <header><div><span>MEASUREMENTS</span><h3>逐根 CNT 测量明细</h3></div><label class="table-search"><span>⌕</span><input id="measurementSearch" type="search" placeholder="按 ID 或数值筛选" /></label></header>
+                <div class="table-scroll"><table><thead><tr><th data-sort="id">ID</th><th data-sort="length_um">长度 μm</th><th data-sort="width_mean_um">平均宽度 μm</th><th data-sort="width_median_um">中位宽度 μm</th><th data-sort="width_iqr_um">宽度 IQR μm</th><th data-sort="slenderness">长宽比</th><th>分类</th></tr></thead><tbody id="measurementTableBody"></tbody></table></div>
+              </article>
+            </section>
+
+            <section class="result-tab-panel" data-result-panel="spatial">
+              <div class="spatial-grid">
+                <article class="dashboard-card heatmap-card"><header><div><span>POINT DENSITY</span><h3>质心密度网格</h3></div><small id="gridSizeLabel">—</small></header><canvas id="pointHeatmap"></canvas></article>
+                <article class="dashboard-card heatmap-card"><header><div><span>COVERAGE</span><h3>像素覆盖率网格</h3></div><small>主均匀性输入</small></header><canvas id="coverageHeatmap"></canvas></article>
+                <article class="dashboard-card heatmap-card"><header><div><span>SHADOW</span><h3>阴影密度网格</h3></div><small>团聚诊断</small></header><canvas id="shadowHeatmap"></canvas></article>
+                <article class="dashboard-card spatial-stats-card"><header><div><span>SPATIAL METRICS</span><h3>空间指标</h3></div></header><dl id="spatialStatsList"></dl></article>
+              </div>
+            </section>
+
+            <section class="result-tab-panel" data-result-panel="framework">
+              <div class="framework-grid">
+                <article class="framework-card" data-framework="uniformity"><span>A</span><div><small>均匀性主指标</small><strong id="frameworkUniformity">—</strong><p id="frameworkUniformityDetail">—</p></div></article>
+                <article class="framework-card" data-framework="bundle"><span>B</span><div><small>粗管 / 束化指标</small><strong id="frameworkBundle">—</strong><p id="frameworkBundleDetail">—</p></div></article>
+                <article class="framework-card" data-framework="length"><span>C</span><div><small>长管指标</small><strong id="frameworkLength">—</strong><p id="frameworkLengthDetail">—</p></div></article>
+                <article class="framework-card" data-framework="agglomeration"><span>D</span><div><small>团聚指标</small><strong id="frameworkAgglomeration">—</strong><p id="frameworkAgglomerationDetail">—</p></div></article>
+              </div>
+              <article class="dashboard-card formula-card"><div><span>HYBRID SCORE</span><h3>四维加权结果</h3><p id="frameworkFormula">—</p></div><strong id="frameworkHybrid">—</strong></article>
+            </section>
+
+            <section class="result-tab-panel" data-result-panel="particles">
+              <div class="particle-summary-grid">
+                <article class="metric-card"><span>颗粒候选数量</span><strong id="particleResultCount">—</strong><small>不计入 CNT 数量</small></article>
+                <article class="metric-card"><span>颗粒面积占比</span><strong id="particleAreaRatio">—</strong><small>占当前分析区</small></article>
+                <article class="metric-card"><span>等效直径均值</span><strong id="particleMeanDiameter">—</strong><small>μm</small></article>
+                <article class="metric-card"><span>候选平均置信度</span><strong id="particleMeanConfidence">—</strong><small>局部暗度与紧凑形态</small></article>
+              </div>
+              <article class="dashboard-card particle-note-card"><span>独立识别口径</span><p>颗粒依据局部暗度、紧凑形态及多阈值稳定性识别，仅用于候选复核；不计入 CNT 数量、分散比例、均匀性或组间五项主指标。</p><button id="showParticleViewButton" class="secondary-button compact" type="button">查看颗粒标注图</button></article>
+              <article class="dashboard-card table-card particle-table-card">
+                <header><div><span>PARTICLE MEASUREMENTS</span><h3>逐颗粒候选明细</h3></div><small>红色轮廓与 P 编号</small></header>
+                <div class="table-scroll"><table><thead><tr><th>ID</th><th>中心 X/Y px</th><th>面积 μm²</th><th>等效直径 μm</th><th>长轴/短轴 μm</th><th>圆度</th><th>实心度</th><th>长宽比</th><th>局部对比度</th><th>置信度</th></tr></thead><tbody id="particleTableBody"></tbody></table></div>
+              </article>
+            </section>
+          </section>
+        </section>
+
+        <section id="page-compare" class="app-page" data-page-panel="compare">
+          <header class="page-intro compact-intro">
+            <div><p class="eyebrow"><span></span>BASELINE × EXPERIMENT</p><h1>让组间差异，回到<strong>同一套完整算法。</strong></h1><p>两组图像使用完全相同的比例尺、ROI 范围、预处理和检测参数，输出逐图统计、显著性检验与代表图。</p></div>
+          </header>
+
+          <section class="compare-setup-card">
+            <header class="compare-setup-header"><div><span>SAMPLES</span><h2>建立对比任务</h2></div><p>每组最多 <strong id="compareLimitText">20 张、整批不超过 200 MB</strong>；建议使用相同倍率、尺寸和成像条件。</p></header>
+            <div class="compare-drop-grid">
+              <article class="group-drop-card base">
+                <header><span>BASE</span><div><strong>base 组</strong><small>基准参考</small></div><b id="baseFileCount">0 张</b></header>
+                <label for="baseFilesInput"><input id="baseFilesInput" type="file" accept="image/*,.tif,.tiff" multiple /><span>＋</span><strong>选择基准图像</strong><small>拖放或批量选择</small></label>
+                <ul id="baseFileList"><li>尚未选择图像</li></ul>
+              </article>
+              <article class="group-drop-card experiment">
+                <header><span>EXP</span><div><strong>实验组</strong><small>实验候选</small></div><b id="experimentFileCount">0 张</b></header>
+                <label for="experimentFilesInput"><input id="experimentFilesInput" type="file" accept="image/*,.tif,.tiff" multiple /><span>＋</span><strong>选择实验图像</strong><small>拖放或批量选择</small></label>
+                <ul id="experimentFileList"><li>尚未选择图像</li></ul>
+              </article>
+            </div>
+
+            <details class="compare-settings">
+              <summary><span><b>统一分析参数</b><small id="compareParameterSummary">10 μm · 中部 75% · 标准检测</small></span><i>⌄</i></summary>
+              <div class="compare-settings-grid">
+                <label class="form-field"><span>标尺长度</span><div class="input-unit"><input id="compareScaleUm" type="number" min="0.1" value="10" /><b>μm</b></div></label>
+                <label class="form-field"><span>手动标尺像素</span><div class="input-unit"><input id="compareScalePixels" type="number" min="0" value="0" /><b>px</b></div></label>
+                <label class="form-field"><span>分析范围</span><select id="compareCenterFraction"><option value="0.75">中部 75%</option><option value="1">完整图像</option><option value="0.5">中部 50%</option></select></label>
+                <label class="form-field"><span>检测风格</span><select id="compareProfile"><option value="balanced">标准（推荐）</option><option value="precision">少误检</option><option value="recall">少漏检</option></select></label>
+                <label class="form-field"><span>最小长度</span><div class="input-unit"><input id="compareMinLength" type="number" min="0" value="5" /><b>μm</b></div></label>
+                <label class="form-field"><span>最小长宽比</span><input id="compareMinSlenderness" type="number" min="0" value="4" /></label>
+              </div>
+            </details>
+
+            <footer class="compare-launch-bar"><div><span class="status-dot ready"></span><p><strong>后台完整分析</strong><small>任务执行期间可以切换页面，结果会保留到任务过期。</small></p></div><button id="startComparisonButton" class="primary-button" type="button" disabled>开始组间对比 <span>→</span></button></footer>
+          </section>
+
+          <section id="compareProgress" class="compare-progress hidden" role="status">
+            <div class="progress-copy"><span class="busy-spinner"></span><div><strong id="compareProgressTitle">正在完整分析两组图像</strong><small id="compareProgressMessage">正在建立任务…</small></div><b id="compareProgressPercent">0%</b></div>
+            <div class="progress-track"><i id="compareProgressBar"></i></div>
+          </section>
+
+          <section id="compareDashboard" class="compare-dashboard hidden">
+            <header class="section-heading"><div><span>COMPARISON OUTPUT</span><h2>组间对比结果</h2><p id="compareVerdict">—</p></div><a id="comparisonExportLink" class="primary-button compact" href="#">导出 CSV</a></header>
+            <div class="compare-result-summary">
+              <article class="group-summary base"><span>BASE</span><div><strong id="baseAnalyzedCount">—</strong><small>成功分析图像</small></div><p id="baseUniformityText">—</p></article>
+              <article class="comparison-verdict-card"><span>CORE VERDICT</span><h3 id="compareVerdictTitle">对比完成</h3><p id="compareVerdictDetail">—</p></article>
+              <article class="group-summary experiment"><span>EXP</span><div><strong id="experimentAnalyzedCount">—</strong><small>成功分析图像</small></div><p id="experimentUniformityText">—</p></article>
+            </div>
+            <div class="compare-visual-grid">
+              <article class="dashboard-card comparison-chart-card"><header><div><span>CORE METRICS</span><h3>五项主指标</h3></div><div class="comparison-legend"><span><i class="base-color"></i>base</span><span><i class="experiment-color"></i>实验</span></div></header><canvas id="comparisonChart"></canvas></article>
+              <article class="dashboard-card representative-card"><header><div><span>REPRESENTATIVE</span><h3>组内代表图</h3></div></header><div class="representative-grid"><figure><img id="baseRepresentative" alt="base 组代表图" /><figcaption>base 组</figcaption></figure><figure><img id="experimentRepresentative" alt="实验组代表图" /><figcaption>实验组</figcaption></figure></div></article>
+            </div>
+            <article class="dashboard-card table-card comparison-detail-card"><header><div><span>STATISTICS</span><h3>指标均值、波动与显著性</h3></div></header><div class="table-scroll"><table><thead><tr><th>指标</th><th>base 均值 ± SD</th><th>实验均值 ± SD</th><th>变化</th><th>Welch p</th><th>M-W p</th><th>方向</th></tr></thead><tbody id="comparisonTableBody"></tbody></table></div></article>
+          </section>
+        </section>
+
+        <section id="page-method" class="app-page" data-page-panel="method">
+          <header class="page-intro compact-intro"><div><p class="eyebrow"><span></span>METHOD & GOVERNANCE</p><h1>完整功能的关键，是<strong>同源、可追溯、可验证。</strong></h1><p>远端只替换交互层，不复制算法。所有科学计算仍由项目中的 CNTAnalyzer 执行。</p></div></header>
+          <div class="architecture-flow">
+            <article><span>01</span><i>WEB WORKSPACE</i><h2>浏览器工作台</h2><p>负责上传、画布比例尺与 ROI、参数控制、结果图表和文件下载。</p></article>
+            <article><span>02</span><i>SESSION API</i><h2>会话与任务层</h2><p>限制上传大小和并发，会话过期清理；组图分析在后台执行并报告进度。</p></article>
+            <article><span>03</span><i>SHARED CORE</i><h2>CNTAnalyzer</h2><p>与桌面端共用 Python/OpenCV 核心，执行预处理、骨架、轮廓和逐根测量。</p></article>
+            <article><span>04</span><i>VERIFICATION</i><h2>一致性闭环</h2><p>固定样图同时走核心与 HTTP 路径，逐项比较数量、长度、宽度与统计指标。</p></article>
+          </div>
+          <div class="method-grid">
+            <article class="method-card"><span>CALIBRATION</span><h3>完整校准与 ROI</h3><ul><li>自动比例尺条与文字识别</li><li>画布手动标尺校准</li><li>比例尺区域自动排除</li><li>多个自定义 ROI 独立分析</li></ul></article>
+            <article class="method-card"><span>MEASUREMENT</span><h3>逐根骨架测量</h3><ul><li>自适应阈值与形态处理</li><li>骨架图直径路径测量</li><li>粘连拆分与近邻合并</li><li>长度、宽度与长宽比输出</li></ul></article>
+            <article class="method-card"><span>SPATIAL</span><h3>空间与团聚统计</h3><ul><li>最近邻 CV 与 NNI</li><li>点密度、覆盖率与阴影网格</li><li>Moran's I、熵与占用率</li><li>热点团聚和分散比例</li></ul></article>
+            <article class="method-card"><span>DELIVERY</span><h3>对比与完整交付</h3><ul><li>双图及 base/实验组对比</li><li>Welch t 与 Mann-Whitney 检验</li><li>JSON、CSV、TXT 报告</li><li>轮廓与骨架 PNG 结果</li></ul></article>
+          </div>
+          <section class="privacy-policy-card"><div><span>DATA LIFECYCLE</span><h2>原图如何处理</h2></div><ol><li><b>上传</b><span>通过 HTTPS 发送到 Ali 服务器，仅用于本次分析。</span></li><li><b>处理</b><span>单图保存在内存会话；批量图暂存于受限任务目录。</span></li><li><b>释放</b><span>单图会话无操作后过期；批量任务生成结果后立即删除原始上传。</span></li><li><b>交付</b><span>结果由用户主动下载，服务端不将原图写入项目数据集。</span></li></ol></section>
+        </section>
+      </main>
+
+      <nav class="mobile-nav" aria-label="移动端导航">
+        <button class="active" type="button" data-page="analyze"><span>◫</span><small>单图</small></button>
+        <button type="button" data-page="compare"><span>⇄</span><small>对比</small></button>
+        <button type="button" data-page="method"><span>⌁</span><small>方法</small></button>
+      </nav>
+    </div>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+    <script src="app.js?v=20260813-paste2" defer></script>
+  </body>
+</html>

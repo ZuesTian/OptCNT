@@ -1,0 +1,18 @@
+[Unit]
+Description=Initialize the isolated OptCNT WSL2 worker runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/opt-cnt-worker/current
+EnvironmentFile=-/etc/opt-cnt-worker/proxy.env
+ExecStart=/bin/sh -c "test -x /opt/opt-cnt-worker/runtime/.venv/bin/python || python3 -m venv /opt/opt-cnt-worker/runtime/.venv"
+ExecStart=/opt/opt-cnt-worker/runtime/.venv/bin/python -m pip install --disable-pip-version-check -r /opt/opt-cnt-worker/current/requirements-server.lock
+TimeoutStartSec=900
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -447,6 +447,12 @@ class CNTAnalyzerGUI:
             return list(self.current_roi.measurements)
         return list(self.analyzer.measurements)
 
+    def _get_active_particle_measurements(self):
+        """返回当前全图或 ROI 下的颗粒结果。"""
+        if self.current_roi is not None:
+            return list(getattr(self.current_roi, 'particle_measurements', []))
+        return list(getattr(self.analyzer, 'particle_measurements', []))
+
     def _is_single_detection_running(self) -> bool:
         """Whether a background single-image detection job is still running."""
         future = getattr(self, '_single_detect_future', None)
@@ -467,7 +473,7 @@ class CNTAnalyzerGUI:
         """根据当前上下文启用或禁用关键交互入口。"""
         has_image = self.analyzer.image is not None
         has_rois = bool(self.analyzer.rois)
-        has_measurements = bool(self._get_active_measurements())
+        has_measurements = bool(self._get_active_measurements() or self._get_active_particle_measurements())
 
         if self.control_panel is not None:
             self.control_panel.set_interaction_state(has_image=has_image, has_rois=has_rois)
@@ -988,6 +994,18 @@ class CNTAnalyzerGUI:
                         width_px = m.width_iqr_um / old_scale if old_scale > 0 else 0
                         m.width_iqr_um = width_px * new_scale
 
+            for particle in getattr(self.analyzer, 'particle_measurements', []):
+                particle.area_um2 = particle.area_pixels * new_scale * new_scale
+                particle.equivalent_diameter_um = particle.equivalent_diameter_pixels * new_scale
+                particle.major_axis_um = particle.major_axis_pixels * new_scale
+                particle.minor_axis_um = particle.minor_axis_pixels * new_scale
+            for roi in self.analyzer.rois:
+                for particle in getattr(roi, 'particle_measurements', []):
+                    particle.area_um2 = particle.area_pixels * new_scale * new_scale
+                    particle.equivalent_diameter_um = particle.equivalent_diameter_pixels * new_scale
+                    particle.major_axis_um = particle.major_axis_pixels * new_scale
+                    particle.minor_axis_um = particle.minor_axis_pixels * new_scale
+
             self._refresh_scale_status_ui()
             self._refresh_analysis_status_ui()
             if self._is_preprocess_mode():
@@ -1436,6 +1454,7 @@ class CNTAnalyzerGUI:
             height=int(roi.height),
             color=tuple(roi.color),
             measurements=[],
+            particle_measurements=[],
         )
 
     def _clone_analyzer_snapshot(self, *, include_preprocess_outputs: bool) -> CNTAnalyzer:
@@ -1497,9 +1516,11 @@ class CNTAnalyzerGUI:
     @staticmethod
     def _run_single_detection_task(analyzer_snapshot: CNTAnalyzer,
                                    detect_settings: dict,
-                                   roi_snapshot: Optional[ROIRegion]) -> List[CNTMeasurement]:
-        """Run CNT detection off the UI thread using a frozen analyzer snapshot."""
-        return list(analyzer_snapshot.detect_cnts_hybrid(roi=roi_snapshot, **detect_settings))
+                                   roi_snapshot: Optional[ROIRegion]) -> dict:
+        """Run CNT and compact-particle detection on the same frozen image."""
+        measurements = list(analyzer_snapshot.detect_cnts_hybrid(roi=roi_snapshot, **detect_settings))
+        particles = list(analyzer_snapshot.detect_particles(roi=roi_snapshot))
+        return {'measurements': measurements, 'particles': particles}
 
     def _handle_preprocess_result(self,
                                   task_token: int,
@@ -1568,7 +1589,9 @@ class CNTAnalyzerGUI:
             self._single_detect_snapshot = None
 
         try:
-            measurements = future.result()
+            detection_result = future.result()
+            measurements = list(detection_result.get('measurements') or [])
+            particles = list(detection_result.get('particles') or [])
         except GUI_EXPECTED_ANALYSIS_EXCEPTIONS as exc:
             logger.exception("CNT检测失败")
             self._set_single_detection_busy_state(False)
@@ -1609,8 +1632,10 @@ class CNTAnalyzerGUI:
 
         if self.current_roi is not None:
             self.current_roi.measurements = list(measurements)
+            self.current_roi.particle_measurements = list(particles)
         else:
             self.analyzer.measurements = list(measurements)
+            self.analyzer.particle_measurements = list(particles)
 
         self._sync_views(refresh_analysis=False)
         self._set_single_detection_busy_state(False)
@@ -1623,8 +1648,15 @@ class CNTAnalyzerGUI:
 
         target_text = f"ROI {self.current_roi.name}" if self.current_roi is not None else "全图"
         count = len(measurements)
-        self.image_panel.show_status(f"检测完成: {target_text} 共 {count} 个CNT")
-        messagebox.showinfo("检测完成", f"在{target_text}中检测到 {count} 个CNT")
+        particle_count = len(particles)
+        self.image_panel.show_status(
+            f"检测完成: {target_text} 共 {count} 个 CNT、{particle_count} 个颗粒候选"
+        )
+        messagebox.showinfo(
+            "检测完成",
+            f"在{target_text}中检测到 {count} 个 CNT 和 {particle_count} 个颗粒候选。\n"
+            "颗粒结果基于局部暗度与紧凑形态，请结合颗粒识别视图复核。",
+        )
 
     def _poll_single_detection_result(self, task_token: int, snapshot: dict) -> None:
         """Poll a background detection future from the Tk main thread."""
@@ -1693,7 +1725,7 @@ class CNTAnalyzerGUI:
                 "检测进度: 开始分析，已完成预处理，后台正在检测...",
                 color=self.MODERN_COLORS['info'],
             )
-            self.image_panel.show_status("CNT检测中...")
+            self.image_panel.show_status("CNT 与颗粒检测中...")
             self._set_single_detection_busy_state(True)
 
             future = self._single_detect_executor.submit(
@@ -1782,6 +1814,11 @@ class CNTAnalyzerGUI:
             elif mode == "skeleton":
                 image = cv2.cvtColor(self.analyzer.get_visualization_with_skeleton(self.current_roi),
                                      cv2.COLOR_BGR2RGB)
+            elif mode == "particles":
+                image = cv2.cvtColor(
+                    self.analyzer.get_particle_visualization(self.current_roi),
+                    cv2.COLOR_BGR2RGB,
+                )
             else:
                 return
 
@@ -2180,31 +2217,43 @@ class CNTAnalyzerGUI:
         self.result_panel.clear_tree()
 
         measurements = self._get_active_measurements()
-        if not measurements:
+        particles = self._get_active_particle_measurements()
+        if not measurements and not particles:
             return
 
-        stats = self.analyzer.get_statistics(self.current_roi)
+        if not measurements:
+            particle_stats = (
+                self.analyzer.get_statistics(self.current_roi).get('particle_statistics') or {}
+            )
+            text_widget = self.result_panel.stats_text
+            self._append_particle_statistics_text(text_widget, particle_stats)
+            return
+
         text_widget = self.result_panel.stats_text
 
+        stats = None
         dispersed_stats = None
+        try:
+            stats, dispersed_stats = self.analyzer.get_statistics_bundle(self.current_roi)
+        except GUI_EXPECTED_DATA_EXCEPTIONS as e:
+            logger.debug(f"获取分散统计失败: {e}")
+            stats = self.analyzer.get_statistics(self.current_roi)
+        except Exception as e:
+            logger.exception("获取分散统计时发生未预期的错误")
+            stats = self.analyzer.get_statistics(self.current_roi)
+
         primary_count = int(stats.get('count', len(measurements)))
         length_stats = stats
         display_measurements = measurements
         dispersed_ids = set()
         agglomerated_ids = set()
         framework = {}
-        try:
-            dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
-            if dispersed_stats:
-                primary_count = int(dispersed_stats.get('dispersed_count', primary_count))
-                length_stats = dispersed_stats.get('dispersed_length_stats') or stats
-                display_measurements = dispersed_stats.get('dispersed_measurements') or []
-                dispersed_ids = {int(measurement.id) for measurement in (dispersed_stats.get('dispersed_measurements') or [])}
-                agglomerated_ids = {int(measurement.id) for measurement in (dispersed_stats.get('agglomerated_measurements') or [])}
-        except GUI_EXPECTED_DATA_EXCEPTIONS as e:
-            logger.debug(f"获取分散统计失败: {e}")
-        except Exception as e:
-            logger.exception("获取分散统计时发生未预期的错误")
+        if dispersed_stats:
+            primary_count = int(dispersed_stats.get('dispersed_count', primary_count))
+            length_stats = dispersed_stats.get('dispersed_length_stats') or stats
+            display_measurements = dispersed_stats.get('dispersed_measurements') or []
+            dispersed_ids = {int(measurement.id) for measurement in (dispersed_stats.get('dispersed_measurements') or [])}
+            agglomerated_ids = {int(measurement.id) for measurement in (dispersed_stats.get('agglomerated_measurements') or [])}
 
         framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
         core_metrics = self._build_core_metric_snapshot(stats, dispersed_stats, framework)
@@ -2334,6 +2383,10 @@ class CNTAnalyzerGUI:
             text_widget.insert(tk.END, f"{spatial['occupancy_ratio']:.1%}\n", 'value')
 
         self._append_evaluation_framework_text(text_widget, framework)
+        self._append_particle_statistics_text(
+            text_widget,
+            stats.get('particle_statistics') or {},
+        )
 
         for m in measurements:
             measurement_id = int(m.id)
@@ -2343,6 +2396,39 @@ class CNTAnalyzerGUI:
                 "是" if measurement_id in dispersed_ids else "",
                 "是" if measurement_id in agglomerated_ids else "",
             ))
+
+    @staticmethod
+    def _append_particle_statistics_text(text_widget, particle_stats: dict) -> None:
+        """在主统计区追加独立的颗粒统计，避免混入 CNT 口径。"""
+        particle_stats = particle_stats or {}
+        text_widget.insert(tk.END, "\n===== 颗粒识别（独立口径） =====\n", 'header')
+        text_widget.insert(tk.END, "颗粒候选数量: ", 'header')
+        text_widget.insert(tk.END, f"{int(particle_stats.get('count', 0))}\n", 'value')
+        text_widget.insert(tk.END, "颗粒面积占比: ", 'header')
+        text_widget.insert(tk.END, f"{float(particle_stats.get('area_ratio', 0.0)):.3%}\n", 'value')
+        text_widget.insert(tk.END, "等效直径均值: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{float(particle_stats.get('equivalent_diameter_mean_um', 0.0)):.2f} μm\n",
+            'value',
+        )
+        text_widget.insert(tk.END, "等效直径中位数: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{float(particle_stats.get('equivalent_diameter_median_um', 0.0)):.2f} μm\n",
+            'value',
+        )
+        text_widget.insert(tk.END, "候选平均置信度: ", 'header')
+        text_widget.insert(
+            tk.END,
+            f"{float(particle_stats.get('confidence_mean', 0.0)):.1%}\n",
+            'value',
+        )
+        text_widget.insert(
+            tk.END,
+            "说明: 颗粒依据局部暗度、紧凑形态及多阈值稳定性识别，不计入 CNT 数量、分散率或均匀性。\n",
+            'warning',
+        )
 
     def _on_select_cnt(self, event):
         """选择CNT时高亮显示"""
@@ -2389,20 +2475,23 @@ class CNTAnalyzerGUI:
             self._clear_advanced_analysis()
             return
 
-        stats = self.analyzer.get_statistics(self.current_roi)
-        spatial = stats.get('spatial_distribution') or {}
-        cnt_count = int(stats.get('count', len(measurements)))
+        stats = None
         dispersed_stats = None
         analysis_measurements = measurements
-        framework = self._get_evaluation_framework(stats=stats, dispersed_stats=None)
         try:
-            dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
-            if dispersed_stats:
-                analysis_measurements = dispersed_stats.get('dispersed_measurements') or measurements
+            stats, dispersed_stats = self.analyzer.get_statistics_bundle(self.current_roi)
         except GUI_EXPECTED_DATA_EXCEPTIONS as e:
             logger.debug(f"获取高级分析分散统计失败: {e}")
+            stats = self.analyzer.get_statistics(self.current_roi)
         except Exception:
             logger.exception("获取高级分析分散统计时发生未预期的错误")
+            stats = self.analyzer.get_statistics(self.current_roi)
+
+        spatial = stats.get('spatial_distribution') or {}
+        cnt_count = int(stats.get('count', len(measurements)))
+        framework = self._get_evaluation_framework(stats=stats, dispersed_stats=None)
+        if dispersed_stats:
+            analysis_measurements = dispersed_stats.get('dispersed_measurements') or measurements
 
         if dispersed_stats is not None:
             framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
@@ -3466,8 +3555,8 @@ class CNTAnalyzerGUI:
 
         analyzer.preprocess(**context['preprocess_settings'], roi=analysis_roi)
         analyzer.detect_cnts_hybrid(**detect_settings, roi=analysis_roi)
-        stats = analyzer.get_statistics(analysis_roi)
-        dispersed_stats = analyzer.get_dispersed_statistics(analysis_roi)
+        analyzer.detect_particles(roi=analysis_roi)
+        stats, dispersed_stats = analyzer.get_statistics_bundle(analysis_roi)
         evaluation_framework = {}
         framework_getter = getattr(analyzer, 'get_evaluation_framework', None)
         if callable(framework_getter):
@@ -3501,6 +3590,7 @@ class CNTAnalyzerGUI:
             'stats': stats,
             'dispersed_stats': dispersed_stats,
             'evaluation_framework': evaluation_framework,
+            'particle_statistics': (stats.get('particle_statistics') or {}),
             'scale_info': scale_info,
             'scale_status': analyzer.get_scale_status(),
             'visualization': visualization,
@@ -5193,8 +5283,9 @@ class CNTAnalyzerGUI:
     def _save_results(self):
         """保存分析结果"""
         measurements = self._get_active_measurements()
+        particles = self._get_active_particle_measurements()
 
-        if not measurements:
+        if not measurements and not particles:
             self.image_panel.show_status("当前上下文没有可保存的检测结果")
             return
 
@@ -5205,13 +5296,9 @@ class CNTAnalyzerGUI:
 
         if file_path:
             try:
-                stats = self.analyzer.get_statistics(self.current_roi)
-                dispersed_stats = None
-                try:
-                    dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
-                except Exception:
-                    dispersed_stats = None
+                stats, dispersed_stats = self.analyzer.get_statistics_bundle(self.current_roi)
                 framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
+                particle_stats = stats.get('particle_statistics') or {}
 
                 if file_path.endswith('.json'):
                     spatial = stats.get('spatial_distribution') or {}
@@ -5236,6 +5323,7 @@ class CNTAnalyzerGUI:
                                 'density_grid': spatial.get('density_grid', []),
                             },
                             'evaluation_framework': framework,
+                            'particle_statistics': particle_stats,
                         },
                     'measurements': [
                             {
@@ -5247,7 +5335,25 @@ class CNTAnalyzerGUI:
                                 'slenderness': float(m.slenderness) if m.slenderness else None
                             }
                             for m in measurements
-                        ]
+                        ],
+                        'particle_measurements': [
+                            {
+                                'id': int(particle.id),
+                                'centroid_x': float(particle.centroid[0]),
+                                'centroid_y': float(particle.centroid[1]),
+                                'area_pixels': float(particle.area_pixels),
+                                'area_um2': float(particle.area_um2),
+                                'equivalent_diameter_um': float(particle.equivalent_diameter_um),
+                                'major_axis_um': float(particle.major_axis_um),
+                                'minor_axis_um': float(particle.minor_axis_um),
+                                'circularity': float(particle.circularity),
+                                'solidity': float(particle.solidity),
+                                'aspect_ratio': float(particle.aspect_ratio),
+                                'mean_local_contrast': float(particle.mean_local_contrast),
+                                'confidence': float(particle.confidence),
+                            }
+                            for particle in particles
+                        ],
                     }
                     with open(file_path, 'w', encoding='utf-8') as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -5265,6 +5371,20 @@ class CNTAnalyzerGUI:
                                 f"{m.width_iqr_um:.2f}" if m.width_iqr_um else "N/A",
                                 f"{m.slenderness:.2f}" if m.slenderness else "N/A"
                             ])
+                        if particles:
+                            writer.writerow([])
+                            writer.writerow(['颗粒ID', '中心X(px)', '中心Y(px)', '面积(μm²)', '等效直径(μm)', '圆度', '实心度', '置信度'])
+                            for particle in particles:
+                                writer.writerow([
+                                    particle.id,
+                                    f"{particle.centroid[0]:.2f}",
+                                    f"{particle.centroid[1]:.2f}",
+                                    f"{particle.area_um2:.4f}",
+                                    f"{particle.equivalent_diameter_um:.4f}",
+                                    f"{particle.circularity:.4f}",
+                                    f"{particle.solidity:.4f}",
+                                    f"{particle.confidence:.4f}",
+                                ])
 
                 messagebox.showinfo("成功", f"结果已保存到:\n{file_path}")
 
@@ -5278,8 +5398,9 @@ class CNTAnalyzerGUI:
     def _export_report(self):
         """导出分析报告"""
         measurements = self._get_active_measurements()
+        particles = self._get_active_particle_measurements()
 
-        if not measurements:
+        if not measurements and not particles:
             self.image_panel.show_status("当前上下文没有可导出的检测结果")
             return
 
@@ -5290,14 +5411,10 @@ class CNTAnalyzerGUI:
 
         if file_path:
             try:
-                stats = self.analyzer.get_statistics(self.current_roi)
+                stats, dispersed_stats = self.analyzer.get_statistics_bundle(self.current_roi)
                 spatial = stats.get('spatial_distribution') or {}
-                dispersed_stats = None
-                try:
-                    dispersed_stats = self.analyzer.get_dispersed_statistics(self.current_roi)
-                except Exception:
-                    dispersed_stats = None
                 framework = self._get_evaluation_framework(stats=stats, dispersed_stats=dispersed_stats)
+                particle_stats = stats.get('particle_statistics') or {}
 
                 report = f"""
 ========================================
@@ -5315,6 +5432,14 @@ class CNTAnalyzerGUI:
     统计摘要
 ----------------------------------------
 检测到的CNT数量: {stats['count']}
+
+颗粒识别（独立口径）:
+  - 颗粒候选数量: {particle_stats.get('count', 0)}
+  - 颗粒面积占比: {particle_stats.get('area_ratio', 0.0):.3%}
+  - 等效直径均值: {particle_stats.get('equivalent_diameter_mean_um', 0.0):.2f} μm
+  - 等效直径中位数: {particle_stats.get('equivalent_diameter_median_um', 0.0):.2f} μm
+  - 候选平均置信度: {particle_stats.get('confidence_mean', 0.0):.1%}
+  - 说明: 颗粒结果不计入 CNT 数量、分散率或均匀性。
 
 长度统计:
   - 平均值: {stats['length_mean']:.2f} μm

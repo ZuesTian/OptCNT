@@ -1,15 +1,24 @@
 # OptCNT
 
-OptCNT 是一个基于 Python、Tkinter 和 OpenCV 的 CNT SEM 图像桌面分析工具，面向单图分析、ROI 分析和多图对比分析场景。
+OptCNT 是一个基于 Python、Tkinter 和 OpenCV 的 CNT 光学显微图像分析工具，面向单图分析、ROI 分析和多图对比分析场景。
+
+**[在线工作台](https://opt-cnt.47.236.76.214.nip.io/)** · [全部 CNT 工具](https://zuestian.github.io/Cnanotools/)
 
 ## 版本信息
 
-- 当前版本：`v2026.04.21`
-- 更新时间：`2026-04-21`
+- 当前源码版本：`v2026.11.05`（已有打包文件不随源码自动更新）
+- 更新时间：`2026-11-05`
 - 当前分支：`main`
 
 ### 本次更新
 
+- 修复全前景区域骨架提取不终止、边界宽度溢出与重叠轮廓面积被扣除的问题
+- 最近邻统计使用固定大小分块；断裂合并使用端点空间索引筛选候选，保留距离与方向判定
+- 拒绝非有限比例尺及检测参数；队列按分析引擎版本领取任务
+- 审核与前后对照见 [CODE_REVIEW.md](CODE_REVIEW.md)。本次修改会影响触及 ROI 边界的检测结果，跨版本比较应重新分析原图
+- 新增深色紧凑颗粒候选识别、逐颗粒尺寸/形态/置信度统计和红色标注视图
+- 颗粒结果使用独立统计口径，不计入 CNT 数量、分散比例、均匀性或组间五项主指标
+- 新增与桌面端共用 `CNTAnalyzer` 的 FastAPI Web 工作台，消除远端前端与项目算法分叉
 - 对比分析界面切换时不再重排主三栏布局，减少标签切换跳变
 - `comparison` 页收敛为单次延迟布局刷新，降低图表与摘要区连跳
 - 结果面板内部 sash 仅在高度明显变化时重算，减少联动抖动
@@ -21,11 +30,13 @@ OptCNT 是一个基于 Python、Tkinter 和 OpenCV 的 CNT SEM 图像桌面分�
 - 自动或手动比例尺标定
 - 支持实时预览的预处理参数调节
 - CNT 检测与长度 / 宽度 / 长宽比测量
+- 深色紧凑颗粒候选识别与尺寸 / 形态 / 置信度测量
 - 分散 CNT / 团聚 CNT 分类统计
 - 骨架、轮廓和检测结果可视化
 - 空间分布、热点区域和均匀度分析
 - 双图对比、组图对比与摘要报告
 - Windows 轻量打包流程
+- 同源 Web API 与浏览器工作台
 
 ## 快速开始
 
@@ -48,10 +59,23 @@ python main.py
 ### 单图分析
 
 - 支持 CNT 检测、长度 / 宽度 / 长宽比测量
+- 支持深色紧凑颗粒候选识别，输出面积、等效直径、长短轴、圆度、实心度、局部对比度和置信度
+- 颗粒标注图使用红色轮廓与 `P1...Pn` 编号；颗粒统计不改变现有 CNT 指标
 - 支持分散 CNT / 团聚 CNT 统计
 - 支持骨架、轮廓、检测结果和空间分布可视化
 - 结果表格默认一行对应一根 CNT，包含 ID、Length (μm)、Dispersed CNT、Agglomerated CNT
 - 结果面板显示长度统计、空间分布、均匀度和评判框架摘要
+
+### Web 工作台
+
+Web 端与桌面端调用同一个 `CNTAnalyzer` 核心，不在浏览器中复制简化算法。单图流程支持比例尺、ROI、参数预览、CNT 检测、颗粒识别、统计表格以及 JSON / CSV / TXT / PNG 导出。
+
+```powershell
+pip install -r requirements-web.txt
+python -m uvicorn src.webapp.app:app --host 127.0.0.1 --port 8000
+```
+
+然后访问 `http://127.0.0.1:8000`。部署到远端时建议由反向代理提供 HTTPS，并按环境设置上传、会话和并发限制；详见 [web/README.md](web/README.md)。
 
 ### 对比分析
 
@@ -68,30 +92,25 @@ python main.py
 
 ### 1. 骨架提取与长度测量
 
-**骨架化 (Skeletonization)**：基于形态学细化算法（Zhang-Suen 算法），提取 CNT 连通域的单像素中心轴。
+**骨架化 (Skeletonization)**：使用十字结构元素反复腐蚀，累积腐蚀图与其开运算结果之差，生成形态学骨架。当前实现不是 Zhang-Suen 细化；骨架可能存在分支或断开。ROI 外按背景处理，保证全前景区域也能终止。
 
-**物理长度 (Physical Length)**：将骨架像素转化为无向图 G(V, E)，利用图遍历算法寻找图的直径（Diameter，即图中最长简单路径）作为 CNT 的实际物理长度，避免了简单周长法对复杂拓扑的高估。
+**长度估计 (Length Estimation)**：将骨架像素构建为八邻接带权图。简单链直接遍历，分支图使用两次 Dijkstra 搜索估计端点间主路径；一般含环图不保证求得精确直径。图直径指最短路径距离的最大值，不等同于最长简单路径。若平滑轮廓的半周长减去宽度超过主路径长度的 1.25 倍，采用轮廓估计修正。结果是二维图像中的对象长度估计，不能直接视为真实单根 CNT 长度；接触 ROI 边界的对象还可能被截断。
 
 ### 2. 空间分布均匀性得分
 
-系统采用多维度特征融合，并通过 Sigmoid 函数映射统一方向（0-100分，分数越高越均匀）：
+当前综合均匀性得分使用覆盖密度 CV、热点面积比例、覆盖熵和 Moran's I（0–100 分，分数越高越均匀）：
 
 ```
-S_base = w_NN · S_sig(CV_NN) + w_Grid · S_sig(CV_Grid) + w_Moran · S_moran(I)
+S = clip(100 × [1 − 0.35 × clip(CV_coverage, 0, 2)
+                 − 0.25 × A_hotspot − 0.20 × (1 − H_coverage)
+                 − 0.20 × clip(I, 0, 1)], 0, 100)
 ```
 
-其中：
-- `CV_NN`：最近邻距离 CV，反映个体间的局部排斥程度
-- `CV_Grid`：网格密度 CV，反映宏观上的空间占据均匀度
-- `I`：Moran's I 莫兰指数，反映空间自相关性（聚集或离散）
+其中 `CV_coverage` 为每格像素覆盖率的 CV，`A_hotspot` 为热点网格面积比例，`H_coverage` 为归一化覆盖熵，`I` 由计数网格计算。主指标中的“网格 CV”是中心点计数 CV，与这里的覆盖 CV 不同。
 
-**映射函数**：
-- 对于"越小越好"的 CV 类指标：`S_sig(x) = 100 / (1 + exp(k · (x - m) / m))`，其中 k=4.0, m=0.6
-- 对于 Moran's I：`S_moran(I) = 100 / (1 + exp(5.0 · (I - 0.1)))`
+最近邻、计数网格及 Moran 分项仍提供 Sigmoid 诊断分数，但不按旧公式合成为总分。少于 2 个有效中心点时总分为 0；2–4 个时按 `50 + (S − 50) × n / 5` 向 50 收缩，并标记低可信度。
 
-**长管非线性惩罚**：大量超长 CNT（>40μm）的存在会破坏宏观均匀性，引入幂次放大惩罚：`Penalty = P_max · min(1.0, r)^0.6`，最高扣减 25 分。
-
-**最终均匀度**：`Score_uniformity = max(0, S_base - Penalty)`
+长管比例作为诊断值及四维框架的组成项保留，当前均匀性总分不再扣除旧版长管惩罚。评分权重和阈值是现有经验规则，本次没有重新拟合或据此验证材料性能。
 
 ### 3. 四维评判框架与混合评分
 
@@ -111,6 +130,7 @@ Score_hybrid = 0.30 × Score_A + 0.20 × Score_B + 0.30 × Score_C + 0.20 × Sco
 ## 核心能力概览
 
 - 基于预处理、骨架和轮廓结果完成 CNT 检测与长度 / 宽度测量
+- 基于原始光学图像的局部暗度、紧凑形态和多阈值稳定性生成颗粒候选
 - 提供分散 / 团聚统计、空间分布和热点区域分析
 - 支持双图对比和组图对比，并输出摘要与图表
 - 组图对比会显式区分 `base组（基准参考）` 与 `实验组（实验候选）`
@@ -129,6 +149,7 @@ OptCNT/
 |   |   |-- models.py          # 数据模型（ROIRegion, CNTMeasurement）
 |   |   |-- utils.py           # 工具函数和常量
 |   |   |-- stats_compat.py    # 统计兼容性模块
+|   |-- webapp/            # 与桌面端同源的 FastAPI 会话、任务与序列化层
 |   `-- gui/               # GUI 模块
 |       |-- gui.py             # 主 GUI 控制器
 |       |-- panels.py          # 面板组件
@@ -139,6 +160,8 @@ OptCNT/
 |       |-- gui_tasking.py     # 任务处理
 |       `-- gui_styles.py      # 样式定义
 |-- tests/                 # 测试用例
+|-- web/                   # 浏览器工作台静态资源
+|-- requirements-web.txt  # Web API 运行依赖
 |-- package_windows.ps1    # Windows 打包脚本
 |-- build_minimal.py       # 最小化构建脚本
 `-- PACKAGING.md          # 打包详细说明
@@ -152,11 +175,12 @@ OptCNT/
 | `requirements-dev.txt` | 运行依赖 + `pytest` |
 | `requirements-build.txt` | 运行依赖 + PyInstaller 打包依赖 |
 | `requirements-optional.txt` | 可选扩展依赖，例如 `scikit-learn` |
+| `requirements-web.txt` | Web API 与远端工作台依赖 |
 
-打包版本使用 `opencv-contrib-python-headless`，确保 `cv2.ximgproc.thinning` 细化路径在最终 exe 中可用。
+当前依赖锁定 `opencv-python-headless==4.13.0.92`，骨架处理不依赖 `cv2.ximgproc.thinning`。已有 exe 需另行重新打包才能包含本次改动。
 
 核心依赖：
-- `opencv-contrib-python-headless>=4.5.0` - 图像处理核心
+- `opencv-python-headless==4.13.0.92` - 图像处理核心
 - `numpy>=1.20.0` - 数值计算
 - `Pillow>=8.0.0` - 图像显示
 - `matplotlib>=3.3.0` - 图表绘制

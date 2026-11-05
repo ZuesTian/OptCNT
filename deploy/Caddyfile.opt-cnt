@@ -1,0 +1,11 @@
+opt-cnt.47.236.76.214.nip.io {
+    encode zstd gzip
+    @document path / /index.html
+    header @document Cache-Control "no-cache"
+    @versionedAssets path_regexp versionedAssets \.(css|js)$
+    header @versionedAssets Cache-Control "public, max-age=31536000, immutable"
+    request_body {
+        max_size 210MB
+    }
+    reverse_proxy 127.0.0.1:8769
+}
