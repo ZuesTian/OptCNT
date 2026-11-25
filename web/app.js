@@ -341,6 +341,7 @@ async function uploadSingleImage(file) {
     const form = new FormData();
     form.append("file", file, file.name);
     const response = await apiJson("/api/v1/sessions", { method: "POST", body: form, timeoutMs: 60000 });
+    document.dispatchEvent(new Event("cnt-data-imported"));
     state.session = response;
     state.activeRoiName = null;
     state.result = null;
