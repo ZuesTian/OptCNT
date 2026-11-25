@@ -127,6 +127,22 @@ def test_worker_version_mismatch_is_rejected(tmp_path: Path):
         )
 
 
+def test_queue_does_not_recompute_jobs_with_a_different_engine(tmp_path: Path):
+    clock = MutableClock()
+    old_store = ComparisonJobStore(data_root=tmp_path, workers=0, clock=clock, engine_version="old-engine")
+    old_job_id = _create_job(old_store)
+    clock.value += 1
+    current_store = _store(tmp_path, clock)
+    new_job_id = _create_job(current_store)
+
+    lease = current_store.lease("server-current", kind="server", engine_version=ENGINE_VERSION)
+    assert lease["job_id"] == new_job_id
+    assert current_store.snapshot(old_job_id)["status"] == "queued"
+    assert current_store.lease("server-current", kind="server", engine_version=ENGINE_VERSION) is None
+    old_lease = old_store.lease("server-old", kind="server", engine_version="old-engine")
+    assert old_lease["job_id"] == old_job_id
+
+
 def test_worker_http_protocol_requires_token_and_lease_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

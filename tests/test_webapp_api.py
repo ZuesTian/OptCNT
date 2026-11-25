@@ -56,6 +56,8 @@ def test_original_jpeg_is_served_without_png_reencoding(client: TestClient):
 def test_health_describes_full_shared_engine(client: TestClient):
     response = client.get("/api/v1/health")
     assert response.status_code == 200
+    assert response.json()["version"] == "2026.11.25"
+    assert response.json()["engine_version"] == "optcnt-comparison-2026.11.05"
     assert response.json()["analysis_engine"] == "CNTAnalyzer"
     assert response.json()["queue_backend"] == "sqlite-lease"
 

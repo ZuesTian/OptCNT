@@ -7,5 +7,7 @@ opt-cnt.47.236.76.214.nip.io {
 	request_body {
 		max_size 210MB
 	}
+	@optcntWorker path /api/v1/workers /api/v1/workers/*
+	respond @optcntWorker 404
 	reverse_proxy 127.0.0.1:8769
 }

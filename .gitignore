@@ -1,5 +1,8 @@
 __pycache__/
 .pytest_cache/
+.pytest-tmp*/
+/tmp/pytest-*/
+/tmp/*-e2e-data/
 *.py[cod]
 *$py.class
 *.so

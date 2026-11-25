@@ -1385,15 +1385,13 @@ def test_get_paned_layout_width_subtracts_sash_pixels():
     assert gui._get_paned_layout_width(gui.main_paned) == 1388
 
 
-def test_calculate_pane_widths_gives_comparison_tab_more_center_space():
+def test_calculate_pane_widths_stays_stable_when_switching_to_comparison_tab():
     gui = _make_gui_stub()
 
     image_widths = gui._calculate_pane_widths(2156, 'image')
     comparison_widths = gui._calculate_pane_widths(2156, 'comparison')
 
-    assert comparison_widths[1] > image_widths[1]
-    assert comparison_widths[0] < image_widths[0]
-    assert comparison_widths[2] < image_widths[2]
+    assert comparison_widths == image_widths
 
 
 def test_calculate_pane_widths_keeps_same_image_ratio_across_window_sizes():
@@ -1532,7 +1530,7 @@ def test_render_comparison_figure_keeps_cached_chart_for_layout_refresh(monkeypa
     assert stale_widget.destroy_calls == 1
     assert gui.comparison_panel.section_heights['comparison_summary'] == 180
     assert gui.comparison_panel.text_content['comparison_summary'] == 'summary'
-    assert len(scheduled) == 1 and 0 < scheduled[0] <= 180
+    assert scheduled == [90]
 
 
 def test_show_comparison_window_renders_only_dispersion_charts():

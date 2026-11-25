@@ -51,6 +51,9 @@ class DetectionSettings:
     merge_distance_px: float = CNT_MERGE_DISTANCE_DEFAULT_PX
 
     def as_kwargs(self) -> dict:
+        numeric_values = (self.min_length_um, self.max_length_um, self.min_slenderness, self.merge_distance_px)
+        if not all(np.isfinite(value) for value in numeric_values):
+            raise ValueError("检测参数必须为有限数值")
         profile = str(self.detection_profile).lower()
         split_mode = str(self.split_mode).lower()
         if profile not in {"precision", "balanced", "recall"}:

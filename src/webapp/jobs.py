@@ -26,7 +26,7 @@ from ..core.workflow import (
 from .serialization import json_safe
 
 
-ENGINE_VERSION = "optcnt-comparison-2026.08.13"
+ENGINE_VERSION = "optcnt-comparison-2026.11.05"
 ACTIVE_STATUSES = ("leased", "running")
 TERMINAL_STATUSES = ("complete", "failed")
 
@@ -372,7 +372,8 @@ class ComparisonJobStore:
                 raise ValueError("未知计算节点类型")
 
             row = connection.execute(
-                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1"
+                "SELECT * FROM jobs WHERE status = 'queued' AND engine_version = ? "
+                "ORDER BY created_at, id LIMIT 1", (self.engine_version,),
             ).fetchone()
             if row is None:
                 connection.commit()

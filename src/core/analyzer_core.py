@@ -419,9 +419,12 @@ class CNTAnalyzer:
 
     def set_scale(self, pixels: float, micrometers: float):
         """设置比例尺"""
-        if pixels <= 0 or micrometers <= 0:
-            raise ValueError("像素数和微米数必须大于0")
-        self.scale_um_per_pixel = micrometers / pixels
+        if not np.isfinite(pixels) or not np.isfinite(micrometers) or pixels <= 0 or micrometers <= 0:
+            raise ValueError("像素数和微米数必须为有限正数")
+        scale = micrometers / pixels
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("比例尺必须为有限正数")
+        self.scale_um_per_pixel = scale
 
     def record_manual_scale(self,
                             pixels: float,
@@ -1059,7 +1062,9 @@ class CNTAnalyzer:
         element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
         while True:
-            eroded = cv2.erode(work, element)
+            # The default erosion border is foreground.  A full mask would
+            # therefore never shrink; treat pixels outside the ROI as background.
+            eroded = cv2.erode(work, element, borderType=cv2.BORDER_CONSTANT, borderValue=0)
             opened = cv2.dilate(eroded, element)
             residue = cv2.subtract(work, opened)
             skeleton = cv2.bitwise_or(skeleton, residue)
@@ -1646,6 +1651,14 @@ class CNTAnalyzer:
         return total_length
 
     # ===== 宽度测量方法 =====
+    @staticmethod
+    def _foreground_distance_transform(binary: np.ndarray) -> np.ndarray:
+        """Measure distance to background, including outside the cropped region."""
+        if np.any(binary[0]) or np.any(binary[-1]) or np.any(binary[:, 0]) or np.any(binary[:, -1]):
+            padded = cv2.copyMakeBorder(binary, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+            return cv2.distanceTransform(padded, cv2.DIST_L2, 5)[1:-1, 1:-1].copy()
+        return cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+
     def _measure_width(self,
                        skeleton: np.ndarray,
                        cnt_binary: np.ndarray,
@@ -1669,7 +1682,7 @@ class CNTAnalyzer:
         dist_transform = (
             distance_transform
             if distance_transform is not None else
-            cv2.distanceTransform(cnt_binary, cv2.DIST_L2, 5)
+            self._foreground_distance_transform(cnt_binary)
         )
 
         skeleton_mask = skeleton > 0
@@ -1727,7 +1740,7 @@ class CNTAnalyzer:
         if not bypass_endpoint_check and endpoints == 2:
             return [(region, None)]
 
-        dist = cv2.distanceTransform(region, cv2.DIST_L2, 5)
+        dist = self._foreground_distance_transform(region)
         max_dist = float(dist.max())
         if max_dist <= 1.0:
             return [(region, dist)]
@@ -1989,11 +2002,39 @@ class CNTAnalyzer:
         merged['merged_from'] = len(members)
         return merged
 
+    def _iter_nearby_candidate_pairs(self, candidates: List[dict], distance: float):
+        """Yield possible endpoint neighbors in the original pair ordering."""
+        cells_by_candidate = []
+        buckets: Dict[Tuple[int, int], List[int]] = {}
+        for index, candidate in enumerate(candidates):
+            cells = {
+                (int(np.floor(point[0] / distance)), int(np.floor(point[1] / distance)))
+                for point in self._candidate_endpoints_xy(candidate)
+            }
+            cells_by_candidate.append(cells)
+            for cell in cells:
+                buckets.setdefault(cell, []).append(index)
+
+        for index, cells in enumerate(cells_by_candidate):
+            possible_neighbors = set()
+            for cell_x, cell_y in cells:
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        possible_neighbors.update(
+                            other for other in buckets.get((cell_x + dx, cell_y + dy), ())
+                            if other > index
+                        )
+            # Retain union-find roots, output ordering and subsequent CNT IDs.
+            for next_index in sorted(possible_neighbors):
+                yield index, next_index
+
     def _merge_nearby_cnt_candidates(self,
                                      candidates: List[dict],
                                      merge_distance_px: float,
                                      profile: str) -> List[dict]:
         """合并距离近且主方向一致的候选 CNT"""
+        if not np.isfinite(merge_distance_px):
+            raise ValueError("合并距离必须为有限数值")
         if merge_distance_px <= 0 or len(candidates) < 2:
             return candidates
 
@@ -2011,18 +2052,17 @@ class CNTAnalyzer:
             if root_first != root_second:
                 parents[root_second] = root_first
 
-        for index in range(len(candidates)):
-            for next_index in range(index + 1, len(candidates)):
-                metrics = self._candidate_pair_metrics(candidates[index], candidates[next_index])
-                if metrics.get('distance', float('inf')) > merge_distance_px:
-                    continue
-                if metrics.get('angle_diff', 180.0) > CNT_MERGE_MAX_ANGLE_DIFF_DEG:
-                    continue
-                if metrics.get('alignment_a', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
-                    continue
-                if metrics.get('alignment_b', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
-                    continue
-                union(index, next_index)
+        for index, next_index in self._iter_nearby_candidate_pairs(candidates, merge_distance_px):
+            metrics = self._candidate_pair_metrics(candidates[index], candidates[next_index])
+            if metrics.get('distance', float('inf')) > merge_distance_px:
+                continue
+            if metrics.get('angle_diff', 180.0) > CNT_MERGE_MAX_ANGLE_DIFF_DEG:
+                continue
+            if metrics.get('alignment_a', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
+                continue
+            if metrics.get('alignment_b', 180.0) > CNT_MERGE_MAX_ALIGNMENT_DEG:
+                continue
+            union(index, next_index)
 
         groups: Dict[int, List[dict]] = {}
         for index, candidate in enumerate(candidates):
@@ -2232,7 +2272,7 @@ class CNTAnalyzer:
         hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
         x, y, width, height = cv2.boundingRect(contour)
         pixel_area = int(np.count_nonzero(binary))
-        core_radius = float(cv2.distanceTransform(binary, cv2.DIST_L2, 5).max())
+        core_radius = float(CNTAnalyzer._foreground_distance_transform(binary).max())
         return {
             'contour': contour,
             'area': float(pixel_area),
@@ -2667,10 +2707,28 @@ class CNTAnalyzer:
         if len(centroid_array) < 2:
             return result
 
-        diffs = centroid_array[:, None, :] - centroid_array[None, :, :]
-        distances = np.sqrt(np.sum(diffs ** 2, axis=2))
-        np.fill_diagonal(distances, np.inf)
-        nearest_distances = np.min(distances, axis=1)
+        # Bound working memory independently of point count.  Each off-diagonal
+        # tile supplies both directions, so each pair is evaluated only once.
+        points = np.asarray(centroid_array, dtype=np.float64)
+        count = len(points)
+        nearest_squared = np.full(count, np.inf, dtype=np.float64)
+        block_size = 256
+        for start in range(0, count, block_size):
+            stop = min(start + block_size, count)
+            for other_start in range(start, count, block_size):
+                other_stop = min(other_start + block_size, count)
+                diffs = points[start:stop, None, :] - points[None, other_start:other_stop, :]
+                np.square(diffs, out=diffs)
+                distances_squared = np.sum(diffs, axis=2)
+                del diffs
+                if start == other_start:
+                    np.fill_diagonal(distances_squared, np.inf)
+                np.minimum(nearest_squared[start:stop], distances_squared.min(axis=1),
+                           out=nearest_squared[start:stop])
+                if start != other_start:
+                    np.minimum(nearest_squared[other_start:other_stop], distances_squared.min(axis=0),
+                               out=nearest_squared[other_start:other_stop])
+        nearest_distances = np.sqrt(nearest_squared)
         nn_mean = float(np.mean(nearest_distances))
         nn_std = float(np.std(nearest_distances))
         nn_cv = float(nn_std / nn_mean) if nn_mean > 0 else 0.0
@@ -2745,7 +2803,10 @@ class CNTAnalyzer:
         """Rasterize CNT contours once so multiple grid sizes can share the same mask."""
         mask = np.zeros((max(0, height), max(0, width)), dtype=np.uint8)
         if local_contours and width > 0 and height > 0:
-            cv2.drawContours(mask, local_contours, -1, 255, -1)
+            # These are independent objects, not a contour hierarchy.  Filling
+            # them together applies the even-odd rule and erases overlaps.
+            for contour in local_contours:
+                cv2.drawContours(mask, [contour], 0, 255, -1)
         return mask
 
     def _build_shadow_density_grid(self,
