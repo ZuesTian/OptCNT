@@ -201,7 +201,8 @@ class ControlPanel(ttk.Frame):
             ("二值图", "binary"),
             ("检测结果", "result"),
             ("检测+骨架", "skeleton"),
-            ("实时骨架预览", "skeleton_preview")
+            ("实时骨架预览", "skeleton_preview"),
+            ("颗粒识别", "particles"),
         ]
 
         self.display_mode_buttons.clear()
@@ -365,7 +366,7 @@ class ControlPanel(ttk.Frame):
 
         self.detect_button = ttk.Button(
             analysis_frame,
-            text="🔍 开始检测CNT",
+            text="🔍 开始检测 CNT + 颗粒",
             style='Danger.TButton',
             command=self.callbacks.get('detect_cnt'),
         )

@@ -1,7 +1,7 @@
 :root {
   color-scheme: light;
   --ink: #17322e;
-  --muted: #637770;
+  --muted: #55685f;
   --soft: #81918c;
   --line: #d8e1dc;
   --line-strong: #c4d0ca;
@@ -14,7 +14,7 @@
   --teal-700: #0b7a70;
   --teal-600: #319a8d;
   --teal-100: #e2f1ed;
-  --lime: #cdea72;
+  --lime: #c3d494;
   --lime-soft: #eff8d2;
   --orange: #e98a42;
   --orange-soft: #fff0e3;
@@ -42,7 +42,7 @@
   --teal-700: #68d3c4;
   --teal-600: #54c1b2;
   --teal-100: #173b36;
-  --lime: #ccec70;
+  --lime: #c2d392;
   --lime-soft: #30411f;
   --orange: #efb65f;
   --orange-soft: #3b3021;
@@ -56,7 +56,7 @@
 
 body { color: var(--ink); background: radial-gradient(circle at 86% 0, color-mix(in srgb, var(--teal-700) 8%, transparent), transparent 30rem), var(--canvas); }
 .app-topbar { border-color: var(--line); background: color-mix(in srgb, var(--paper) 92%, transparent); }
-.theme-toggle { display: inline-flex; min-height: 36px; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--paper); cursor: pointer; font-size: 9px; font-weight: 750; }
+.theme-toggle { display: inline-flex; min-height: 36px; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--paper); cursor: pointer; font-size: 12px; font-weight: 750; }
 .theme-toggle:hover { color: var(--teal-700); border-color: color-mix(in srgb, var(--teal-700) 42%, var(--line)); }
 .theme-toggle [data-theme-icon] { width: 16px; font-size: 13px; }
 
@@ -79,7 +79,14 @@ input, select, textarea { color: var(--ink); border-color: var(--line-strong); b
 :root[data-theme="dark"] tbody tr:hover td { background: var(--canvas-deep); }
 :root[data-theme="dark"] .particle-note-card { background: color-mix(in srgb, var(--rose) 7%, var(--paper)); border-color: color-mix(in srgb, var(--rose) 30%, var(--line)); }
 
-@media (max-width: 920px) {
-  .theme-toggle { width: 36px; justify-content: center; padding: 0; }
+@media (max-width: 340px) {
+  .theme-toggle { width: 44px; justify-content: center; padding: 0; }
   .theme-toggle [data-theme-label] { display: none; }
 }
+
+:root[data-theme="dark"] :is(.score-card,.metric-card,.dashboard-card,.framework-card,.compare-progress,.group-summary,.comparison-verdict-card,.roi-item,.export-popover,.input-unit,.toast,.dashboard-tabs button.active,.architecture-flow article::after) {background:var(--paper);border-color:var(--line);color:var(--ink)}
+.app-topbar .portal-link {display:inline-flex}
+@media(max-width:620px){.app-topbar{flex-wrap:wrap;height:auto;gap:6px}.topbar-actions{flex-wrap:wrap}}
+
+[data-theme-toggle],a[href="https://zuestian.github.io/Cnanotools/"]{min-height:44px;min-width:44px}
+@media(min-width:341px){[data-theme-toggle] [data-theme-label]{display:inline}}

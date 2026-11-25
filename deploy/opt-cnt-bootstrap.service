@@ -1,0 +1,15 @@
+[Unit]
+Description=Initialize the isolated OptCNT runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/opt-cnt/current
+Environment=UV_LINK_MODE=copy
+ExecStart=/bin/sh -c "test -x /opt/opt-cnt/runtime/.venv/bin/python || /usr/local/bin/uv venv --python /usr/local/bin/python3.11 /opt/opt-cnt/runtime/.venv"
+ExecStart=/usr/local/bin/uv pip install --python /opt/opt-cnt/runtime/.venv/bin/python -r /opt/opt-cnt/current/requirements-server.lock
+TimeoutStartSec=900
+NoNewPrivileges=true

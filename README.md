@@ -1,15 +1,18 @@
 # OptCNT
 
-OptCNT 是一个基于 Python、Tkinter 和 OpenCV 的 CNT SEM 图像桌面分析工具，面向单图分析、ROI 分析和多图对比分析场景。
+OptCNT 是一个基于 Python、Tkinter 和 OpenCV 的 CNT OPT光学显微镜图像桌面分析工具，面向单图分析、ROI 分析和多图对比分析场景。
 
 ## 版本信息
 
-- 当前版本：`v2026.04.21`
-- 更新时间：`2026-04-21`
+- 当前版本：`v2026.08.12`
+- 更新时间：`2026-08-12`
 - 当前分支：`main`
 
 ### 本次更新
 
+- 新增深色紧凑颗粒候选识别、逐颗粒尺寸/形态/置信度统计和红色标注视图
+- 颗粒结果使用独立统计口径，不计入 CNT 数量、分散比例、均匀性或组间五项主指标
+- 新增与桌面端共用 `CNTAnalyzer` 的 FastAPI Web 工作台，消除远端前端与项目算法分叉
 - 对比分析界面切换时不再重排主三栏布局，减少标签切换跳变
 - `comparison` 页收敛为单次延迟布局刷新，降低图表与摘要区连跳
 - 结果面板内部 sash 仅在高度明显变化时重算，减少联动抖动
@@ -21,11 +24,13 @@ OptCNT 是一个基于 Python、Tkinter 和 OpenCV 的 CNT SEM 图像桌面分�
 - 自动或手动比例尺标定
 - 支持实时预览的预处理参数调节
 - CNT 检测与长度 / 宽度 / 长宽比测量
+- 深色紧凑颗粒候选识别与尺寸 / 形态 / 置信度测量
 - 分散 CNT / 团聚 CNT 分类统计
 - 骨架、轮廓和检测结果可视化
 - 空间分布、热点区域和均匀度分析
 - 双图对比、组图对比与摘要报告
 - Windows 轻量打包流程
+- 同源 Web API 与浏览器工作台
 
 ## 快速开始
 
@@ -48,10 +53,23 @@ python main.py
 ### 单图分析
 
 - 支持 CNT 检测、长度 / 宽度 / 长宽比测量
+- 支持深色紧凑颗粒候选识别，输出面积、等效直径、长短轴、圆度、实心度、局部对比度和置信度
+- 颗粒标注图使用红色轮廓与 `P1...Pn` 编号；颗粒统计不改变现有 CNT 指标
 - 支持分散 CNT / 团聚 CNT 统计
 - 支持骨架、轮廓、检测结果和空间分布可视化
 - 结果表格默认一行对应一根 CNT，包含 ID、Length (μm)、Dispersed CNT、Agglomerated CNT
 - 结果面板显示长度统计、空间分布、均匀度和评判框架摘要
+
+### Web 工作台
+
+Web 端与桌面端调用同一个 `CNTAnalyzer` 核心，不在浏览器中复制简化算法。单图流程支持比例尺、ROI、参数预览、CNT 检测、颗粒识别、统计表格以及 JSON / CSV / TXT / PNG 导出。
+
+```powershell
+pip install -r requirements-web.txt
+python -m uvicorn src.webapp.app:app --host 127.0.0.1 --port 8000
+```
+
+然后访问 `http://127.0.0.1:8000`。部署到远端时建议由反向代理提供 HTTPS，并按环境设置上传、会话和并发限制；详见 [web/README.md](web/README.md)。
 
 ### 对比分析
 
@@ -111,6 +129,7 @@ Score_hybrid = 0.30 × Score_A + 0.20 × Score_B + 0.30 × Score_C + 0.20 × Sco
 ## 核心能力概览
 
 - 基于预处理、骨架和轮廓结果完成 CNT 检测与长度 / 宽度测量
+- 基于原始光学图像的局部暗度、紧凑形态和多阈值稳定性生成颗粒候选
 - 提供分散 / 团聚统计、空间分布和热点区域分析
 - 支持双图对比和组图对比，并输出摘要与图表
 - 组图对比会显式区分 `base组（基准参考）` 与 `实验组（实验候选）`
@@ -129,6 +148,7 @@ OptCNT/
 |   |   |-- models.py          # 数据模型（ROIRegion, CNTMeasurement）
 |   |   |-- utils.py           # 工具函数和常量
 |   |   |-- stats_compat.py    # 统计兼容性模块
+|   |-- webapp/            # 与桌面端同源的 FastAPI 会话、任务与序列化层
 |   `-- gui/               # GUI 模块
 |       |-- gui.py             # 主 GUI 控制器
 |       |-- panels.py          # 面板组件
@@ -139,6 +159,8 @@ OptCNT/
 |       |-- gui_tasking.py     # 任务处理
 |       `-- gui_styles.py      # 样式定义
 |-- tests/                 # 测试用例
+|-- web/                   # 浏览器工作台静态资源
+|-- requirements-web.txt  # Web API 运行依赖
 |-- package_windows.ps1    # Windows 打包脚本
 |-- build_minimal.py       # 最小化构建脚本
 `-- PACKAGING.md          # 打包详细说明
@@ -152,6 +174,7 @@ OptCNT/
 | `requirements-dev.txt` | 运行依赖 + `pytest` |
 | `requirements-build.txt` | 运行依赖 + PyInstaller 打包依赖 |
 | `requirements-optional.txt` | 可选扩展依赖，例如 `scikit-learn` |
+| `requirements-web.txt` | Web API 与远端工作台依赖 |
 
 打包版本使用 `opencv-contrib-python-headless`，确保 `cv2.ximgproc.thinning` 细化路径在最终 exe 中可用。
 

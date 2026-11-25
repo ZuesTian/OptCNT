@@ -1,11 +1,10 @@
 import cv2
 import numpy as np
 import pytest
-from types import SimpleNamespace
 
 import src.core.analyzer_core as analyzer_core_module
 from src.core.analyzer_core import CNTAnalyzer
-from src.core.models import CNTMeasurement
+from src.core.models import CNTMeasurement, ROIRegion
 
 
 def _make_measurement(
@@ -120,6 +119,39 @@ def test_get_statistics_uses_shared_length_distribution_bins():
     assert stats["spatial_distribution"] == {"mock": True}
 
 
+def test_get_statistics_bundle_shares_one_spatial_context(monkeypatch):
+    analyzer = CNTAnalyzer()
+    analyzer.measurements = [_make_measurement(0, 10.0), _make_measurement(1, 12.0)]
+    context = object()
+    calls = {"prepare": 0, "statistics": [], "dispersed": []}
+
+    def prepare(roi=None):
+        calls["prepare"] += 1
+        return context
+
+    def statistics(roi=None, *, spatial_context=None):
+        calls["statistics"].append(spatial_context)
+        return {"count": 2, "spatial_distribution": {"grid_size": 10}}
+
+    def dispersed(roi=None, strictness="all_hotspots", *, spatial_context=None):
+        calls["dispersed"].append(spatial_context)
+        return {"total_count": 2, "dispersed_count": 2}
+
+    monkeypatch.setattr(analyzer, "_prepare_spatial_distribution_context", prepare)
+    monkeypatch.setattr(analyzer, "get_statistics", statistics)
+    monkeypatch.setattr(analyzer, "get_dispersed_statistics", dispersed)
+
+    stats, dispersed_stats = analyzer.get_statistics_bundle()
+
+    assert stats["count"] == 2
+    assert dispersed_stats["dispersed_count"] == 2
+    assert calls == {
+        "prepare": 1,
+        "statistics": [context],
+        "dispersed": [context],
+    }
+
+
 def test_recognize_characters_stops_after_high_confidence_template_match(monkeypatch):
     analyzer = CNTAnalyzer()
     analyzer.ocr_templates = {
@@ -192,7 +224,7 @@ def test_preprocess_can_skip_skeleton_generation(monkeypatch):
     assert analyzer.skeleton_overlay is None
 
 
-def test_skeletonize_prefers_opencv_thinning_when_available(monkeypatch):
+def test_skeletonize_does_not_change_when_optional_ximgproc_is_available(monkeypatch):
     analyzer = CNTAnalyzer()
     binary = np.array(
         [
@@ -202,27 +234,24 @@ def test_skeletonize_prefers_opencv_thinning_when_available(monkeypatch):
         ],
         dtype=np.uint8,
     )
-    expected = np.array(
-        [
-            [0, 0, 0],
-            [0, 255, 0],
-            [0, 0, 0],
-        ],
-        dtype=np.uint8,
-    )
     calls = {"count": 0}
 
     def fake_thinning(work):
         calls["count"] += 1
         assert work.dtype == np.uint8
-        return expected
+        return np.zeros_like(work)
 
-    monkeypatch.setattr(analyzer_core_module.cv2, "ximgproc", SimpleNamespace(thinning=fake_thinning), raising=False)
+    monkeypatch.setattr(
+        analyzer_core_module.cv2,
+        "ximgproc",
+        type("XImgProc", (), {"thinning": staticmethod(fake_thinning)})(),
+        raising=False,
+    )
 
     result = analyzer._skeletonize(binary)
 
-    assert calls["count"] == 1
-    assert np.array_equal(result, expected)
+    assert calls["count"] == 0
+    assert cv2.countNonZero(result) > 0
 
 
 def test_trace_skeleton_path_does_not_loop_on_cycle_graph():
@@ -258,6 +287,87 @@ def test_find_graph_diameter_path_prefers_longest_branch_to_branch_path():
     assert analyzer._calculate_path_length(path) == pytest.approx(5.0)
 
 
+def test_find_best_skeleton_path_skips_dijkstra_for_simple_chain(monkeypatch):
+    analyzer = CNTAnalyzer()
+    neighbors = {
+        (0, 0): [(0, 1)],
+        (0, 1): [(0, 0), (0, 2)],
+        (0, 2): [(0, 1)],
+    }
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("simple chains must not enter Dijkstra")
+
+    monkeypatch.setattr(analyzer, "_find_graph_diameter_path", fail_if_called)
+
+    assert analyzer._find_best_skeleton_path(neighbors, [160.0]) == [
+        (0, 2),
+        (0, 1),
+        (0, 0),
+    ]
+
+
+def test_compact_skeleton_graph_matches_legacy_neighbors_and_diameter():
+    analyzer = CNTAnalyzer()
+    skeleton = np.zeros((12, 12), dtype=np.uint8)
+    cv2.line(skeleton, (1, 2), (9, 2), 255, 1)
+    cv2.line(skeleton, (5, 2), (5, 9), 255, 1)
+
+    legacy_neighbors = analyzer._build_skeleton_neighbors(skeleton)
+    graph = analyzer._build_skeleton_graph(skeleton)
+
+    assert analyzer._skeleton_graph_to_neighbors(graph) == legacy_neighbors
+    assert analyzer._find_best_skeleton_graph_path(graph, [160.0]) == analyzer._find_best_skeleton_path(
+        legacy_neighbors,
+        [160.0],
+    )
+
+
+def test_measure_width_reuses_supplied_distance_transform(monkeypatch):
+    analyzer = CNTAnalyzer()
+    cnt_binary = np.zeros((9, 15), dtype=np.uint8)
+    cv2.rectangle(cnt_binary, (1, 2), (13, 6), 255, -1)
+    skeleton = np.zeros_like(cnt_binary)
+    cv2.line(skeleton, (2, 4), (12, 4), 255, 1)
+    distance_transform = cv2.distanceTransform(cnt_binary, cv2.DIST_L2, 5)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("distance transform must be reused")
+
+    monkeypatch.setattr(analyzer_core_module.cv2, "distanceTransform", fail_if_called)
+
+    result = analyzer._measure_width(
+        skeleton,
+        cnt_binary,
+        distance_transform=distance_transform,
+    )
+
+    assert result["mean"] > 0.0
+    assert result["median"] > 0.0
+
+
+def test_split_region_exposes_distance_transform_when_watershed_is_not_needed(monkeypatch):
+    analyzer = CNTAnalyzer()
+    region = np.zeros((24, 60), dtype=np.uint8)
+    cv2.rectangle(region, (2, 8), (57, 15), 255, -1)
+    expected_distance = np.full(region.shape, 2.5, dtype=np.float32)
+
+    monkeypatch.setattr(analyzer, "_skeletonize", lambda value: np.zeros_like(value))
+    monkeypatch.setattr(analyzer_core_module.cv2, "distanceTransform", lambda *args: expected_distance)
+    monkeypatch.setattr(
+        analyzer_core_module.cv2,
+        "connectedComponents",
+        lambda value: (2, np.zeros(value.shape, dtype=np.int32)),
+    )
+
+    pieces = analyzer._split_stuck_cnt_region_with_distance(region, split_mode="aggressive")
+
+    assert len(pieces) == 1
+    piece, distance_transform = pieces[0]
+    assert np.array_equal(piece, region)
+    assert distance_transform is expected_distance
+
+
 def test_calculate_path_length_uses_numba_helper_when_available(monkeypatch):
     analyzer = CNTAnalyzer()
     calls = {}
@@ -275,6 +385,26 @@ def test_calculate_path_length_uses_numba_helper_when_available(monkeypatch):
     assert result == pytest.approx(12.5)
     assert calls["shape"] == (2, 2)
     assert calls["dtype"] == np.float64
+
+
+def test_jit_falls_back_when_numba_dispatcher_creation_fails(monkeypatch):
+    def failing_numba_jit(*args, **kwargs):
+        def decorator(func):
+            raise RuntimeError("broken optional llvmlite runtime")
+
+        return decorator
+
+    def kernel(value):
+        return value + 1
+
+    monkeypatch.setattr(analyzer_core_module, "NUMBA_AVAILABLE", True)
+    monkeypatch.setattr(analyzer_core_module, "_numba_jit", failing_numba_jit)
+
+    decorated = analyzer_core_module.jit(nopython=True)(kernel)
+
+    assert decorated is kernel
+    assert decorated(4) == 5
+    assert analyzer_core_module.NUMBA_AVAILABLE is False
 
 
 def test_detect_cnts_hybrid_skips_candidates_whose_upper_bound_is_below_min_length(monkeypatch):
@@ -765,6 +895,64 @@ def test_get_evaluation_framework_uses_width_median_for_long_thick_and_updates_l
     assert framework["long_cnt"]["long_thick_score"] == pytest.approx(expected_long_thick_score)
     assert framework["long_cnt"]["score"] == pytest.approx(
         np.mean([expected_length_mean_score, expected_ultra_long_score, expected_long_thick_score])
+    )
+
+
+def _make_particle_test_image() -> np.ndarray:
+    image = np.full((200, 260, 3), 220, dtype=np.uint8)
+    cv2.circle(image, (80, 90), 9, (20, 20, 20), -1)
+    cv2.line(image, (150, 125), (210, 125), (20, 20, 20), 2)
+    return image
+
+
+def test_detect_particles_finds_compact_dark_particle_and_rejects_thin_line():
+    analyzer = CNTAnalyzer()
+    analyzer.auto_enhance_enabled = False
+    analyzer.set_image(_make_particle_test_image())
+
+    particles = analyzer.detect_particles()
+
+    assert len(particles) == 1
+    particle = particles[0]
+    assert particle.centroid == pytest.approx((80.0, 90.0), abs=1.0)
+    assert particle.aspect_ratio < 1.5
+    assert particle.confidence >= analyzer_core_module.PARTICLE_MIN_CONFIDENCE
+
+
+def test_detect_particles_preserves_global_coordinates_inside_small_roi():
+    analyzer = CNTAnalyzer()
+    analyzer.auto_enhance_enabled = False
+    analyzer.set_image(_make_particle_test_image())
+    roi = ROIRegion(name="颗粒复核区", x=40, y=45, width=100, height=95)
+
+    particles = analyzer.detect_particles(roi=roi)
+
+    assert len(particles) == 1
+    particle = particles[0]
+    assert particle.centroid == pytest.approx((80.0, 90.0), abs=1.0)
+    contour_x, contour_y, _, _ = cv2.boundingRect(particle.contour)
+    assert contour_x > roi.x
+    assert contour_y > roi.y
+    assert roi.particle_measurements == particles
+
+
+def test_particle_statistics_are_independent_from_cnt_statistics():
+    analyzer = CNTAnalyzer()
+    analyzer.auto_enhance_enabled = False
+    analyzer.set_image(_make_particle_test_image())
+    analyzer.scale_um_per_pixel = 0.25
+    particles = analyzer.detect_particles()
+
+    particle_stats = analyzer.get_particle_statistics()
+    stats = analyzer.get_statistics()
+
+    assert stats["count"] == 0
+    assert stats["particle_statistics"] == particle_stats
+    assert particle_stats["count"] == 1
+    assert particle_stats["total_area_pixels"] == pytest.approx(particles[0].area_pixels)
+    assert particle_stats["total_area_um2"] == pytest.approx(particles[0].area_pixels * 0.25 ** 2)
+    assert particle_stats["equivalent_diameter_mean_um"] == pytest.approx(
+        particles[0].equivalent_diameter_pixels * 0.25
     )
 
 

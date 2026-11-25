@@ -512,7 +512,7 @@ async function createRoi(rect) {
     const response = await apiJson(`/api/v1/sessions/${state.session.session_id}/rois`, {
       method: "POST",
       body: JSON.stringify({
-        name: `ROI_${(state.session.rois?.length || 0) + 1}`,
+
         x: Math.round(rect.x),
         y: Math.round(rect.y),
         width: Math.round(rect.width),
@@ -881,14 +881,14 @@ function drawInteractionOverlay() {
     const end = originalToCanvas({ x: roi.x + roi.width, y: roi.y + roi.height });
     const active = roi.name === state.activeRoiName;
     ctx.save();
-    ctx.strokeStyle = active ? "#d7f276" : "rgba(255, 210, 70, .85)";
+    ctx.strokeStyle = active ? "#c5d796" : "rgba(255, 210, 70, .85)";
     ctx.fillStyle = active ? "rgba(215, 242, 118, .08)" : "rgba(255, 210, 70, .04)";
     ctx.lineWidth = active ? 2.2 : 1.4;
     ctx.setLineDash(active ? [] : [5, 4]);
     ctx.fillRect(start.x, start.y, end.x - start.x, end.y - start.y);
     ctx.strokeRect(start.x, start.y, end.x - start.x, end.y - start.y);
     ctx.setLineDash([]);
-    ctx.fillStyle = active ? "#d7f276" : "#ffd246";
+    ctx.fillStyle = active ? "#c5d796" : "#ffd246";
     ctx.font = "700 9px Segoe UI, sans-serif";
     ctx.fillText(roi.name, start.x + 5, Math.max(11, start.y - 5));
     ctx.restore();
@@ -904,7 +904,7 @@ function drawInteractionOverlay() {
       const a = originalToCanvas(state.drawStart);
       const b = originalToCanvas(state.drawCurrent);
       ctx.save();
-      ctx.strokeStyle = "#d7f276";
+      ctx.strokeStyle = "#c5d796";
       ctx.fillStyle = "rgba(215, 242, 118, .09)";
       ctx.lineWidth = 2;
       ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
@@ -919,7 +919,7 @@ function drawScaleLine(ctx, start, end, provisional) {
   const b = originalToCanvas(end);
   const pixels = Math.hypot(end.x - start.x, end.y - start.y);
   ctx.save();
-  ctx.strokeStyle = provisional ? "#d7f276" : "#76e0d0";
+  ctx.strokeStyle = provisional ? "#c5d796" : "#76e0d0";
   ctx.lineWidth = 2.2;
   ctx.beginPath();
   ctx.moveTo(a.x, a.y);
@@ -928,7 +928,7 @@ function drawScaleLine(ctx, start, end, provisional) {
   for (const point of [a, b]) {
     ctx.beginPath();
     ctx.arc(point.x, point.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = provisional ? "#d7f276" : "#76e0d0";
+    ctx.fillStyle = provisional ? "#c5d796" : "#76e0d0";
     ctx.fill();
   }
   ctx.font = "700 9px Segoe UI, sans-serif";
@@ -1218,7 +1218,7 @@ function drawLengthHistogram() {
     roundedRect(ctx, x, y, Math.max(2, slot - 4), barHeight, 3);
     ctx.fill();
   });
-  ctx.fillStyle = "#7b8c88";
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted");
   ctx.font = "8px Segoe UI";
   [0, .25, .5, .75, 1].forEach((fraction) => {
     const x = pad.left + plotWidth * fraction;
@@ -1247,11 +1247,11 @@ function drawDispersionChart() {
     ctx.fill();
     angle = next;
   });
-  ctx.fillStyle = "#172623";
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--ink");
   ctx.font = "400 24px Georgia";
   ctx.textAlign = "center";
   ctx.fillText(String(dispersed + agglomerated), cx, cy + 2);
-  ctx.fillStyle = "#7b8c88";
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted");
   ctx.font = "8px Segoe UI";
   ctx.fillText("CNT", cx, cy + 18);
   ctx.textAlign = "left";
@@ -1259,7 +1259,7 @@ function drawDispersionChart() {
     const y = height * .42 + index * 42;
     ctx.fillStyle = color;
     ctx.fillRect(width * .72, y, 8, 8);
-    ctx.fillStyle = "#667773";
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted");
     ctx.font = "8px Segoe UI";
     ctx.fillText(`${label} ${value} · ${(value / total * 100).toFixed(1)}%`, width * .72 + 14, y + 8);
   });
@@ -1283,7 +1283,7 @@ function drawMorphologyChart() {
     ctx.arc(x, y, 2.6, 0, Math.PI * 2);
     ctx.fill();
   });
-  ctx.fillStyle = "#7b8c88";
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted");
   ctx.font = "8px Segoe UI";
   ctx.fillText("长度 (μm)", width - 64, height - 12);
   ctx.save();
@@ -1513,7 +1513,7 @@ function renderComparisonCharts() {
     const experiment = Math.abs(Number(metric.experiment?.mean || 0));
     const max = Math.max(base, experiment, 1e-9);
     const y = pad.top + index * rowHeight;
-    ctx.fillStyle = "#667773";
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--muted");
     ctx.textAlign = "right";
     ctx.fillText(metric.label, pad.left - 10, y + rowHeight * .53);
     ctx.fillStyle = "#edf2ef";
@@ -1667,3 +1667,5 @@ function bindEvents() {
 }
 
 bootstrap();
+
+document.addEventListener("cntlab:themechange", () => { renderResultCharts(); renderComparisonCharts(); });

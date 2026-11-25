@@ -11,9 +11,9 @@
     />
     <title>OptCNT · 完整光学分析工作台</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23123c37'/%3E%3Cpath d='M7 22 L16 9 L25 22' stroke='%23e8f3ef' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='9' r='2' fill='%2344b8a0'/%3E%3C/svg%3E" />
-    <script src="theme.js?v=20260813"></script>
-    <link rel="stylesheet" href="styles.css?v=20260813-paste2" />
-    <link rel="stylesheet" href="theme.css?v=20260813" />
+    <script src="theme.js?v=20261125"></script>
+    <link rel="stylesheet" href="styles.css?v=20261125" />
+    <link rel="stylesheet" href="theme.css?v=20261125" />
   </head>
   <body>
     <a class="skip-link" href="#mainContent">跳到主要内容</a>
@@ -62,7 +62,7 @@
           <div class="topbar-actions">
             <span class="lifecycle-chip" title="图片仅在分析会话中临时保留"><i></i>会话过期自动清理</span>
             <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-icon aria-hidden="true">☾</span><span data-theme-label>深色</span></button>
-            <a class="portal-link" href="https://zuestian.github.io/Cnanotools/">工具总览 <span>↗</span></a>
+            <a class="portal-link" href="https://zuestian.github.io/Cnanotools/">返回 CNT LAB</a>
             <button id="helpButton" class="round-button" type="button" aria-label="打开方法说明">?</button>
           </div>
         </header>
@@ -147,7 +147,7 @@
                   <header class="drawer-heading"><span>CALIBRATION</span><h2>确认物理尺度</h2><p>自动检测结果可直接使用，也可在画布上重画比例尺。</p></header>
                   <article id="scaleStatusCard" class="status-card warning">
                     <span id="scaleConfidenceBadge">待确认</span>
-                    <div><strong id="scaleStatusTitle">正在检测比例尺</strong><small id="scaleStatusDetail">—</small></div>
+                    <div><strong id="scaleStatusTitle">等待载入图像</strong><small id="scaleStatusDetail">—</small></div>
                   </article>
                   <div class="form-grid two-columns">
                     <label class="form-field"><span>线段像素</span><div class="input-unit"><input id="scalePixelsInput" type="number" min="0.1" step="0.1" value="0" /><b>px</b></div></label>
@@ -380,6 +380,6 @@
     </div>
 
     <div id="toastRegion" class="toast-region" aria-live="polite"></div>
-    <script src="app.js?v=20260813-paste2" defer></script>
+    <script src="app.js?v=20261125" defer></script>
   </body>
 </html>

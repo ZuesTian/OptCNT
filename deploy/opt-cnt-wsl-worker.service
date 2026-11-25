@@ -1,0 +1,34 @@
+[Unit]
+Description=OptCNT WSL2 comparison compute worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=amd
+Group=amd
+WorkingDirectory=/opt/opt-cnt-worker/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=NUMBA_CACHE_DIR=/var/lib/opt-cnt-worker/numba-cache
+Environment=MPLCONFIGDIR=/var/lib/opt-cnt-worker/matplotlib-cache
+Environment=OPTCNT_WORKER_DATA_DIR=/var/lib/opt-cnt-worker/jobs
+Environment=OPTCNT_WORKER_CAPACITY=1
+Environment=OPTCNT_WORKER_POLL_SECONDS=3
+EnvironmentFile=-/etc/opt-cnt-worker/proxy.env
+EnvironmentFile=/etc/opt-cnt-worker/worker.env
+ExecStart=/opt/opt-cnt-worker/runtime/.venv/bin/python -m src.webapp.worker
+Restart=always
+RestartSec=8
+TimeoutStopSec=45
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opt-cnt-worker
+NoNewPrivileges=true
+MemoryHigh=96G
+MemoryMax=112G
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
